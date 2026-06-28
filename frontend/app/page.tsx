@@ -26,6 +26,9 @@ interface ToolCall {
   status: "running" | "completed";
 }
 
+const BACKEND_URL = "https://salesagent-b6po.onrender.com";
+const WS_URL = "wss://salesagent-b6po.onrender.com";
+
 export default function Dashboard() {
   const [threadId, setThreadId] = useState<string>("");
   const [threads, setThreads] = useState<Array<{thread_id: string, title?: string}>>([]);
@@ -117,7 +120,7 @@ export default function Dashboard() {
   // Fetch threads and leads lists
   const fetchThreads = async () => {
     try {
-      const res = await fetch("http://localhost:8008/api/conversations", { headers: getHeaders() });
+      const res = await fetch(`${BACKEND_URL}/api/conversations`, { headers: getHeaders() });
       if (res.ok) {
         const data = await res.json();
         setThreads(data);
@@ -133,7 +136,7 @@ export default function Dashboard() {
     const newTitle = window.prompt("Rename chat thread:", currentTitle);
     if (!newTitle || newTitle.trim() === "") return;
     try {
-      const res = await fetch(`http://localhost:8008/api/conversations/${id}/title`, {
+      const res = await fetch(`${BACKEND_URL}/api/conversations/${id}/title`, {
         method: "PUT",
         headers: {
           ...getHeaders(),
@@ -153,7 +156,7 @@ export default function Dashboard() {
     const confirmed = window.confirm("Are you sure you want to delete this chat session? This will remove all conversation logs, leads status, and SDR agent memory.");
     if (!confirmed) return;
     try {
-      const res = await fetch(`http://localhost:8008/api/conversations/${id}`, {
+      const res = await fetch(`${BACKEND_URL}/api/conversations/${id}`, {
         method: "DELETE",
         headers: getHeaders()
       });
@@ -177,7 +180,7 @@ export default function Dashboard() {
 
   const fetchLeads = async () => {
     try {
-      const res = await fetch("http://localhost:8008/api/leads", { headers: getHeaders() });
+      const res = await fetch(`${BACKEND_URL}/api/leads`, { headers: getHeaders() });
       if (res.ok) {
         const data = await res.json();
         setLeads(data);
@@ -189,7 +192,7 @@ export default function Dashboard() {
 
   const fetchLeadProfile = async (id: string) => {
     try {
-      const res = await fetch(`http://localhost:8008/api/leads/${id}`, { headers: getHeaders() });
+      const res = await fetch(`${BACKEND_URL}/api/leads/${id}`, { headers: getHeaders() });
       if (res.ok) {
         const data = await res.json();
         setActiveLead(data);
@@ -223,7 +226,7 @@ export default function Dashboard() {
     toolCallsRef.current = [];
 
     // Connect to WebSocket passing api_key in query string for authentication
-    const socket = new WebSocket(`ws://localhost:8008/ws/chat/${threadId}?api_key=${apiKey}`);
+    const socket = new WebSocket(`${WS_URL}/ws/chat/${threadId}?api_key=${apiKey}`);
     
     socket.onopen = () => {
       setConnected(true);
@@ -365,7 +368,7 @@ export default function Dashboard() {
   // Supervisor actions
   const handleClaimThread = async (id: string) => {
     try {
-      const res = await fetch(`http://localhost:8008/api/handoffs/${id}/claim`, { method: "POST", headers: getHeaders() });
+      const res = await fetch(`${BACKEND_URL}/api/handoffs/${id}/claim`, { method: "POST", headers: getHeaders() });
       if (res.ok) {
         fetchLeads();
         fetchLeadProfile(id);
@@ -377,7 +380,7 @@ export default function Dashboard() {
 
   const handleResolveThread = async (id: string) => {
     try {
-      const res = await fetch(`http://localhost:8008/api/handoffs/${id}/resolve`, { method: "POST", headers: getHeaders() });
+      const res = await fetch(`${BACKEND_URL}/api/handoffs/${id}/resolve`, { method: "POST", headers: getHeaders() });
       if (res.ok) {
         fetchLeads();
         fetchLeadProfile(id);
@@ -390,7 +393,7 @@ export default function Dashboard() {
   const handleSendSupervisorMessage = async (id: string) => {
     if (!supervisorMessage.trim()) return;
     try {
-      const res = await fetch(`http://localhost:8008/api/handoffs/${id}/message`, {
+      const res = await fetch(`${BACKEND_URL}/api/handoffs/${id}/message`, {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({ message: supervisorMessage.trim() })
