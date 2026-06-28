@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     ENABLE_WHATSAPP_ALERTS: bool = False
     VAPI_PRIVATE_KEY: str = ""
     VAPI_PUBLIC_KEY: str = ""
+    ENCRYPTION_KEY: str = ""
+    REDIS_URL: str = ""
+    DEFAULT_TENANT_ID: str = "alpha_default"
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    JWT_SECRET: str = "change-me-in-production-use-long-random-string"
+    SUPER_ADMIN_EMAIL: str = "admin@alpha.dev"
+    SUPER_ADMIN_PASSWORD: str = "Admin123!change"
 
     model_config = SettingsConfigDict(
         env_file=os.path.join(os.path.dirname(__file__), ".env"),

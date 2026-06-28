@@ -23,9 +23,30 @@ from backend.database import (
     unlink_voice_call,
     get_recent_typed_chat_messages,
 )
+from backend.adapters.factory import AdapterFactory
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _tenant_id(config: RunnableConfig) -> str:
+    return config.get("configurable", {}).get("tenant_id") or settings.DEFAULT_TENANT_ID
+
+
+async def _load_tenant_context(config: RunnableConfig):
+    from backend.tenant.context import IntegrationConfigs, TenantContext, TenantSettings
+    from backend.tenant.registry import get_tenant_by_id
+
+    tid = _tenant_id(config)
+    ctx = await get_tenant_by_id(tid)
+    if ctx:
+        return ctx
+    return TenantContext(
+        tenant_id=tid,
+        org_name=tid,
+        settings=TenantSettings(),
+        integrations=IntegrationConfigs(),
+    )
 
 async def send_whatsapp_alert(thread_id: str, reason: str, caller_info: str = ""):
     """
@@ -83,14 +104,26 @@ async def send_whatsapp_alert(thread_id: str, reason: str, caller_info: str = ""
 
 
 @tool
-async def search_crm(company: str) -> str:
+async def search_crm(company: str, config: RunnableConfig) -> str:
     """
     Search the CRM for an existing lead profile or company info.
     Returns details of the company if found, otherwise returns a message indicating no record exists.
     """
+    tenant = await _load_tenant_context(config)
+    from backend.integrations.service import normalize_integrations
+
+    integrations = normalize_integrations(tenant.integrations_raw)
+    crm_provider = (integrations.get("crm") or {}).get("provider", "internal").lower()
+    if crm_provider not in ("none", "", "internal"):
+        crm = AdapterFactory.crm(tenant)
+        return await crm.search_company(company)
+
     from backend.database import get_db
+
     db = get_db()
-    lead = await db.leads.find_one({"company": {"$regex": company, "$options": "i"}})
+    lead = await db.leads.find_one(
+        {"tenant_id": tenant.tenant_id, "company": {"$regex": company, "$options": "i"}}
+    )
     if lead:
         return f"Found CRM Record: Company={lead.get('company')}, Status={lead.get('status')}, Fit={lead.get('fit')}"
     return f"No existing CRM record found for company: {company}"
@@ -116,7 +149,7 @@ async def update_lead_status(
         "status": status,
         "fit": fit
     }
-    await save_lead(thread_id, lead_data)
+    await save_lead(_tenant_id(config), thread_id, lead_data)
     return f"Lead status updated in CRM: Company={company}, Status={status}, Fit={fit}"
 
 @tool
@@ -130,9 +163,11 @@ async def schedule_demo(
     Pass in the requested meeting_time and the company name.
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    tenant_id = _tenant_id(config)
     from backend.database import get_db
     db = get_db()
     booking = {
+        "tenant_id": tenant_id,
         "thread_id": thread_id,
         "company": company,
         "meeting_time": meeting_time,
@@ -140,7 +175,7 @@ async def schedule_demo(
     }
     await db.meetings.insert_one(booking)
     await db.leads.update_one(
-        {"thread_id": thread_id},
+        {"tenant_id": tenant_id, "thread_id": thread_id},
         {"$set": {"status": "Demo Scheduled"}},
         upsert=True
     )
@@ -151,72 +186,31 @@ async def query_pos_database(
     product_query: Optional[str] = None,
     order_id: Optional[int] = None,
     customer_email: Optional[str] = None,
-    customer_phone: Optional[str] = None
+    customer_phone: Optional[str] = None,
+    config: RunnableConfig = None,
 ) -> str:
     """
-    Query the local read-only POS/Inventory database.
+    Query the tenant's configured inventory/POS sources (Shopify, SQL, demo catalog, etc.).
     Use this to check product pricing/stock or check order status for a customer.
     
     To check order status, you MUST provide the order_id along with either customer_email or customer_phone to authenticate ownership and secure private data.
     """
-    conn = sqlite3.connect(SQLITE_DB_PATH)
-    cursor = conn.cursor()
-    
+    tenant = await _load_tenant_context(config or {})
+    pos = AdapterFactory.pos(tenant)
+
     try:
         if order_id is not None:
-            if not customer_email and not customer_phone:
-                return "Error: You must provide the customer's email or phone number to verify ownership and query order details."
-            
-            cursor.execute("SELECT id, customer_email, customer_phone, status, total_price, items FROM orders WHERE id = ?", (order_id,))
-            row = cursor.fetchone()
-            if not row:
-                return f"No order found with ID: {order_id}"
-                
-            db_id, db_email, db_phone, db_status, db_total, db_items = row
-            
-            email_match = customer_email and customer_email.lower().strip() == db_email.lower().strip()
-            phone_match = customer_phone and customer_phone.strip() == (db_phone or "").strip()
-            
-            if not email_match and not phone_match:
-                return "Security Error: Customer verification failed. The provided email or phone does not match this order."
-                
-            return f"Order #{db_id} Details: Status={db_status}, Items={db_items}, Total={db_total}."
-            
-        elif product_query is not None:
-            # Generic terms like "products", "services", "all", "list" → return full catalog
-            generic_terms = {"product", "products", "service", "services", "all", "list", "everything", "what do you have", ""}
-            is_generic = product_query.strip().lower() in generic_terms
-
-            if is_generic:
-                cursor.execute("SELECT name, price, stock_quantity, description FROM products")
-                rows = cursor.fetchall()
-            else:
-                cursor.execute(
-                    "SELECT name, price, stock_quantity, description FROM products WHERE LOWER(name) LIKE LOWER(?)",
-                    (f"%{product_query}%",)
-                )
-                rows = cursor.fetchall()
-                if not rows:
-                    # Fallback: return all products so agent can answer anyway
-                    cursor.execute("SELECT name, price, stock_quantity, description FROM products")
-                    rows = cursor.fetchall()
-
-            if not rows:
-                return "No products found in the database."
-
-            results = [f"- {r[0]}: Price={r[1]}, In Stock={r[2]} ({r[3]})" for r in rows]
-            return "Product Catalog:\n" + "\n".join(results)
-            
-        else:
-            cursor.execute("SELECT name, price, stock_quantity, description FROM products")
-            rows = cursor.fetchall()
-            results = [f"- {r[0]}: Price={r[1]}, In Stock={r[2]} ({r[3]})" for r in rows]
-            return "Available SaaS Packages:\n" + "\n".join(results)
-            
+            return await pos.get_order_status(
+                int(order_id),
+                customer_email=customer_email,
+                customer_phone=customer_phone,
+            )
+        if product_query is not None:
+            return await pos.list_products(product_query)
+        return await pos.list_products(None)
     except Exception as e:
-        return f"Database query failed: {str(e)}"
-    finally:
-        conn.close()
+        logger.error("query_pos_database failed for tenant %s: %s", tenant.tenant_id, e, exc_info=True)
+        return f"Inventory query failed: {e}"
 
 @tool
 async def handoff_to_human(
@@ -234,20 +228,14 @@ async def handoff_to_human(
     Do NOT use this to reject or disqualify anyone.
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
-    from backend.database import get_db
-    db = get_db()
+    tenant_id = _tenant_id(config)
 
-    # Save caller details + mark as follow-up requested
-    await db.leads.update_one(
-        {"thread_id": thread_id},
-        {"$set": {
-            "status": "Follow-up Requested",
-            "handoff_reason": reason,
-            "name": caller_name,
-            "phone": caller_phone
-        }},
-        upsert=True
-    )
+    await save_lead(tenant_id, thread_id, {
+        "status": "Follow-up Requested",
+        "handoff_reason": reason,
+        "name": caller_name,
+        "phone": caller_phone,
+    })
 
     caller_info = f"Name: {caller_name} | Phone: {caller_phone}"
     logger.info(f"Human follow-up for thread {thread_id}: {caller_info} — {reason}")
@@ -275,6 +263,7 @@ async def book_appointment(
     Always collect ALL fields before calling this tool.
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    tenant_id = _tenant_id(config)
     
     # Validate required fields
     missing = []
@@ -293,12 +282,13 @@ async def book_appointment(
         return f"I still need the following details to complete your booking: {', '.join(missing)}. Could you please provide those?"
     
     # Check availability
-    available = await check_slot_available(date.strip(), time.strip())
+    available = await check_slot_available(tenant_id, date.strip(), time.strip())
     if not available:
         return f"Unfortunately, {date} at {time} is already taken. Could you suggest another date or time that works for you?"
     
     # Confirm and create booking
     appt = await create_appointment(
+        tenant_id=tenant_id,
         thread_id=thread_id,
         name=name.strip(),
         email=email.strip(),
@@ -326,6 +316,7 @@ async def place_order(
     product_name should match what they agreed to (e.g. 'SaaS Professional', 'Starter package').
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    tenant_id = _tenant_id(config)
 
     missing = []
     if not product_name or product_name.strip() == "":
@@ -343,7 +334,9 @@ async def place_order(
             "Could you share those with me?"
         )
 
-    product = _lookup_product(product_name.strip())
+    product = await AdapterFactory.pos(await _load_tenant_context(config)).lookup_product(product_name.strip())
+    if not product:
+        product = _lookup_product(product_name.strip())
     if not product:
         return (
             f"I couldn't find a product matching '{product_name}'. "
@@ -362,6 +355,7 @@ async def place_order(
     )
 
     await create_order(
+        tenant_id=tenant_id,
         thread_id=thread_id,
         customer_name=customer_name.strip(),
         customer_email=customer_email.strip(),
@@ -371,7 +365,7 @@ async def place_order(
         sqlite_order_id=sqlite_order_id,
     )
 
-    await save_lead(thread_id, {
+    await save_lead(tenant_id, thread_id, {
         "company": customer_name.strip(),
         "status": "Order Placed",
         "intent_score": 10,
@@ -398,11 +392,13 @@ async def lookup_appointments(
     Requires email or phone to verify identity.
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    tenant_id = _tenant_id(config)
 
     if (not email or "@" not in email) and (not phone or phone.strip() == ""):
         return "I can look that up for you — could you share the email or phone number you used when booking?"
 
     appts = await find_active_appointments(
+        tenant_id,
         email=email.strip() if email else None,
         phone=phone.strip() if phone else None,
         thread_id=thread_id,
@@ -432,11 +428,13 @@ async def cancel_appointment(
     Collect email or phone to verify identity. If they have multiple bookings, also ask for date and time.
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    tenant_id = _tenant_id(config)
 
     if (not email or "@" not in email) and (not phone or phone.strip() == ""):
         return "I can cancel that for you — what email or phone number did you use when you booked?"
 
     appts = await find_active_appointments(
+        tenant_id,
         email=email.strip() if email else None,
         phone=phone.strip() if phone else None,
         thread_id=thread_id,
@@ -455,7 +453,7 @@ async def cancel_appointment(
         )
 
     target = appts[0]
-    cancelled = await cancel_appointment_record(target["_id"])
+    cancelled = await cancel_appointment_record(tenant_id, target["_id"])
     if not cancelled:
         return "That appointment may already be cancelled. Can I help with anything else?"
 
@@ -482,6 +480,7 @@ async def reschedule_appointment(
     Then collect the new preferred date and time before calling this tool.
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    tenant_id = _tenant_id(config)
 
     missing = []
     if (not email or "@" not in email) and (not phone or phone.strip() == ""):
@@ -495,6 +494,7 @@ async def reschedule_appointment(
         return f"Happy to reschedule — I just need your {', '.join(missing)}."
 
     appts = await find_active_appointments(
+        tenant_id,
         email=email.strip() if email else None,
         phone=phone.strip() if phone else None,
         thread_id=thread_id,
@@ -519,11 +519,11 @@ async def reschedule_appointment(
     if target.get("date") == new_date and target.get("time") == new_time:
         return f"Your appointment is already scheduled for {new_date} at {new_time}. Anything else I can help with?"
 
-    available = await check_slot_available(new_date, new_time)
+    available = await check_slot_available(tenant_id, new_date, new_time)
     if not available:
         return f"{new_date} at {new_time} is already taken. Could you suggest another date or time?"
 
-    updated = await reschedule_appointment_record(target["_id"], new_date, new_time)
+    updated = await reschedule_appointment_record(tenant_id, target["_id"], new_date, new_time)
     if not updated:
         return "I wasn't able to update that appointment. Would you like me to try again or connect you with a team member?"
 
@@ -550,6 +550,8 @@ async def cancel_order(
     except (TypeError, ValueError):
         oid = 0
 
+    tenant_id = _tenant_id(config)
+
     if not oid:
         return "I can cancel that order — do you have your order number? It was shared when you placed the order."
 
@@ -557,6 +559,7 @@ async def cancel_order(
         return "To cancel your order, I'll need the email or phone number you used when ordering."
 
     orders = await find_active_orders(
+        tenant_id,
         order_id=oid,
         email=email.strip() if email else None,
         phone=phone.strip() if phone else None,
@@ -565,7 +568,7 @@ async def cancel_order(
     if not orders:
         from backend.database import get_db
         db = get_db()
-        any_order = await db.orders.find_one({"order_id": oid})
+        any_order = await db.orders.find_one({"tenant_id": tenant_id, "order_id": oid})
         if any_order and any_order.get("status") == "cancelled":
             return f"Order #{oid} is already cancelled. Is there anything else I can help with?"
         return (
@@ -577,7 +580,7 @@ async def cancel_order(
     if target.get("status") == "cancelled":
         return f"Order #{oid} is already cancelled. Can I help with anything else?"
 
-    cancelled = await cancel_order_record(oid)
+    cancelled = await cancel_order_record(tenant_id, oid)
     if not cancelled:
         return "I wasn't able to cancel that order right now. Would you like me to connect you with a team member?"
 
@@ -596,7 +599,8 @@ async def get_typed_chat_details(config: RunnableConfig) -> str:
     Prefer typed chat values over spoken dictation when both exist.
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
-    typed = await get_recent_typed_chat_messages(thread_id, limit=8)
+    tenant_id = _tenant_id(config)
+    typed = await get_recent_typed_chat_messages(tenant_id, thread_id, limit=8)
 
     if not typed:
         return (

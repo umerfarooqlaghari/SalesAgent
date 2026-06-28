@@ -31,10 +31,12 @@ async def main():
 
     # 1. Test case: Querying SaaS Packages (Inventory query RAG)
     thread_id = "test_verification_thread_v2"
-    config = {"configurable": {"thread_id": thread_id}}
+    tenant_id = "alpha_default"
+    config = {"configurable": {"thread_id": thread_id, "tenant_id": tenant_id}}
     inputs = {
         "messages": [HumanMessage(content="Hello! What packages do you sell? I want to know pricing and stock details.")],
-        "thread_id": thread_id
+        "thread_id": thread_id,
+        "tenant_id": tenant_id,
     }
     
     print("\n--- TEST CASE 1: Querying Inventory/Packages (POS SQL Tool) ---")
@@ -56,7 +58,8 @@ async def main():
     # 2. Test case: Checking Order status (Secure POS Query)
     inputs_order = {
         "messages": [HumanMessage(content="Can you verify the status of order #1001 for cto@cloudgrid.io?")],
-        "thread_id": thread_id
+        "thread_id": thread_id,
+        "tenant_id": tenant_id,
     }
     print("\n\n--- TEST CASE 2: Order Status Check (SQL Parameterized Verify) ---")
     async for event in graph.astream_events(inputs_order, config=config, version="v2"):
