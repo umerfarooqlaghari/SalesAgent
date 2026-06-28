@@ -166,13 +166,29 @@ async def query_pos_database(
             return f"Order #{db_id} Details: Status={db_status}, Items={db_items}, Total={db_total}."
             
         elif product_query is not None:
-            cursor.execute("SELECT name, price, stock_quantity, description FROM products WHERE name LIKE ?", (f"%{product_query}%",))
-            rows = cursor.fetchall()
+            # Generic terms like "products", "services", "all", "list" → return full catalog
+            generic_terms = {"product", "products", "service", "services", "all", "list", "everything", "what do you have", ""}
+            is_generic = product_query.strip().lower() in generic_terms
+
+            if is_generic:
+                cursor.execute("SELECT name, price, stock_quantity, description FROM products")
+                rows = cursor.fetchall()
+            else:
+                cursor.execute(
+                    "SELECT name, price, stock_quantity, description FROM products WHERE LOWER(name) LIKE LOWER(?)",
+                    (f"%{product_query}%",)
+                )
+                rows = cursor.fetchall()
+                if not rows:
+                    # Fallback: return all products so agent can answer anyway
+                    cursor.execute("SELECT name, price, stock_quantity, description FROM products")
+                    rows = cursor.fetchall()
+
             if not rows:
-                return f"No products matching query '{product_query}' were found in the database."
-            
+                return "No products found in the database."
+
             results = [f"- {r[0]}: Price={r[1]}, In Stock={r[2]} ({r[3]})" for r in rows]
-            return "Inventory Query Results:\n" + "\n".join(results)
+            return "Product Catalog:\n" + "\n".join(results)
             
         else:
             cursor.execute("SELECT name, price, stock_quantity, description FROM products")
@@ -188,42 +204,41 @@ async def query_pos_database(
 @tool
 async def handoff_to_human(
     reason: str,
+    caller_name: str,
+    caller_phone: str,
     config: RunnableConfig
 ) -> str:
     """
-    Logs the caller's request for human follow-up and reassures them a representative will reach out.
+    Logs the caller's details and notifies a human representative to follow up.
+    REQUIRED: Collect caller_name and caller_phone BEFORE calling this tool.
     Use ONLY when:
-    1. The user explicitly asks to speak with a human.
-    2. You genuinely don't know the answer and the user wants further help.
-    Do NOT use this to reject or disqualify any lead.
+    1. The user explicitly asks to speak with or be contacted by a human.
+    2. You genuinely don't know the answer and they want further help.
+    Do NOT use this to reject or disqualify anyone.
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
     from backend.database import get_db
     db = get_db()
 
-    # Mark lead as requesting follow-up
+    # Save caller details + mark as follow-up requested
     await db.leads.update_one(
         {"thread_id": thread_id},
-        {"$set": {"status": "Follow-up Requested", "handoff_reason": reason}},
+        {"$set": {
+            "status": "Follow-up Requested",
+            "handoff_reason": reason,
+            "name": caller_name,
+            "phone": caller_phone
+        }},
         upsert=True
     )
 
-    # Pull any stored caller info to include in the WhatsApp notification
-    lead = await db.leads.find_one({"thread_id": thread_id})
-    caller_parts = []
-    if lead:
-        if lead.get("name"): caller_parts.append(f"Name: {lead['name']}")
-        if lead.get("email"): caller_parts.append(f"Email: {lead['email']}")
-        if lead.get("phone"): caller_parts.append(f"Phone: {lead['phone']}")
-        if lead.get("company"): caller_parts.append(f"Company: {lead['company']}")
-    caller_info = " | ".join(caller_parts) if caller_parts else "No profile data yet"
-
-    logger.info(f"Human follow-up requested for thread {thread_id}: {reason}")
+    caller_info = f"Name: {caller_name} | Phone: {caller_phone}"
+    logger.info(f"Human follow-up for thread {thread_id}: {caller_info} — {reason}")
 
     # Fire WhatsApp notification to the operator
     await send_whatsapp_alert(thread_id, reason, caller_info)
 
-    return "I've noted your details and a representative will reach out to you within a couple of minutes. Is there anything else I can help you with in the meantime?"
+    return "Perfect, I've passed your details to our team. A representative will reach out to you within a few minutes. Is there anything else I can help you with?"
 
 
 @tool

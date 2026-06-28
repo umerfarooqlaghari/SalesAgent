@@ -29,20 +29,20 @@ interface ToolCall {
 
 export default function Dashboard() {
   const [threadId, setThreadId] = useState<string>("");
-  const [threads, setThreads] = useState<Array<{thread_id: string, title?: string}>>([]);
+  const [threads, setThreads] = useState<Array<{ thread_id: string, title?: string }>>([]);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [activeLead, setActiveLead] = useState<Lead | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeTab, setActiveTab] = useState<"sandbox" | "supervisor" | "leads" | "appointments">("sandbox");
   const [appointments, setAppointments] = useState<any[]>([]);
-  
+
   // Real-time states
   const [connected, setConnected] = useState<boolean>(false);
   const [statusText, setStatusText] = useState<string>("Disconnected");
   const [streamingThought, setStreamingThought] = useState<string>("");
   const [streamingResponse, setStreamingResponse] = useState<string>("");
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
-  
+
   // Extension Settings (v2)
   const [apiKey, setApiKey] = useState<string>("test_key_abc123");
   const [backendUrl, setBackendUrl] = useState<string>(() => {
@@ -55,12 +55,12 @@ export default function Dashboard() {
   const voiceEnabledRef = useRef(false);
   const [isCalling, setIsCalling] = useState<boolean>(false);
   const vapiRef = useRef<any>(null);
-  
+
   // Inputs
   const [chatInput, setChatInput] = useState<string>("");
   const [supervisorMessage, setSupervisorMessage] = useState<string>("");
   const [selectedHandoffThread, setSelectedHandoffThread] = useState<string>("");
-  
+
   // Refs to prevent closure stale states
   const ws = useRef<WebSocket | null>(null);
   const streamingThoughtRef = useRef("");
@@ -124,9 +124,9 @@ export default function Dashboard() {
         .replace(/<thought>[\s\S]*?<\/thought>/gi, "")
         .replace(/[*_`#~]/g, "")
         .trim();
-      
+
       if (!clean) return;
-      
+
       const utterance = new SpeechSynthesisUtterance(clean);
       window.speechSynthesis.speak(utterance);
     }
@@ -136,24 +136,24 @@ export default function Dashboard() {
     if (typeof window !== "undefined") {
       const vapiPublicKey = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY || "e8cd4840-5e48-4005-9b73-353ac169e70e";
       vapiRef.current = new Vapi(vapiPublicKey);
-      
+
       vapiRef.current.on("call-start", () => {
         setIsCalling(true);
         setStatusText("Vapi call connected!");
       });
-      
+
       vapiRef.current.on("call-end", () => {
         setIsCalling(false);
         setStatusText("Vapi call ended.");
       });
-      
+
       vapiRef.current.on("error", (e: any) => {
         console.error("Vapi call error:", e);
         setIsCalling(false);
         setStatusText("Vapi error: " + (e.message || "Failed"));
       });
     }
-    
+
     return () => {
       if (vapiRef.current) {
         vapiRef.current.stop();
@@ -180,7 +180,7 @@ export default function Dashboard() {
   useEffect(() => {
     fetchThreads();
     fetchLeads();
-    
+
     const randomId = "thread_" + Math.random().toString(36).substring(2, 10);
     setThreadId(randomId);
   }, [apiKey, backendUrl]); // Refetch if API key or backendUrl changes
@@ -303,22 +303,22 @@ export default function Dashboard() {
 
     // Connect to WebSocket passing api_key in query string for authentication
     const socket = new WebSocket(`${getWsUrl(backendUrl)}/ws/chat/${threadId}?api_key=${apiKey}`);
-    
+
     socket.onopen = () => {
       setConnected(true);
       setStatusText("Connected. Idle.");
     };
-    
+
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
-      
+
       if (data.type === "unauthorized") {
         setStatusText("Error: API Key Unauthorized");
         setConnected(false);
         socket.close();
         return;
       }
-      
+
       if (data.type === "history") {
         setMessages(data.messages);
       } else if (data.type === "lead_status") {
@@ -329,7 +329,7 @@ export default function Dashboard() {
         if (data.status === "Idle") {
           const finalResponse = streamingResponseRef.current;
           const finalThought = streamingThoughtRef.current;
-          
+
           if (finalResponse || finalThought) {
             setMessages((prev) => [
               ...prev,
@@ -339,12 +339,12 @@ export default function Dashboard() {
                 thought: finalThought || undefined
               }
             ]);
-            
+
             // Speak complete final response if TTS Voice Mode is toggled ON
             if (voiceEnabledRef.current && finalResponse) {
               speakResponse(finalResponse);
             }
-            
+
             streamingResponseRef.current = "";
             streamingThoughtRef.current = "";
             toolCallsRef.current = [];
@@ -364,9 +364,9 @@ export default function Dashboard() {
         toolCallsRef.current = updated;
         setToolCalls(updated);
       } else if (data.type === "tool_end") {
-        const updated = toolCallsRef.current.map((t) => 
-          t.tool === data.tool && t.status === "running" 
-            ? { ...t, output: data.output, status: "completed" as const } 
+        const updated = toolCallsRef.current.map((t) =>
+          t.tool === data.tool && t.status === "running"
+            ? { ...t, output: data.output, status: "completed" as const }
             : t
         );
         toolCallsRef.current = updated;
@@ -396,17 +396,17 @@ export default function Dashboard() {
         setToolCalls([]);
       }
     };
-    
+
     socket.onclose = () => {
       setConnected(false);
       setStatusText("Disconnected");
     };
-    
+
     socket.onerror = () => {
       setConnected(false);
       setStatusText("Connection error");
     };
-    
+
     ws.current = socket;
     fetchLeadProfile(threadId);
 
@@ -424,10 +424,10 @@ export default function Dashboard() {
   // Send message as Sandbox user
   const handleSendMessage = () => {
     if (!chatInput.trim() || !ws.current || ws.current.readyState !== WebSocket.OPEN) return;
-    
+
     const userMsg = chatInput.trim();
     setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
-    
+
     ws.current.send(JSON.stringify({ message: userMsg }));
     setChatInput("");
     setStreamingThought("");
@@ -591,11 +591,10 @@ export default function Dashboard() {
               return (
                 <div
                   key={id}
-                  className={`group w-full flex items-center justify-between rounded-lg text-xs font-semibold transition-all border ${
-                    threadId === id
+                  className={`group w-full flex items-center justify-between rounded-lg text-xs font-semibold transition-all border ${threadId === id
                       ? "bg-[#1E293B] text-sky-400 border-sky-500/30 shadow-[0_4px_12px_rgba(0,0,0,0.1)]"
                       : "bg-[#161F30]/40 text-slate-300 hover:bg-[#1E293B]/60 border-transparent"
-                  }`}
+                    }`}
                 >
                   <button
                     onClick={() => {
@@ -653,11 +652,10 @@ export default function Dashboard() {
           <nav className="flex gap-4">
             <button
               onClick={() => setActiveTab("sandbox")}
-              className={`px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${
-                activeTab === "sandbox"
+              className={`px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${activeTab === "sandbox"
                   ? "bg-[#1E293B] text-sky-400 border border-sky-500/20"
                   : "text-slate-400 hover:text-white"
-              }`}
+                }`}
             >
               Agent Chat Sandbox
             </button>
@@ -666,11 +664,10 @@ export default function Dashboard() {
                 setActiveTab("supervisor");
                 setSelectedHandoffThread(threadId);
               }}
-              className={`relative px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${
-                activeTab === "supervisor"
+              className={`relative px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${activeTab === "supervisor"
                   ? "bg-[#1E293B] text-sky-400 border border-sky-500/20"
                   : "text-slate-400 hover:text-white"
-              }`}
+                }`}
             >
               Supervisor Console
               {leads.some((l) => l.status === "Handoff Requested") && (
@@ -684,11 +681,10 @@ export default function Dashboard() {
                 setActiveTab("leads");
                 fetchLeads();
               }}
-              className={`px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${
-                activeTab === "leads"
+              className={`px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${activeTab === "leads"
                   ? "bg-[#1E293B] text-sky-400 border border-sky-500/20"
                   : "text-slate-400 hover:text-white"
-              }`}
+                }`}
             >
               CRM Synced Leads
             </button>
@@ -703,13 +699,12 @@ export default function Dashboard() {
                     const data = await res.json();
                     setAppointments(data.appointments || []);
                   }
-                } catch {}
+                } catch { }
               }}
-              className={`px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${
-                activeTab === "appointments"
+              className={`px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${activeTab === "appointments"
                   ? "bg-[#1E293B] text-sky-400 border border-sky-500/20"
                   : "text-slate-400 hover:text-white"
-              }`}
+                }`}
             >
               📅 Appointments
             </button>
@@ -719,11 +714,10 @@ export default function Dashboard() {
           <div className="flex items-center gap-3">
             <button
               onClick={handleToggleVapiCall}
-              className={`px-3.5 py-1.5 rounded-lg border text-xs font-bold uppercase tracking-wider transition-all duration-300 flex items-center gap-2 ${
-                isCalling
+              className={`px-3.5 py-1.5 rounded-lg border text-xs font-bold uppercase tracking-wider transition-all duration-300 flex items-center gap-2 ${isCalling
                   ? "bg-rose-950/60 text-rose-400 border-rose-800/80 shadow-[0_0_8px_rgba(244,63,94,0.15)] animate-pulse"
                   : "bg-slate-800/50 hover:bg-slate-700/50 text-sky-400 border-sky-500/20"
-              }`}
+                }`}
             >
               {isCalling ? (
                 <>
@@ -738,26 +732,6 @@ export default function Dashboard() {
               )}
             </button>
 
-            <button
-              onClick={() => setVoiceEnabled(!voiceEnabled)}
-              className={`px-3.5 py-1.5 rounded-lg border text-xs font-bold uppercase tracking-wider transition-all duration-300 flex items-center gap-2 ${
-                voiceEnabled
-                  ? "bg-emerald-950/60 text-emerald-400 border-emerald-800/80 shadow-[0_0_8px_rgba(52,211,153,0.15)]"
-                  : "bg-slate-800/50 text-slate-400 border-slate-700"
-              }`}
-            >
-              {voiceEnabled ? (
-                <>
-                  <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-                  🔊 Voice Agent: ON
-                </>
-              ) : (
-                <>
-                  <span className="h-2 w-2 rounded-full bg-slate-500" />
-                  🔇 Voice Agent: OFF
-                </>
-              )}
-            </button>
 
             <div className="flex items-center gap-3">
               <div className="text-right">
@@ -804,26 +778,23 @@ export default function Dashboard() {
                     {messages.map((msg, idx) => (
                       <div
                         key={idx}
-                        className={`flex gap-4 max-w-4xl ${
-                          msg.role === "user" ? "ml-auto flex-row-reverse" : ""
-                        }`}
+                        className={`flex gap-4 max-w-4xl ${msg.role === "user" ? "ml-auto flex-row-reverse" : ""
+                          }`}
                       >
                         {/* Avatar */}
-                        <div className={`h-8 w-8 rounded-lg flex items-center justify-center shrink-0 text-xs font-extrabold ${
-                          msg.role === "user" 
-                            ? "bg-slate-700 text-white" 
+                        <div className={`h-8 w-8 rounded-lg flex items-center justify-center shrink-0 text-xs font-extrabold ${msg.role === "user"
+                            ? "bg-slate-700 text-white"
                             : "bg-gradient-to-tr from-sky-500 to-indigo-600 text-white shadow-md shadow-indigo-500/10"
-                        }`}>
+                          }`}>
                           {msg.role === "user" ? "U" : "SDR"}
                         </div>
 
                         {/* Speech Bubble */}
                         <div className="space-y-2 max-w-[85%]">
-                          <div className={`rounded-xl px-4 py-2.5 text-sm leading-relaxed border ${
-                            msg.role === "user"
+                          <div className={`rounded-xl px-4 py-2.5 text-sm leading-relaxed border ${msg.role === "user"
                               ? "bg-[#1E293B] text-slate-100 border-[#2D3D54] shadow-sm shadow-slate-900/5"
                               : "bg-[#161F30]/80 text-slate-200 border-[#202E47]"
-                          }`}>
+                            }`}>
                             {msg.content}
                           </div>
 
@@ -852,9 +823,8 @@ export default function Dashboard() {
                         <div className="flex-1 bg-[#101726]/60 border border-slate-800/80 rounded-lg p-3 text-xs font-mono max-w-[85%]">
                           <div className="flex items-center justify-between text-slate-400 border-b border-slate-800/80 pb-1.5 mb-1.5">
                             <span className="font-bold text-sky-400">🔧 tool_call: {call.tool}()</span>
-                            <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold ${
-                              call.status === "running" ? "bg-indigo-950 text-indigo-300 animate-pulse" : "bg-emerald-950 text-emerald-300"
-                            }`}>
+                            <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold ${call.status === "running" ? "bg-indigo-950 text-indigo-300 animate-pulse" : "bg-emerald-950 text-emerald-300"
+                              }`}>
                               {call.status}
                             </span>
                           </div>
@@ -1038,11 +1008,10 @@ export default function Dashboard() {
                           setSelectedHandoffThread(lead.thread_id);
                           setThreadId(lead.thread_id);
                         }}
-                        className={`w-full text-left p-3.5 rounded-xl border transition-all ${
-                          selectedHandoffThread === lead.thread_id
+                        className={`w-full text-left p-3.5 rounded-xl border transition-all ${selectedHandoffThread === lead.thread_id
                             ? "bg-[#1E293B] text-white border-sky-500/30"
                             : "bg-[#161F30]/40 text-slate-300 hover:bg-[#1E293B]/40 border-[#1F293D]"
-                        }`}
+                          }`}
                       >
                         <div className="flex items-center justify-between mb-1.5">
                           <span className="font-bold text-xs truncate max-w-[120px]">
@@ -1094,21 +1063,18 @@ export default function Dashboard() {
                     {messages.map((msg, idx) => (
                       <div
                         key={idx}
-                        className={`flex gap-4 max-w-4xl ${
-                          msg.role === "user" ? "ml-auto flex-row-reverse" : ""
-                        }`}
+                        className={`flex gap-4 max-w-4xl ${msg.role === "user" ? "ml-auto flex-row-reverse" : ""
+                          }`}
                       >
-                        <div className={`h-8 w-8 rounded-lg flex items-center justify-center shrink-0 text-xs font-extrabold ${
-                          msg.role === "user" ? "bg-slate-700 text-white" : "bg-[#1E293B] text-sky-400"
-                        }`}>
+                        <div className={`h-8 w-8 rounded-lg flex items-center justify-center shrink-0 text-xs font-extrabold ${msg.role === "user" ? "bg-slate-700 text-white" : "bg-[#1E293B] text-sky-400"
+                          }`}>
                           {msg.role === "user" ? "U" : "OP"}
                         </div>
                         <div className="space-y-1 max-w-[85%]">
-                          <div className={`rounded-xl px-4 py-2.5 text-sm leading-relaxed border ${
-                            msg.role === "user"
+                          <div className={`rounded-xl px-4 py-2.5 text-sm leading-relaxed border ${msg.role === "user"
                               ? "bg-[#1E293B] text-slate-100 border-[#2D3D54]"
                               : "bg-[#161F30]/80 text-slate-200 border-[#202E47]"
-                          }`}>
+                            }`}>
                             {msg.content}
                           </div>
                           {msg.thought && (
@@ -1243,7 +1209,7 @@ export default function Dashboard() {
                       const data = await res.json();
                       setAppointments(data.appointments || []);
                     }
-                  } catch {}
+                  } catch { }
                 }}
                 className="px-3 py-1.5 text-xs font-bold bg-sky-500/10 text-sky-400 border border-sky-500/20 rounded-lg hover:bg-sky-500/20 transition-all"
               >
@@ -1290,13 +1256,12 @@ export default function Dashboard() {
                           </span>
                         </td>
                         <td className="py-4 px-5">
-                          <span className={`px-2 py-0.5 rounded text-xs font-bold border ${
-                            appt.status === "confirmed"
+                          <span className={`px-2 py-0.5 rounded text-xs font-bold border ${appt.status === "confirmed"
                               ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
                               : appt.status === "cancelled"
-                              ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
-                              : "bg-slate-500/10 text-slate-400 border-slate-500/20"
-                          }`}>
+                                ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                                : "bg-slate-500/10 text-slate-400 border-slate-500/20"
+                            }`}>
                             {appt.status || "pending"}
                           </span>
                         </td>
