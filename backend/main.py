@@ -12,11 +12,13 @@ dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
 dns.resolver.default_resolver.nameservers = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
 
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, AsyncIterator
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body, Security, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
+import json
 
 from backend.config import settings
 from backend.database import (
@@ -404,72 +406,80 @@ async def get_vapi_public_key(api_key: str = Depends(validate_api_key)):
 @app.post("/chat/completions")
 async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     import re
-    # Vapi sends messages, extract the last user message
+
     messages_list = data.get("messages", [])
+    wants_stream = data.get("stream", False)
+
     if not messages_list:
-        return {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "Hello! Welcome to Alpha. How can I assist you today?"
-                }
-            }]
+        fallback = {
+            "choices": [{"message": {"role": "assistant", "content": "Hello! Welcome to Alpha. How can I assist you today?"}}]
         }
-        
-    last_msg = messages_list[-1]
-    user_content = last_msg.get("content", "")
-    
-    # Use unique Vapi Call ID or default fallback
+        if wants_stream:
+            async def fallback_gen():
+                chunk = {"choices": [{"delta": {"role": "assistant", "content": "Hello! Welcome to Alpha. How can I assist you today?"}, "finish_reason": None}]}
+                yield f"data: {json.dumps(chunk)}\n\n"
+                done = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(done)}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(fallback_gen(), media_type="text/event-stream")
+        return fallback
+
+    # Find last user message
+    user_content = ""
+    for msg in reversed(messages_list):
+        if msg.get("role") == "user":
+            raw = msg.get("content", "")
+            if isinstance(raw, list):
+                user_content = " ".join(p.get("text", "") for p in raw if isinstance(p, dict))
+            else:
+                user_content = str(raw)
+            break
+
     call_id = data.get("call", {}).get("id") or "vapi_default_session"
     thread_id = f"vapi_{call_id}"
-    
-    # Save user transcript message
+
     await save_conversation_message(thread_id, "user", user_content)
-    
-    # Run the SDR LangGraph graph
+
+    # Run the LangGraph SDR brain
     graph = await get_agent_graph()
     config = {"configurable": {"thread_id": thread_id}}
     inputs = {"messages": [HumanMessage(content=user_content)], "thread_id": thread_id}
-    
     result = await graph.ainvoke(inputs, config=config)
-    
-    # Extract the assistant's response and filter reasoning thought blocks
+
+    # Extract plain text assistant response
     assistant_msg = ""
     messages_out = result.get("messages", [])
     if messages_out:
         last_out = messages_out[-1]
         content = last_out.content
-        
-        # Resolve content if it is a list of blocks (multimodal/rich format)
         if isinstance(content, list):
-            text_parts = []
-            for part in content:
-                if isinstance(part, dict) and "text" in part:
-                    text_parts.append(part["text"])
-                elif isinstance(part, str):
-                    text_parts.append(part)
-            content = " ".join(text_parts)
+            content = " ".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
         elif not isinstance(content, str):
             content = str(content)
-            
         if "<thought>" in content and "</thought>" in content:
             content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL).strip()
         assistant_msg = content
-        
-    # Save assistant response transcript message
+
     await save_conversation_message(thread_id, "assistant", assistant_msg)
-        
-    # Return OpenAI-compatible response format
-    return {
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": assistant_msg
-                }
-            }
-        ]
-    }
+
+    # Always stream SSE — Vapi requires streaming to feed TTS pipeline
+    async def stream_response() -> AsyncIterator[str]:
+        # Send the full content in one chunk then close
+        chunk = {
+            "id": f"chatcmpl-{thread_id}",
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": assistant_msg}, "finish_reason": None}]
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        done_chunk = {
+            "id": f"chatcmpl-{thread_id}",
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }
+        yield f"data: {json.dumps(done_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream_response(), media_type="text/event-stream")
 
 @app.post("/api/voice/webhook")
 @app.post("/webhook")
