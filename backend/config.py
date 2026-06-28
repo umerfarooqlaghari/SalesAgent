@@ -7,12 +7,6 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str
     GOOGLE_CLOUD_PROJECT: str = ""
     PORT: int = 8000
-    TWILIO_ACCOUNT_SID: str = ""
-    TWILIO_API_KEY_SID: str = ""
-    TWILIO_API_KEY_SECRET: str = ""
-    TWILIO_WHATSAPP_FROM: str = ""
-    TWILIO_WHATSAPP_TO: str = ""
-    ENABLE_WHATSAPP_ALERTS: bool = False
     VAPI_PRIVATE_KEY: str = ""
     VAPI_PUBLIC_KEY: str = ""
 

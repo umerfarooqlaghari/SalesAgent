@@ -1,7 +1,6 @@
 import sqlite3
 import logging
 from typing import Optional
-import httpx
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 
@@ -9,52 +8,6 @@ from backend.database import save_lead, SQLITE_DB_PATH, check_slot_available, cr
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
-
-async def send_whatsapp_alert(thread_id: str, reason: str):
-    """
-    Triggers Twilio WhatsApp Template notification to the agent operator.
-    """
-    if not settings.ENABLE_WHATSAPP_ALERTS:
-        logger.info("WhatsApp alerts are disabled in config settings.")
-        return
-        
-    username = settings.TWILIO_API_KEY_SID or settings.TWILIO_ACCOUNT_SID
-    password = settings.TWILIO_API_KEY_SECRET or getattr(settings, "TWILIO_AUTH_TOKEN", "")
-    
-    if not settings.TWILIO_ACCOUNT_SID or not password:
-        logger.warning("Twilio credentials missing. Cannot dispatch WhatsApp alert.")
-        return
-        
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{settings.TWILIO_ACCOUNT_SID}/Messages.json"
-    
-    # Twilio requires From and To to prefix with 'whatsapp:'
-    from_wa = settings.TWILIO_WHATSAPP_FROM
-    if from_wa and not from_wa.startswith("whatsapp:"):
-        from_wa = f"whatsapp:{from_wa}"
-    if not from_wa:
-        from_wa = "whatsapp:+14155238886"  # Sandbox default
-        
-    to_wa = settings.TWILIO_WHATSAPP_TO
-    if to_wa and not to_wa.startswith("whatsapp:"):
-        to_wa = f"whatsapp:{to_wa}"
-    if not to_wa:
-        to_wa = "whatsapp:+923335943063"
-        
-    payload = {
-        "From": from_wa,
-        "To": to_wa,
-        "Body": f"⚠️ *SDR SDR Handoff Alert*\n\nThread: {thread_id}\nReason: {reason}\n\n👉 Open the console: http://localhost:3000"
-    }
-    
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, data=payload, auth=(username, password))
-            if response.status_code == 201:
-                logger.info(f"WhatsApp alert sent successfully for thread: {thread_id}")
-            else:
-                logger.error(f"Failed to dispatch WhatsApp alert. Twilio response: {response.text}")
-        except Exception as e:
-            logger.error(f"Error calling Twilio API: {e}", exc_info=True)
 
 @tool
 async def search_crm(company: str) -> str:
@@ -182,23 +135,22 @@ async def handoff_to_human(
     config: RunnableConfig
 ) -> str:
     """
-    Connects the caller with a human team member.
-    Use this ONLY when the user explicitly asks to speak with a human or be transferred.
-    Do NOT use this to reject leads.
+    Logs the caller's request for human follow-up and reassures them a representative will reach out.
+    Use ONLY when:
+    1. The user explicitly asks to speak with a human.
+    2. You genuinely don't know the answer and the user wants further help.
+    Do NOT use this to reject or disqualify any lead.
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
     from backend.database import get_db
     db = get_db()
     await db.leads.update_one(
         {"thread_id": thread_id},
-        {"$set": {"status": "Handoff Requested", "handoff_reason": reason}},
+        {"$set": {"status": "Follow-up Requested", "handoff_reason": reason}},
         upsert=True
     )
-    
-    # Send WhatsApp Alert notification
-    await send_whatsapp_alert(thread_id, reason)
-    
-    return "Connecting you with a team member now. Please hold for just a moment."
+    logger.info(f"Human follow-up requested for thread {thread_id}: {reason}")
+    return "I've noted your details and a representative will reach out to you within a couple of minutes. Is there anything else I can help you with in the meantime?"
 
 
 @tool
