@@ -410,7 +410,7 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "content": "Hello! Welcome to SaaSFlow AI. How can I assist you today?"
+                    "content": "Hello! Welcome to Alpha. How can I assist you today?"
                 }
             }]
         }
@@ -435,6 +435,19 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     if messages_out:
         last_out = messages_out[-1]
         content = last_out.content
+        
+        # Resolve content if it is a list of blocks (multimodal/rich format)
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and "text" in part:
+                    text_parts.append(part["text"])
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            content = " ".join(text_parts)
+        elif not isinstance(content, str):
+            content = str(content)
+            
         if "<thought>" in content and "</thought>" in content:
             content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL).strip()
         assistant_msg = content

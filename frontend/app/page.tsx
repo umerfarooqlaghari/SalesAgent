@@ -26,9 +26,6 @@ interface ToolCall {
   status: "running" | "completed";
 }
 
-const BACKEND_URL = "https://salesagent-b6po.onrender.com";
-const WS_URL = "wss://salesagent-b6po.onrender.com";
-
 export default function Dashboard() {
   const [threadId, setThreadId] = useState<string>("");
   const [threads, setThreads] = useState<Array<{thread_id: string, title?: string}>>([]);
@@ -46,6 +43,12 @@ export default function Dashboard() {
   
   // Extension Settings (v2)
   const [apiKey, setApiKey] = useState<string>("test_key_abc123");
+  const [backendUrl, setBackendUrl] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("sdr_backend_url") || process.env.NEXT_PUBLIC_BACKEND_URL || "https://salesagent-b6po.onrender.com";
+    }
+    return process.env.NEXT_PUBLIC_BACKEND_URL || "https://salesagent-b6po.onrender.com";
+  });
   const [voiceEnabled, setVoiceEnabled] = useState<boolean>(false);
   const voiceEnabledRef = useRef(false);
   
@@ -84,6 +87,23 @@ export default function Dashboard() {
     }
   };
 
+  const handleBackendUrlChange = (val: string) => {
+    setBackendUrl(val);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("sdr_backend_url", val);
+    }
+  };
+
+  const getWsUrl = (url: string) => {
+    try {
+      const u = new URL(url);
+      const protocol = u.protocol === "https:" ? "wss:" : "ws:";
+      return `${protocol}//${u.host}`;
+    } catch (e) {
+      return "wss://salesagent-b6po.onrender.com";
+    }
+  };
+
   const getHeaders = () => {
     return {
       "Authorization": `Bearer ${apiKey}`,
@@ -115,15 +135,23 @@ export default function Dashboard() {
     
     const randomId = "thread_" + Math.random().toString(36).substring(2, 10);
     setThreadId(randomId);
-  }, [apiKey]); // Refetch if API key changes
+  }, [apiKey, backendUrl]); // Refetch if API key or backendUrl changes
 
   // Fetch threads and leads lists
   const fetchThreads = async () => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/conversations`, { headers: getHeaders() });
+      const res = await fetch(`${backendUrl}/api/conversations`, { headers: getHeaders() });
       if (res.ok) {
         const data = await res.json();
-        setThreads(data);
+        const uniqueThreads: any[] = [];
+        const seenIds = new Set();
+        for (const t of data) {
+          if (t && t.thread_id && !seenIds.has(t.thread_id)) {
+            seenIds.add(t.thread_id);
+            uniqueThreads.push(t);
+          }
+        }
+        setThreads(uniqueThreads);
       } else if (res.status === 401) {
         setStatusText("Error: Invalid API Key (401)");
       }
@@ -136,7 +164,7 @@ export default function Dashboard() {
     const newTitle = window.prompt("Rename chat thread:", currentTitle);
     if (!newTitle || newTitle.trim() === "") return;
     try {
-      const res = await fetch(`${BACKEND_URL}/api/conversations/${id}/title`, {
+      const res = await fetch(`${backendUrl}/api/conversations/${id}/title`, {
         method: "PUT",
         headers: {
           ...getHeaders(),
@@ -156,7 +184,7 @@ export default function Dashboard() {
     const confirmed = window.confirm("Are you sure you want to delete this chat session? This will remove all conversation logs, leads status, and SDR agent memory.");
     if (!confirmed) return;
     try {
-      const res = await fetch(`${BACKEND_URL}/api/conversations/${id}`, {
+      const res = await fetch(`${backendUrl}/api/conversations/${id}`, {
         method: "DELETE",
         headers: getHeaders()
       });
@@ -180,7 +208,7 @@ export default function Dashboard() {
 
   const fetchLeads = async () => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/leads`, { headers: getHeaders() });
+      const res = await fetch(`${backendUrl}/api/leads`, { headers: getHeaders() });
       if (res.ok) {
         const data = await res.json();
         setLeads(data);
@@ -192,7 +220,7 @@ export default function Dashboard() {
 
   const fetchLeadProfile = async (id: string) => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/leads/${id}`, { headers: getHeaders() });
+      const res = await fetch(`${backendUrl}/api/leads/${id}`, { headers: getHeaders() });
       if (res.ok) {
         const data = await res.json();
         setActiveLead(data);
@@ -226,7 +254,7 @@ export default function Dashboard() {
     toolCallsRef.current = [];
 
     // Connect to WebSocket passing api_key in query string for authentication
-    const socket = new WebSocket(`${WS_URL}/ws/chat/${threadId}?api_key=${apiKey}`);
+    const socket = new WebSocket(`${getWsUrl(backendUrl)}/ws/chat/${threadId}?api_key=${apiKey}`);
     
     socket.onopen = () => {
       setConnected(true);
@@ -334,12 +362,16 @@ export default function Dashboard() {
     ws.current = socket;
     fetchLeadProfile(threadId);
 
-    setThreads((prev) => (prev.includes(threadId) ? prev : [...prev, threadId]));
+    setThreads((prev) => {
+      const exists = prev.some((t) => t.thread_id === threadId);
+      if (exists) return prev;
+      return [...prev, { thread_id: threadId }];
+    });
 
     return () => {
       socket.close();
     };
-  }, [threadId, apiKey]);
+  }, [threadId, apiKey, backendUrl]);
 
   // Send message as Sandbox user
   const handleSendMessage = () => {
@@ -368,7 +400,7 @@ export default function Dashboard() {
   // Supervisor actions
   const handleClaimThread = async (id: string) => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/handoffs/${id}/claim`, { method: "POST", headers: getHeaders() });
+      const res = await fetch(`${backendUrl}/api/handoffs/${id}/claim`, { method: "POST", headers: getHeaders() });
       if (res.ok) {
         fetchLeads();
         fetchLeadProfile(id);
@@ -380,7 +412,7 @@ export default function Dashboard() {
 
   const handleResolveThread = async (id: string) => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/handoffs/${id}/resolve`, { method: "POST", headers: getHeaders() });
+      const res = await fetch(`${backendUrl}/api/handoffs/${id}/resolve`, { method: "POST", headers: getHeaders() });
       if (res.ok) {
         fetchLeads();
         fetchLeadProfile(id);
@@ -393,7 +425,7 @@ export default function Dashboard() {
   const handleSendSupervisorMessage = async (id: string) => {
     if (!supervisorMessage.trim()) return;
     try {
-      const res = await fetch(`${BACKEND_URL}/api/handoffs/${id}/message`, {
+      const res = await fetch(`${backendUrl}/api/handoffs/${id}/message`, {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({ message: supervisorMessage.trim() })
@@ -436,10 +468,10 @@ export default function Dashboard() {
         <div className="p-6 border-b border-[#1F293D] flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="h-8 w-8 rounded-lg bg-gradient-to-tr from-sky-500 to-indigo-600 flex items-center justify-center font-bold text-white shadow-md shadow-indigo-500/20">
-              S
+              A
             </div>
             <div>
-              <h1 className="font-extrabold text-sm tracking-wide text-white">SAASFLOW AI</h1>
+              <h1 className="font-extrabold text-sm tracking-wide text-white">ALPHA</h1>
               <span className="text-[10px] text-slate-400 font-medium">B2B SDR AGENT CONSOLE</span>
             </div>
           </div>
@@ -465,6 +497,19 @@ export default function Dashboard() {
             value={apiKey}
             onChange={(e) => handleApiKeyChange(e.target.value)}
             placeholder="Enter API key to unlock..."
+            className="w-full bg-[#1A2234] border border-[#2D3D54] rounded-lg px-3 py-1.5 text-xs text-[#F1F5F9] focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 transition-all font-mono"
+          />
+          <div className="flex items-center justify-between mt-3 mb-1.5">
+            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+              Backend Service URL
+            </label>
+            <span className="text-[9px] font-bold text-sky-400 uppercase">Host</span>
+          </div>
+          <input
+            type="text"
+            value={backendUrl}
+            onChange={(e) => handleBackendUrlChange(e.target.value)}
+            placeholder="e.g. https://salesagent-b6po.onrender.com"
             className="w-full bg-[#1A2234] border border-[#2D3D54] rounded-lg px-3 py-1.5 text-xs text-[#F1F5F9] focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 transition-all font-mono"
           />
         </div>

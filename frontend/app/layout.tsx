@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SaaSFlow AI - B2B SDR Agent Console",
+  title: "Alpha - B2B SDR Agent Console",
   description: "Autonomous B2B Sales agent platform with LangGraph, MongoDB and real-time HITL",
 };
 
