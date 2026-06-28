@@ -469,3 +469,10 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
             }
         ]
     }
+
+@app.post("/api/voice/webhook")
+async def vapi_webhook(data: Dict[str, Any] = Body(...)):
+    message = data.get("message", {})
+    msg_type = message.get("type")
+    logger.info(f"Received Vapi webhook event: {msg_type}")
+    return {"status": "success", "event": msg_type}
