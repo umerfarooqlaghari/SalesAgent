@@ -1,6 +1,7 @@
 import sqlite3
 import logging
 from typing import Optional
+import httpx
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 
@@ -8,6 +9,61 @@ from backend.database import save_lead, SQLITE_DB_PATH, check_slot_available, cr
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
+
+async def send_whatsapp_alert(thread_id: str, reason: str, caller_info: str = ""):
+    """
+    Sends a WhatsApp notification via Twilio REST API when a lead requests human follow-up.
+    Uses Account SID + Auth Token basic auth (not API key pair).
+    """
+    if not settings.ENABLE_WHATSAPP_ALERTS:
+        logger.info("WhatsApp alerts disabled — set ENABLE_WHATSAPP_ALERTS=True to enable.")
+        return
+
+    account_sid = settings.TWILIO_ACCOUNT_SID
+    # Use Auth Token if available, otherwise fall back to API Key Secret
+    auth_token = settings.TWILIO_AUTH_TOKEN or settings.TWILIO_API_KEY_SECRET
+
+    if not account_sid or not auth_token:
+        logger.warning("Twilio credentials missing (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN). Cannot send WhatsApp alert.")
+        return
+
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+
+    from_wa = settings.TWILIO_WHATSAPP_FROM or "whatsapp:+14155238886"
+    to_wa = settings.TWILIO_WHATSAPP_TO
+    if not to_wa:
+        logger.warning("TWILIO_WHATSAPP_TO not set. Cannot send WhatsApp alert.")
+        return
+
+    # Ensure whatsapp: prefix
+    if not from_wa.startswith("whatsapp:"):
+        from_wa = f"whatsapp:{from_wa}"
+    if not to_wa.startswith("whatsapp:"):
+        to_wa = f"whatsapp:{to_wa}"
+
+    body = (
+        f"🔔 *Alpha — Lead Follow-Up Request*\n\n"
+        f"Thread: `{thread_id}`\n"
+        f"Reason: {reason}\n"
+        f"{('Caller Info: ' + caller_info) if caller_info else ''}\n\n"
+        f"👉 Open the console to review: https://salesagent-b6po.onrender.com"
+    )
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            response = await client.post(
+                url,
+                data={"From": from_wa, "To": to_wa, "Body": body},
+                auth=(account_sid, auth_token)
+            )
+            if response.status_code == 201:
+                logger.info(f"✅ WhatsApp alert sent for thread {thread_id}")
+            else:
+                logger.error(f"❌ Twilio returned {response.status_code}: {response.text}")
+        except Exception as e:
+            logger.error(f"❌ WhatsApp alert failed: {e}", exc_info=True)
+
+
 
 @tool
 async def search_crm(company: str) -> str:
@@ -144,12 +200,29 @@ async def handoff_to_human(
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
     from backend.database import get_db
     db = get_db()
+
+    # Mark lead as requesting follow-up
     await db.leads.update_one(
         {"thread_id": thread_id},
         {"$set": {"status": "Follow-up Requested", "handoff_reason": reason}},
         upsert=True
     )
+
+    # Pull any stored caller info to include in the WhatsApp notification
+    lead = await db.leads.find_one({"thread_id": thread_id})
+    caller_parts = []
+    if lead:
+        if lead.get("name"): caller_parts.append(f"Name: {lead['name']}")
+        if lead.get("email"): caller_parts.append(f"Email: {lead['email']}")
+        if lead.get("phone"): caller_parts.append(f"Phone: {lead['phone']}")
+        if lead.get("company"): caller_parts.append(f"Company: {lead['company']}")
+    caller_info = " | ".join(caller_parts) if caller_parts else "No profile data yet"
+
     logger.info(f"Human follow-up requested for thread {thread_id}: {reason}")
+
+    # Fire WhatsApp notification to the operator
+    await send_whatsapp_alert(thread_id, reason, caller_info)
+
     return "I've noted your details and a representative will reach out to you within a couple of minutes. Is there anything else I can help you with in the meantime?"
 
 
