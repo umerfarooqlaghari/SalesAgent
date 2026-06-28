@@ -2,7 +2,7 @@ import httpx
 import json
 
 def test_vapi_custom_llm_integration():
-    url = "http://localhost:8008/api/voice/chat/completions"
+    url = "http://localhost:8008/chat/completions"
     
     # Mock Vapi payload structure
     payload = {

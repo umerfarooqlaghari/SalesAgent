@@ -401,6 +401,7 @@ async def get_vapi_public_key(api_key: str = Depends(validate_api_key)):
     return {"public_key": settings.VAPI_PUBLIC_KEY}
 
 @app.post("/api/voice/chat/completions")
+@app.post("/chat/completions")
 async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     import re
     # Vapi sends messages, extract the last user message
@@ -471,6 +472,7 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     }
 
 @app.post("/api/voice/webhook")
+@app.post("/webhook")
 async def vapi_webhook(data: Dict[str, Any] = Body(...)):
     message = data.get("message", {})
     msg_type = message.get("type")
