@@ -123,11 +123,65 @@ async def get_tenant_by_id(tenant_id: str) -> Optional[TenantContext]:
     return TenantContext.from_document(doc)
 
 
+async def migrate_stale_tenant_prompts() -> None:
+    """Replace copied Alpha demo prompts on real client tenants (one-time / startup)."""
+    from backend.agent.prompts import build_tenant_system_prompt, is_alpha_default_prompt
+    from backend.integrations.normalize import normalize_integrations
+    from backend.integrations.service import _disable_demo_stub_sources
+
+    db = get_db()
+    migrated = 0
+    async for doc in db.tenants.find({"tenant_id": {"$ne": DEFAULT_TENANT_ID}, "status": "active"}):
+        settings = doc.get("settings") or {}
+        prompt = settings.get("system_prompt") or ""
+        if not is_alpha_default_prompt(prompt):
+            continue
+
+        org = doc.get("org_name") or doc["tenant_id"]
+        desc = settings.get("company_description") or ""
+        new_prompt = build_tenant_system_prompt(org, desc)
+
+        integrations = normalize_integrations(doc.get("integration_configs"))
+        _disable_demo_stub_sources(integrations)
+
+        await db.tenants.update_one(
+            {"tenant_id": doc["tenant_id"]},
+            {
+                "$set": {
+                    "settings.system_prompt": new_prompt,
+                    "integration_configs": integrations,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+        migrated += 1
+        logger.info("Migrated Alpha demo prompt → %s for tenant %s", org, doc["tenant_id"])
+
+    if migrated:
+        logger.info("Migrated %s tenant prompt(s) off Alpha demo template", migrated)
+
+
 async def get_tenant_system_prompt(tenant_id: str, fallback: str) -> str:
     ctx = await get_tenant_by_id(tenant_id)
-    if ctx and ctx.settings.system_prompt:
-        return ctx.settings.system_prompt
-    return fallback
+    if not ctx:
+        return fallback
+
+    prompt = ctx.settings.system_prompt or fallback
+
+    if tenant_id != DEFAULT_TENANT_ID and ctx.org_name:
+        from backend.agent.prompts import build_tenant_system_prompt, is_alpha_default_prompt
+
+        if is_alpha_default_prompt(prompt):
+            desc = ctx.settings.company_description or ""
+            prompt = build_tenant_system_prompt(ctx.org_name, desc)
+            db = get_db()
+            await db.tenants.update_one(
+                {"tenant_id": tenant_id},
+                {"$set": {"settings.system_prompt": prompt}},
+            )
+            logger.info("Auto-fixed stale Alpha prompt for tenant %s", tenant_id)
+
+    return prompt
 
 
 async def seed_default_knowledge() -> None:
