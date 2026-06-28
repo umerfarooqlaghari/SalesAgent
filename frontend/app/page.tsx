@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from "react";
+import Vapi from "@vapi-ai/web";
 
 interface Lead {
   _id?: string;
@@ -51,6 +52,8 @@ export default function Dashboard() {
   });
   const [voiceEnabled, setVoiceEnabled] = useState<boolean>(false);
   const voiceEnabledRef = useRef(false);
+  const [isCalling, setIsCalling] = useState<boolean>(false);
+  const vapiRef = useRef<any>(null);
   
   // Inputs
   const [chatInput, setChatInput] = useState<string>("");
@@ -125,6 +128,50 @@ export default function Dashboard() {
       
       const utterance = new SpeechSynthesisUtterance(clean);
       window.speechSynthesis.speak(utterance);
+    }
+  };
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const vapiPublicKey = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY || "e8cd4840-5e48-4005-9b73-353ac169e70e";
+      vapiRef.current = new Vapi(vapiPublicKey);
+      
+      vapiRef.current.on("call-start", () => {
+        setIsCalling(true);
+        setStatusText("Vapi call connected!");
+      });
+      
+      vapiRef.current.on("call-end", () => {
+        setIsCalling(false);
+        setStatusText("Vapi call ended.");
+      });
+      
+      vapiRef.current.on("error", (e: any) => {
+        console.error("Vapi call error:", e);
+        setIsCalling(false);
+        setStatusText("Vapi error: " + (e.message || "Failed"));
+      });
+    }
+    
+    return () => {
+      if (vapiRef.current) {
+        vapiRef.current.stop();
+      }
+    };
+  }, []);
+
+  const handleToggleVapiCall = () => {
+    if (isCalling) {
+      vapiRef.current.stop();
+    } else {
+      setStatusText("Connecting Vapi Call...");
+      try {
+        const assistantId = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID || "a5b5e387-3e26-4ad0-ad0f-8454b675f1c9";
+        vapiRef.current.start(assistantId);
+      } catch (err: any) {
+        console.error("Failed to start Vapi call:", err);
+        setStatusText("Vapi Error: " + err.message);
+      }
     }
   };
 
@@ -648,6 +695,27 @@ export default function Dashboard() {
 
           {/* Voice Mode & Refresh Panel (v2) */}
           <div className="flex items-center gap-3">
+            <button
+              onClick={handleToggleVapiCall}
+              className={`px-3.5 py-1.5 rounded-lg border text-xs font-bold uppercase tracking-wider transition-all duration-300 flex items-center gap-2 ${
+                isCalling
+                  ? "bg-rose-950/60 text-rose-400 border-rose-800/80 shadow-[0_0_8px_rgba(244,63,94,0.15)] animate-pulse"
+                  : "bg-slate-800/50 hover:bg-slate-700/50 text-sky-400 border-sky-500/20"
+              }`}
+            >
+              {isCalling ? (
+                <>
+                  <span className="h-2 w-2 rounded-full bg-rose-500 animate-ping" />
+                  🛑 End Vapi Call
+                </>
+              ) : (
+                <>
+                  <span className="h-2 w-2 rounded-full bg-sky-400 animate-pulse" />
+                  📞 Start Vapi Call
+                </>
+              )}
+            </button>
+
             <button
               onClick={() => setVoiceEnabled(!voiceEnabled)}
               className={`px-3.5 py-1.5 rounded-lg border text-xs font-bold uppercase tracking-wider transition-all duration-300 flex items-center gap-2 ${

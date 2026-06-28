@@ -50,25 +50,27 @@ async def router_node(state: AgentState) -> Dict[str, Any]:
     if not messages:
         return {}
 
-    last_user_message = messages[-1].content
-    
-    # Classify intent using Gemini
-    llm = ChatGoogleGenerativeAI(
-        api_key=settings.GEMINI_API_KEY,
-        model="gemini-2.5-flash",
-        temperature=0.0
-    )
-    structured_llm = llm.with_structured_output(IntentResponse)
-    
-    try:
-        classification = await structured_llm.ainvoke([
-            SystemMessage(content="You are an intent classifier. Categorize the user's query into 'Purchase', 'Inquiry', or 'Support'."),
-            messages[-1]
-        ])
-        intent = classification.intent
-    except Exception as e:
-        logger.error(f"Error classifying intent: {e}")
-        intent = "Inquiry"  # Default fallback
+    thread_id = state.get("thread_id", "default_thread")
+    if thread_id and thread_id.startswith("vapi_"):
+        intent = "Inquiry"
+    else:
+        # Classify intent using Gemini
+        llm = ChatGoogleGenerativeAI(
+            api_key=settings.GEMINI_API_KEY,
+            model="gemini-2.5-flash",
+            temperature=0.0
+        )
+        structured_llm = llm.with_structured_output(IntentResponse)
+        
+        try:
+            classification = await structured_llm.ainvoke([
+                SystemMessage(content="You are an intent classifier. Categorize the user's query into 'Purchase', 'Inquiry', or 'Support'."),
+                messages[-1]
+            ])
+            intent = classification.intent
+        except Exception as e:
+            logger.error(f"Error classifying intent: {e}")
+            intent = "Inquiry"  # Default fallback
     
     # Sync or load existing LeadProfile from DB
     thread_id = state.get("thread_id", "default_thread")

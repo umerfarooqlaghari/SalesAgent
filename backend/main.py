@@ -422,6 +422,9 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     call_id = data.get("call", {}).get("id") or "vapi_default_session"
     thread_id = f"vapi_{call_id}"
     
+    # Save user transcript message
+    await save_conversation_message(thread_id, "user", user_content)
+    
     # Run the SDR LangGraph graph
     graph = await get_agent_graph()
     config = {"configurable": {"thread_id": thread_id}}
@@ -451,6 +454,9 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
         if "<thought>" in content and "</thought>" in content:
             content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL).strip()
         assistant_msg = content
+        
+    # Save assistant response transcript message
+    await save_conversation_message(thread_id, "assistant", assistant_msg)
         
     # Return OpenAI-compatible response format
     return {
