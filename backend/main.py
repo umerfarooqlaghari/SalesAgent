@@ -23,6 +23,7 @@ import json
 from backend.config import settings
 from backend.database import (
     db_client,
+    get_db,
     get_lead,
     save_lead,
     list_leads,
@@ -34,7 +35,11 @@ from backend.database import (
     rename_conversation,
     delete_conversation,
     list_appointments,
-    list_orders
+    list_orders,
+    link_voice_call,
+    get_linked_console_thread,
+    unlink_voice_call,
+    get_recent_typed_chat_messages,
 )
 from backend.agent.graph import get_agent_graph
 
@@ -168,6 +173,22 @@ async def update_conversation_title(thread_id: str, data: Dict[str, str] = Body(
 async def delete_conversation_route(thread_id: str, api_key: str = Depends(validate_api_key)):
     await delete_conversation(thread_id)
     return {"status": "success", "thread_id": thread_id}
+
+@app.post("/api/conversations/{thread_id}/typed")
+async def append_typed_message(
+    thread_id: str,
+    data: Dict[str, Any] = Body(...),
+    api_key: str = Depends(validate_api_key),
+):
+    """
+    Append a user-typed message during an active voice call without running the chat agent.
+    The voice pipeline reads these messages on the next spoken turn.
+    """
+    message = (data.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    await save_conversation_message(thread_id, "user", message, source="chat")
+    return {"status": "saved", "thread_id": thread_id}
 
 
 @app.websocket("/ws/chat/{thread_id}")
@@ -339,6 +360,34 @@ async def get_orders(api_key: str = Depends(validate_api_key)):
     orders = await list_orders()
     return {"orders": orders}
 
+@app.post("/api/voice/link")
+async def link_voice_call_route(
+    data: Dict[str, Any] = Body(...),
+    api_key: str = Depends(validate_api_key),
+):
+    """Link a Vapi call ID to the console chat thread for typed detail capture."""
+    call_id = data.get("call_id")
+    console_thread_id = data.get("console_thread_id")
+    if not call_id or not console_thread_id:
+        raise HTTPException(status_code=400, detail="call_id and console_thread_id are required")
+    await link_voice_call(call_id, console_thread_id)
+    return {"status": "linked", "call_id": call_id, "console_thread_id": console_thread_id}
+
+@app.delete("/api/voice/link/{call_id}")
+async def unlink_voice_call_route(call_id: str, api_key: str = Depends(validate_api_key)):
+    await unlink_voice_call(call_id)
+    return {"status": "unlinked", "call_id": call_id}
+
+async def _get_typed_chat_context(console_thread_id: str, since_iso: Optional[str] = None) -> str:
+    typed = await get_recent_typed_chat_messages(console_thread_id, since_iso=since_iso, limit=8)
+    if not typed:
+        return ""
+    lines = "\n".join(f"  • {msg}" for msg in typed)
+    return (
+        "\n\n[TYPED CHAT MESSAGES — prefer these for name/email/phone over spoken dictation]:\n"
+        f"{lines}"
+    )
+
 def _extract_assistant_text(messages_out: list) -> str:
     """Pull the last speakable assistant text from graph output (handles tool-call turns)."""
     import re
@@ -402,21 +451,32 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
             break
 
     call_id = data.get("call", {}).get("id") or "vapi_default_session"
-    thread_id = f"vapi_{call_id}"
+    linked_thread = await get_linked_console_thread(call_id)
+    agent_thread_id = linked_thread or f"vapi_{call_id}"
 
-    await save_conversation_message(thread_id, "user", user_content)
+    # Merge typed chat context when console is linked to this call
+    typed_context = ""
+    if linked_thread:
+        db = get_db()
+        link_doc = await db.voice_call_links.find_one({"call_id": call_id})
+        since_iso = link_doc.get("linked_at") if link_doc else None
+        typed_context = await _get_typed_chat_context(linked_thread, since_iso=since_iso)
+
+    enriched_user_content = user_content + typed_context
+
+    await save_conversation_message(agent_thread_id, "user", user_content, source="voice")
 
     # Run the LangGraph SDR brain
     graph = await get_agent_graph()
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 16}
-    inputs = {"messages": [HumanMessage(content=user_content)], "thread_id": thread_id}
+    config = {"configurable": {"thread_id": agent_thread_id}, "recursion_limit": 16}
+    inputs = {"messages": [HumanMessage(content=enriched_user_content)], "thread_id": agent_thread_id}
 
     try:
         result = await graph.ainvoke(inputs, config=config)
         messages_out = result.get("messages", [])
         assistant_msg = _extract_assistant_text(messages_out)
     except Exception as e:
-        logger.error(f"Vapi agent error for {thread_id}: {e}", exc_info=True)
+        logger.error(f"Vapi agent error for {agent_thread_id}: {e}", exc_info=True)
         error_msg = str(e)
         if "RESOURCE_EXHAUSTED" in error_msg or "429" in error_msg:
             assistant_msg = (
@@ -429,19 +489,19 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
                 "Could you say that again, or would you like me to connect you with a team member?"
             )
 
-    await save_conversation_message(thread_id, "assistant", assistant_msg)
+    await save_conversation_message(agent_thread_id, "assistant", assistant_msg, source="voice")
 
     # Always stream SSE — Vapi requires streaming to feed TTS pipeline
     async def stream_response() -> AsyncIterator[str]:
         # Send the full content in one chunk then close
         chunk = {
-            "id": f"chatcmpl-{thread_id}",
+            "id": f"chatcmpl-{agent_thread_id}",
             "object": "chat.completion.chunk",
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": assistant_msg}, "finish_reason": None}]
         }
         yield f"data: {json.dumps(chunk)}\n\n"
         done_chunk = {
-            "id": f"chatcmpl-{thread_id}",
+            "id": f"chatcmpl-{agent_thread_id}",
             "object": "chat.completion.chunk",
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
         }

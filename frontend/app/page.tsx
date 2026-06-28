@@ -56,6 +56,14 @@ export default function Dashboard() {
   const voiceEnabledRef = useRef(false);
   const [isCalling, setIsCalling] = useState<boolean>(false);
   const vapiRef = useRef<any>(null);
+  const activeVapiCallIdRef = useRef<string | null>(null);
+  const threadIdRef = useRef(threadId);
+  const apiKeyRef = useRef(apiKey);
+  const backendUrlRef = useRef(backendUrl);
+
+  useEffect(() => { threadIdRef.current = threadId; }, [threadId]);
+  useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
+  useEffect(() => { backendUrlRef.current = backendUrl; }, [backendUrl]);
 
   // Inputs
   const [chatInput, setChatInput] = useState<string>("");
@@ -141,14 +149,39 @@ export default function Dashboard() {
       const vapiPublicKey = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY || "e8cd4840-5e48-4005-9b73-353ac169e70e";
       vapiRef.current = new Vapi(vapiPublicKey);
 
-      vapiRef.current.on("call-start", () => {
+      vapiRef.current.on("call-start", async (call: { id?: string }) => {
         setIsCalling(true);
         setStatusText("Vapi call connected!");
+        const callId = call?.id;
+        activeVapiCallIdRef.current = callId || null;
+        if (callId && threadIdRef.current) {
+          try {
+            await fetch(`${backendUrlRef.current}/api/voice/link`, {
+              method: "POST",
+              headers: { Authorization: `Bearer ${apiKeyRef.current}`, "Content-Type": "application/json" },
+              body: JSON.stringify({ call_id: callId, console_thread_id: threadIdRef.current }),
+            });
+          } catch (e) {
+            console.error("Failed to link voice call to chat thread:", e);
+          }
+        }
       });
 
-      vapiRef.current.on("call-end", () => {
+      vapiRef.current.on("call-end", async () => {
         setIsCalling(false);
         setStatusText("Vapi call ended.");
+        const callId = activeVapiCallIdRef.current;
+        if (callId) {
+          try {
+            await fetch(`${backendUrlRef.current}/api/voice/link/${callId}`, {
+              method: "DELETE",
+              headers: { Authorization: `Bearer ${apiKeyRef.current}` },
+            });
+          } catch (e) {
+            console.error("Failed to unlink voice call:", e);
+          }
+          activeVapiCallIdRef.current = null;
+        }
       });
 
       vapiRef.current.on("error", (e: any) => {
@@ -425,11 +458,32 @@ export default function Dashboard() {
     };
   }, [threadId, apiKey, backendUrl]);
 
-  // Send message as Sandbox user
-  const handleSendMessage = () => {
-    if (!chatInput.trim() || !ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+  // Send message as Sandbox user (or typed-only during active voice call)
+  const handleSendMessage = async () => {
+    if (!chatInput.trim()) return;
 
     const userMsg = chatInput.trim();
+
+    // During voice call: save typed detail for the voice agent — do not run chat agent
+    if (isCalling) {
+      setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
+      setChatInput("");
+      try {
+        await fetch(`${backendUrl}/api/conversations/${threadId}/typed`, {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({ message: userMsg }),
+        });
+        setStatusText("Typed detail saved — the voice agent will use it on the next turn.");
+      } catch (e) {
+        console.error("Failed to save typed message:", e);
+        setStatusText("Could not save typed message.");
+      }
+      return;
+    }
+
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+
     setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
 
     ws.current.send(JSON.stringify({ message: userMsg }));
@@ -947,6 +1001,11 @@ export default function Dashboard() {
 
               {/* Chat Input block */}
               <div className="border-t border-[#1F293D] bg-[#111726]/40 p-3 backdrop-blur-md sm:p-4">
+                {isCalling && (
+                  <div className="mb-3 rounded-lg border border-sky-500/20 bg-sky-500/10 px-3 py-2 text-xs text-sky-300">
+                    📞 <strong>Call active.</strong> When the agent asks for your name, email, or phone, type it here for accuracy. Spoken dictation may mishear numbers and letters (e.g. &quot;one&quot; vs &quot;1&quot;).
+                  </div>
+                )}
                 {activeLead?.status === "Handoff Requested" || activeLead?.status === "Human Claimed" ? (
                   <div className="flex flex-col items-start gap-2 rounded-lg border border-amber-800/30 bg-amber-950/20 p-3 sm:flex-row sm:items-center sm:justify-between">
                     <span className="text-xs font-semibold text-amber-400">
@@ -966,12 +1025,16 @@ export default function Dashboard() {
                       value={chatInput}
                       onChange={(e) => setChatInput(e.target.value)}
                       onKeyDown={(e) => e.key === "Enter" && handleSendMessage()}
-                      placeholder="Type a message as a lead..."
+                      placeholder={
+                        isCalling
+                          ? "Type name, email, or phone here when the agent asks..."
+                          : "Type a message as a lead..."
+                      }
                       className="min-w-0 flex-1 rounded-lg border border-[#2D3D54] bg-[#1A2234] px-3 py-2.5 text-sm text-[#F1F5F9] placeholder-slate-500 transition-all focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 sm:px-4"
                     />
                     <button
                       onClick={handleSendMessage}
-                      disabled={!chatInput.trim() || !connected}
+                      disabled={!chatInput.trim() || (!isCalling && !connected)}
                       className="flex shrink-0 items-center gap-1.5 rounded-lg bg-gradient-to-r from-sky-500 to-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-indigo-600/10 transition-all hover:from-sky-400 hover:to-indigo-500 disabled:pointer-events-none disabled:opacity-40 sm:px-5"
                     >
                       <span className="hidden sm:inline">Send</span>

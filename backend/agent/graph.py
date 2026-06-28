@@ -19,6 +19,7 @@ from backend.agent.tools import (
     cancel_appointment,
     reschedule_appointment,
     cancel_order,
+    get_typed_chat_details,
 )
 from backend.agent.checkpointer import get_checkpointer
 from backend.database import get_lead
@@ -39,6 +40,7 @@ agent_tools = [
     cancel_appointment,
     reschedule_appointment,
     cancel_order,
+    get_typed_chat_details,
 ]
 tool_node = ToolNode(agent_tools)
 
@@ -87,9 +89,16 @@ For real-time stock/pricing confirmation, call `query_pos_database` with product
 
 7. **Order Cancellation:** When caller wants to cancel an order → get order number + email or phone, then call `cancel_order`. Confirm cancellation aloud.
 
-8. **When unsure:** Ask a clarifying question or use the right lookup tool. NEVER go silent. If you truly cannot help, offer `handoff_to_human` — do not end the call without speaking.
+8. **Collecting contact details (name, email, phone) — IMPORTANT for voice calls:**
+   a) If the caller is on the web console (voice + chat), FIRST ask them to **type** the detail in the chat box: e.g. "For accuracy, could you type your email in the chat?"
+   b) Then call `get_typed_chat_details` to read what they typed. **Always prefer typed chat over spoken words** for email and phone.
+   c) If they say no / can't type: say "No problem, you can dictate it to me — I'll read it back to confirm." Then repeat exactly what you heard and ask "Is that correct?"
+   d) Warn on dictation: speech can mishear numbers and letters — e.g. "one" vs "1", "at" vs "@", "dot" vs ".". For email and phone, strongly encourage typing or spelling aloud letter-by-letter, then confirm.
+   e) Never proceed with booking/orders until email and phone are confirmed.
 
-9. Tone: 1-2 short sentences max. Natural phone-call pace. No bullet lists. No fabrication. NEVER end a call without speaking — always give a verbal response.
+9. **When unsure:** Ask a clarifying question or use the right lookup tool. NEVER go silent. If you truly cannot help, offer `handoff_to_human` — do not end the call without speaking.
+
+10. Tone: 1-2 short sentences max. Natural phone-call pace. No bullet lists. No fabrication. NEVER end a call without speaking — always give a verbal response.
 """
 
 class IntentResponse(BaseModel):

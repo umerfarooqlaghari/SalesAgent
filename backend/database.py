@@ -154,13 +154,24 @@ async def list_leads() -> List[Dict[str, Any]]:
         leads.append(doc)
     return leads
 
-async def save_conversation_message(thread_id: str, role: str, message: str, thought: Optional[str] = None):
+async def save_conversation_message(
+    thread_id: str,
+    role: str,
+    message: str,
+    thought: Optional[str] = None,
+    source: Optional[str] = None,
+):
+    from datetime import datetime, timezone
+
     db = get_db()
     entry = {
         "role": role,
         "content": message,
-        "thought": thought
+        "thought": thought,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if source:
+        entry["source"] = source
     await db.conversations.update_one(
         {"thread_id": thread_id},
         {"$push": {"messages": entry}},
@@ -370,6 +381,76 @@ async def list_orders() -> List[Dict[str, Any]]:
         doc["_id"] = str(doc["_id"])
         orders.append(doc)
     return orders
+
+# ---------------------------------------------------------------------------
+# Voice call ↔ console chat linking (typed details during calls)
+# ---------------------------------------------------------------------------
+
+async def link_voice_call(call_id: str, console_thread_id: str) -> None:
+    """Link a Vapi call to the console chat thread so typed messages are visible to the voice agent."""
+    from datetime import datetime, timezone
+
+    db = get_db()
+    await db.voice_call_links.update_one(
+        {"call_id": call_id},
+        {
+            "$set": {
+                "call_id": call_id,
+                "console_thread_id": console_thread_id,
+                "linked_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+        upsert=True,
+    )
+
+async def get_linked_console_thread(call_id: str) -> Optional[str]:
+    db = get_db()
+    doc = await db.voice_call_links.find_one({"call_id": call_id})
+    return doc.get("console_thread_id") if doc else None
+
+async def unlink_voice_call(call_id: str) -> None:
+    db = get_db()
+    await db.voice_call_links.delete_one({"call_id": call_id})
+
+async def get_recent_typed_chat_messages(
+    thread_id: str,
+    since_iso: Optional[str] = None,
+    limit: int = 10,
+) -> List[str]:
+    """Return recent user-typed chat messages for a thread (optionally after link time)."""
+    conv = await get_conversation(thread_id)
+    if not conv:
+        return []
+
+    from datetime import datetime
+
+    cutoff = None
+    if since_iso:
+        try:
+            cutoff = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+        except ValueError:
+            cutoff = None
+
+    typed: List[str] = []
+    for entry in conv.get("messages", []):
+        if entry.get("role") != "user":
+            continue
+        content = (entry.get("content") or "").strip()
+        if not content:
+            continue
+        # Skip messages that look like pure voice transcripts mirrored from call
+        if entry.get("source") == "voice":
+            continue
+        if cutoff and entry.get("timestamp"):
+            try:
+                ts = datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
+                if ts < cutoff:
+                    continue
+            except ValueError:
+                pass
+        typed.append(content)
+
+    return typed[-limit:]
 
 def _normalize_phone(phone: str) -> str:
     """Strip non-digits for loose phone matching."""

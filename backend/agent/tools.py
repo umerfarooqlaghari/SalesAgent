@@ -18,6 +18,10 @@ from backend.database import (
     reschedule_appointment_record,
     find_active_orders,
     cancel_order_record,
+    link_voice_call,
+    get_linked_console_thread,
+    unlink_voice_call,
+    get_recent_typed_chat_messages,
 )
 from backend.config import settings
 
@@ -581,5 +585,28 @@ async def cancel_order(
     return (
         f"Your order #{oid} for {product} has been cancelled. "
         "A team member won't charge you for this order. Is there anything else I can help with today?"
+    )
+
+
+@tool
+async def get_typed_chat_details(config: RunnableConfig) -> str:
+    """
+    Read contact details the caller typed in the chat box (name, email, phone, etc.).
+    Use AFTER asking the caller to type information in the chat for accuracy — especially email and phone.
+    Prefer typed chat values over spoken dictation when both exist.
+    """
+    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    typed = await get_recent_typed_chat_messages(thread_id, limit=8)
+
+    if not typed:
+        return (
+            "No typed messages found in the chat yet. "
+            "Ask the caller to type their detail in the chat box, or accept dictation and read it back to confirm."
+        )
+
+    lines = "\n".join(f"- {msg}" for msg in typed)
+    return (
+        "Recent typed chat messages (prefer these for email/phone/name — more accurate than speech):\n"
+        f"{lines}"
     )
 
