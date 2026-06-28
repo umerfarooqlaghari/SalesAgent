@@ -200,3 +200,55 @@ async def delete_conversation(thread_id: str):
     # Delete from LangGraph checkpointer memory collections
     await db.checkpoints.delete_many({"thread_id": thread_id})
     await db.writes.delete_many({"thread_id": thread_id})
+
+# ---------------------------------------------------------------------------
+# Appointment booking helpers
+# ---------------------------------------------------------------------------
+
+async def check_slot_available(date_str: str, time_str: str) -> bool:
+    """Returns True if the requested date+time slot has no existing booking."""
+    db = get_db()
+    existing = await db.appointments.find_one({
+        "date": date_str,
+        "time": time_str,
+        "status": {"$ne": "cancelled"}
+    })
+    return existing is None
+
+async def create_appointment(
+    thread_id: str,
+    name: str,
+    email: str,
+    phone: str,
+    date_str: str,
+    time_str: str,
+    notes: str = ""
+) -> Dict[str, Any]:
+    """Saves a confirmed appointment to MongoDB and returns the booking document."""
+    from datetime import datetime, timezone
+    db = get_db()
+    doc = {
+        "thread_id": thread_id,
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "date": date_str,
+        "time": time_str,
+        "notes": notes,
+        "status": "confirmed",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    result = await db.appointments.insert_one(doc)
+    doc["_id"] = str(result.inserted_id)
+    return doc
+
+async def list_appointments() -> List[Dict[str, Any]]:
+    """Returns all appointments ordered by date/time."""
+    db = get_db()
+    cursor = db.appointments.find({}).sort([("date", 1), ("time", 1)])
+    appts = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        appts.append(doc)
+    return appts
+

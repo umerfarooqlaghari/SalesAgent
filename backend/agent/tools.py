@@ -5,7 +5,7 @@ import httpx
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 
-from backend.database import save_lead, SQLITE_DB_PATH
+from backend.database import save_lead, SQLITE_DB_PATH, check_slot_available, create_appointment
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
@@ -182,8 +182,9 @@ async def handoff_to_human(
     config: RunnableConfig
 ) -> str:
     """
-    Triggers an immediate handoff to a human representative.
-    Use this if the lead exhibits high purchase intent, asks for a human, or asks a complex question the bot cannot answer.
+    Connects the caller with a human team member.
+    Use this ONLY when the user explicitly asks to speak with a human or be transferred.
+    Do NOT use this to reject leads.
     """
     thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
     from backend.database import get_db
@@ -197,4 +198,58 @@ async def handoff_to_human(
     # Send WhatsApp Alert notification
     await send_whatsapp_alert(thread_id, reason)
     
-    return f"Handoff triggered: {reason}. A human representative will take over shortly."
+    return "Connecting you with a team member now. Please hold for just a moment."
+
+
+@tool
+async def book_appointment(
+    name: str,
+    email: str,
+    phone: str,
+    date: str,
+    time: str,
+    notes: str,
+    config: RunnableConfig
+) -> str:
+    """
+    Books a meeting or consultation appointment.
+    Collects the caller's name, email, phone number, preferred date (e.g. 'June 30 2026'),
+    and preferred time (e.g. '2:00 PM'). Checks if the slot is available and confirms booking.
+    Always collect ALL fields before calling this tool.
+    """
+    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    
+    # Validate required fields
+    missing = []
+    if not name or name.strip() == "":
+        missing.append("name")
+    if not email or "@" not in email:
+        missing.append("email")
+    if not phone or phone.strip() == "":
+        missing.append("phone number")
+    if not date or date.strip() == "":
+        missing.append("preferred date")
+    if not time or time.strip() == "":
+        missing.append("preferred time")
+    
+    if missing:
+        return f"I still need the following details to complete your booking: {', '.join(missing)}. Could you please provide those?"
+    
+    # Check availability
+    available = await check_slot_available(date.strip(), time.strip())
+    if not available:
+        return f"Unfortunately, {date} at {time} is already taken. Could you suggest another date or time that works for you?"
+    
+    # Confirm and create booking
+    appt = await create_appointment(
+        thread_id=thread_id,
+        name=name.strip(),
+        email=email.strip(),
+        phone=phone.strip(),
+        date_str=date.strip(),
+        time_str=time.strip(),
+        notes=notes or ""
+    )
+    
+    return f"You're all set, {name}! Your appointment is confirmed for {date} at {time}. We'll send a confirmation to {email} shortly."
+

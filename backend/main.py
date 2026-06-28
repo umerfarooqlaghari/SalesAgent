@@ -32,7 +32,8 @@ from backend.database import (
     seed_default_api_key,
     validate_api_key_in_db,
     rename_conversation,
-    delete_conversation
+    delete_conversation,
+    list_appointments
 )
 from backend.agent.graph import get_agent_graph
 
@@ -401,6 +402,12 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str, api_key: Opti
 @app.get("/api/voice/public-key")
 async def get_vapi_public_key(api_key: str = Depends(validate_api_key)):
     return {"public_key": settings.VAPI_PUBLIC_KEY}
+
+@app.get("/api/appointments")
+async def get_appointments(api_key: str = Depends(validate_api_key)):
+    """Returns all scheduled appointments from MongoDB."""
+    appts = await list_appointments()
+    return {"appointments": appts}
 
 @app.post("/api/voice/chat/completions")
 @app.post("/chat/completions")

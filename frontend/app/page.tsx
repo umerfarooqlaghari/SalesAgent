@@ -33,7 +33,8 @@ export default function Dashboard() {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [activeLead, setActiveLead] = useState<Lead | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [activeTab, setActiveTab] = useState<"sandbox" | "supervisor" | "leads">("sandbox");
+  const [activeTab, setActiveTab] = useState<"sandbox" | "supervisor" | "leads" | "appointments">("sandbox");
+  const [appointments, setAppointments] = useState<any[]>([]);
   
   // Real-time states
   const [connected, setConnected] = useState<boolean>(false);
@@ -691,6 +692,27 @@ export default function Dashboard() {
             >
               CRM Synced Leads
             </button>
+            <button
+              onClick={async () => {
+                setActiveTab("appointments");
+                try {
+                  const res = await fetch(`${backendUrl}/api/appointments`, {
+                    headers: { Authorization: `Bearer ${apiKey}` }
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    setAppointments(data.appointments || []);
+                  }
+                } catch {}
+              }}
+              className={`px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${
+                activeTab === "appointments"
+                  ? "bg-[#1E293B] text-sky-400 border border-sky-500/20"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              📅 Appointments
+            </button>
           </nav>
 
           {/* Voice Mode & Refresh Panel (v2) */}
@@ -1194,6 +1216,91 @@ export default function Dashboard() {
                         </td>
                         <td className="py-4 px-6">{renderStatusBadge(lead.status)}</td>
                         <td className="py-4 px-6 font-mono text-xs text-slate-400">{lead.thread_id}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ── Appointments Panel ── */}
+        {activeTab === "appointments" && (
+          <div className="p-6 h-full flex flex-col gap-5">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-bold text-white tracking-tight">📅 Scheduled Appointments</h2>
+                <p className="text-xs text-slate-500 mt-0.5">Booked via voice or chat — stored in MongoDB</p>
+              </div>
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await fetch(`${backendUrl}/api/appointments`, {
+                      headers: { Authorization: `Bearer ${apiKey}` }
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      setAppointments(data.appointments || []);
+                    }
+                  } catch {}
+                }}
+                className="px-3 py-1.5 text-xs font-bold bg-sky-500/10 text-sky-400 border border-sky-500/20 rounded-lg hover:bg-sky-500/20 transition-all"
+              >
+                ↻ Refresh
+              </button>
+            </div>
+            <div className="overflow-auto rounded-xl border border-[#1E293B] flex-1">
+              <table className="w-full text-sm text-slate-300 min-w-[860px]">
+                <thead>
+                  <tr className="bg-[#0F172A] border-b border-[#1E293B] text-xs uppercase tracking-widest text-slate-500">
+                    <th className="py-3 px-5 text-left">Name</th>
+                    <th className="py-3 px-5 text-left">Email</th>
+                    <th className="py-3 px-5 text-left">Phone</th>
+                    <th className="py-3 px-5 text-left">Date</th>
+                    <th className="py-3 px-5 text-left">Time</th>
+                    <th className="py-3 px-5 text-left">Status</th>
+                    <th className="py-3 px-5 text-left">Notes</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#1E293B]/60">
+                  {appointments.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="text-center py-16 text-xs text-slate-500 font-semibold">
+                        <div className="flex flex-col items-center gap-2">
+                          <span className="text-3xl">📭</span>
+                          <span>No appointments yet. Start a Vapi call and ask to book a meeting!</span>
+                        </div>
+                      </td>
+                    </tr>
+                  ) : (
+                    appointments.map((appt, idx) => (
+                      <tr key={idx} className="hover:bg-[#1E293B]/30 transition-all">
+                        <td className="py-4 px-5 font-bold text-white">{appt.name || "—"}</td>
+                        <td className="py-4 px-5 font-mono text-xs text-sky-300">{appt.email || "—"}</td>
+                        <td className="py-4 px-5 font-mono text-xs">{appt.phone || "—"}</td>
+                        <td className="py-4 px-5">
+                          <span className="px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-300 text-xs font-semibold border border-indigo-500/20">
+                            {appt.date || "—"}
+                          </span>
+                        </td>
+                        <td className="py-4 px-5">
+                          <span className="px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 text-xs font-semibold border border-sky-500/20">
+                            {appt.time || "—"}
+                          </span>
+                        </td>
+                        <td className="py-4 px-5">
+                          <span className={`px-2 py-0.5 rounded text-xs font-bold border ${
+                            appt.status === "confirmed"
+                              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                              : appt.status === "cancelled"
+                              ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                              : "bg-slate-500/10 text-slate-400 border-slate-500/20"
+                          }`}>
+                            {appt.status || "pending"}
+                          </span>
+                        </td>
+                        <td className="py-4 px-5 text-xs text-slate-400 max-w-[180px] truncate">{appt.notes || "—"}</td>
                       </tr>
                     ))
                   )}
