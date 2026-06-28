@@ -7,7 +7,19 @@ from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
 
 from backend.agent.state import AgentState, LeadProfile
-from backend.agent.tools import search_crm, update_lead_status, schedule_demo, query_pos_database, handoff_to_human, book_appointment
+from backend.agent.tools import (
+    search_crm,
+    update_lead_status,
+    schedule_demo,
+    query_pos_database,
+    handoff_to_human,
+    book_appointment,
+    place_order,
+    lookup_appointments,
+    cancel_appointment,
+    reschedule_appointment,
+    cancel_order,
+)
 from backend.agent.checkpointer import get_checkpointer
 from backend.database import get_lead
 from backend.config import settings
@@ -15,10 +27,22 @@ from backend.config import settings
 logger = logging.getLogger(__name__)
 
 # List of tools
-agent_tools = [search_crm, update_lead_status, schedule_demo, query_pos_database, handoff_to_human, book_appointment]
+agent_tools = [
+    search_crm,
+    update_lead_status,
+    schedule_demo,
+    query_pos_database,
+    handoff_to_human,
+    book_appointment,
+    place_order,
+    lookup_appointments,
+    cancel_appointment,
+    reschedule_appointment,
+    cancel_order,
+]
 tool_node = ToolNode(agent_tools)
 
-SYSTEM_PROMPT = """You are a friendly sales assistant for Alpha. Help callers with questions, book appointments, and arrange human follow-ups.
+SYSTEM_PROMPT = """You are a friendly sales assistant for Alpha. Help callers with questions, book appointments, place orders, and arrange human follow-ups.
 
 Your active thread ID is {thread_id}.
 Lead Profile: Company={company} | Title={job_title} | Score={intent_score} | Status={status} | Fit={fit}
@@ -39,16 +63,33 @@ For real-time stock/pricing confirmation, call `query_pos_database` with product
    - "Give me just a second on that."
    Then call the tool. The filler goes in your text reply BEFORE the tool call.
 
-3. Human Follow-up — ONLY 2 triggers:
-   a) Caller explicitly asks to speak with or be reached by a human.
+3. **Placing Orders (IMPORTANT):** When the caller says they want to buy, purchase, or take a package/product/service (e.g. "I'll take that", "I want the professional package", "sign me up"):
+   a) Confirm which package/product they want if unclear.
+   b) Collect one at a time if missing: (1) Full name, (2) Email, (3) Phone number.
+   c) Say "Great, let me place that order for you" then call `place_order`.
+   d) After the order is placed, ALWAYS read the confirmation aloud — never stay silent or end the call.
+   e) Use `place_order` for purchases — do NOT use `handoff_to_human` for orders.
+
+4. Human Follow-up — ONLY 2 triggers:
+   a) Caller explicitly asks to speak with or be reached by a human (not for placing an order).
    b) You truly cannot answer and they want more help.
    BEFORE calling `handoff_to_human`, collect: (1) their name and (2) their phone number, one at a time.
    Once you have both, say "Perfect, I've got your details" then call `handoff_to_human`.
-   NEVER use it for pricing, services, or to reject anyone.
+   NEVER use it for pricing, services, purchases, or to reject anyone.
 
-4. Appointment Booking: Collect one at a time — (1) Full name, (2) Email, (3) Phone, (4) Date, (5) Time — then call `book_appointment`.
+5. Appointment Booking: Collect one at a time — (1) Full name, (2) Email, (3) Phone, (4) Date, (5) Time — then call `book_appointment`.
 
-5. Tone: 1-2 short sentences max. Natural phone-call pace. No bullet lists. No fabrication.
+6. **Appointment Changes:**
+   a) To **check** a booking → call `lookup_appointments` (needs email or phone).
+   b) To **cancel** → call `cancel_appointment` (verify with email/phone; ask date/time if multiple bookings).
+   c) To **reschedule / change time** → collect new date & time, then call `reschedule_appointment`.
+   Always confirm the change aloud. Offer to rebook if nothing is found.
+
+7. **Order Cancellation:** When caller wants to cancel an order → get order number + email or phone, then call `cancel_order`. Confirm cancellation aloud.
+
+8. **When unsure:** Ask a clarifying question or use the right lookup tool. NEVER go silent. If you truly cannot help, offer `handoff_to_human` — do not end the call without speaking.
+
+9. Tone: 1-2 short sentences max. Natural phone-call pace. No bullet lists. No fabrication. NEVER end a call without speaking — always give a verbal response.
 """
 
 class IntentResponse(BaseModel):
@@ -187,8 +228,7 @@ def route_after_agent(state: AgentState) -> Literal["tools", "__end__"]:
     return END
 
 def route_after_post_tool(state: AgentState) -> Literal["sdr_agent", "__end__"]:
-    if state.get("requires_handoff"):
-        return END
+    # Always loop back so the agent speaks tool results (critical for voice calls).
     return "sdr_agent"
 
 # Build Graph

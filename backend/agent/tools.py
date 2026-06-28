@@ -5,7 +5,20 @@ import httpx
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 
-from backend.database import save_lead, SQLITE_DB_PATH, check_slot_available, create_appointment
+from backend.database import (
+    save_lead,
+    SQLITE_DB_PATH,
+    check_slot_available,
+    create_appointment,
+    _lookup_product,
+    _create_sqlite_order,
+    create_order,
+    find_active_appointments,
+    cancel_appointment_record,
+    reschedule_appointment_record,
+    find_active_orders,
+    cancel_order_record,
+)
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
@@ -292,4 +305,281 @@ async def book_appointment(
     )
     
     return f"You're all set, {name}! Your appointment is confirmed for {date} at {time}. We'll send a confirmation to {email} shortly."
+
+
+@tool
+async def place_order(
+    product_name: str,
+    customer_name: str,
+    customer_email: str,
+    customer_phone: str,
+    config: RunnableConfig
+) -> str:
+    """
+    Place a customer order for a product, package, or service.
+    Use when the caller says they want to buy, purchase, or take a package/product/service.
+    Collect customer_name, customer_email, and customer_phone before calling if not already known.
+    product_name should match what they agreed to (e.g. 'SaaS Professional', 'Starter package').
+    """
+    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+
+    missing = []
+    if not product_name or product_name.strip() == "":
+        missing.append("which product or package they want")
+    if not customer_name or customer_name.strip() == "":
+        missing.append("their full name")
+    if not customer_email or "@" not in customer_email:
+        missing.append("their email address")
+    if not customer_phone or customer_phone.strip() == "":
+        missing.append("their phone number")
+
+    if missing:
+        return (
+            f"I'd love to take your order! I just need a couple more details: {', '.join(missing)}. "
+            "Could you share those with me?"
+        )
+
+    product = _lookup_product(product_name.strip())
+    if not product:
+        return (
+            f"I couldn't find a product matching '{product_name}'. "
+            "We offer SaaS Starter ($49/mo), SaaS Professional ($199/mo), and SaaS Enterprise ($999/mo). "
+            "Which one would you like to order?"
+        )
+
+    if product["stock_quantity"] <= 0:
+        return f"Sorry, {product['name']} is currently out of stock. Would you like to hear about our other packages?"
+
+    sqlite_order_id = _create_sqlite_order(
+        customer_email=customer_email.strip(),
+        customer_phone=customer_phone.strip(),
+        product_name=product["name"],
+        total_price=product["price"],
+    )
+
+    await create_order(
+        thread_id=thread_id,
+        customer_name=customer_name.strip(),
+        customer_email=customer_email.strip(),
+        customer_phone=customer_phone.strip(),
+        product_name=product["name"],
+        total_price=product["price"],
+        sqlite_order_id=sqlite_order_id,
+    )
+
+    await save_lead(thread_id, {
+        "company": customer_name.strip(),
+        "status": "Order Placed",
+        "intent_score": 10,
+        "fit": True,
+    })
+
+    return (
+        f"Perfect! I've taken your order for the {product['name']} at {product['price']}. "
+        f"Your order number is {sqlite_order_id}. "
+        "A sales agent will contact you shortly to finalize the details and next steps. "
+        "Is there anything else I can help you with today?"
+    )
+
+
+@tool
+async def lookup_appointments(
+    email: str,
+    phone: str,
+    config: RunnableConfig,
+) -> str:
+    """
+    Look up a caller's upcoming appointments.
+    Use when they ask about their booking, meeting time, or before cancelling/rescheduling.
+    Requires email or phone to verify identity.
+    """
+    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+
+    if (not email or "@" not in email) and (not phone or phone.strip() == ""):
+        return "I can look that up for you — could you share the email or phone number you used when booking?"
+
+    appts = await find_active_appointments(
+        email=email.strip() if email else None,
+        phone=phone.strip() if phone else None,
+        thread_id=thread_id,
+    )
+
+    if not appts:
+        return "I don't see any upcoming appointments under that email or phone. Would you like to book a new one?"
+
+    lines = [
+        f"- {a.get('name', 'Guest')}: {a.get('date')} at {a.get('time')} (status: {a.get('status', 'confirmed')})"
+        for a in appts
+    ]
+    return "Here are your upcoming appointments:\n" + "\n".join(lines)
+
+
+@tool
+async def cancel_appointment(
+    email: str,
+    phone: str,
+    date: str,
+    time: str,
+    config: RunnableConfig,
+) -> str:
+    """
+    Cancel an existing appointment/meeting.
+    Use when the caller wants to cancel their booking.
+    Collect email or phone to verify identity. If they have multiple bookings, also ask for date and time.
+    """
+    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+
+    if (not email or "@" not in email) and (not phone or phone.strip() == ""):
+        return "I can cancel that for you — what email or phone number did you use when you booked?"
+
+    appts = await find_active_appointments(
+        email=email.strip() if email else None,
+        phone=phone.strip() if phone else None,
+        thread_id=thread_id,
+        date_str=date.strip() if date else None,
+        time_str=time.strip() if time else None,
+    )
+
+    if not appts:
+        return "I couldn't find an active appointment matching those details. Would you like me to look up your bookings first?"
+
+    if len(appts) > 1 and (not date or not time):
+        summary = "; ".join(f"{a.get('date')} at {a.get('time')}" for a in appts)
+        return (
+            f"You have multiple upcoming appointments ({summary}). "
+            "Which date and time would you like to cancel?"
+        )
+
+    target = appts[0]
+    cancelled = await cancel_appointment_record(target["_id"])
+    if not cancelled:
+        return "That appointment may already be cancelled. Can I help with anything else?"
+
+    return (
+        f"Done — your appointment on {target.get('date')} at {target.get('time')} has been cancelled. "
+        "Would you like to reschedule for another time, or is there anything else I can help with?"
+    )
+
+
+@tool
+async def reschedule_appointment(
+    email: str,
+    phone: str,
+    new_date: str,
+    new_time: str,
+    current_date: str,
+    current_time: str,
+    config: RunnableConfig,
+) -> str:
+    """
+    Reschedule an existing appointment to a new date and time.
+    Use when the caller wants to change or move their meeting.
+    Collect email or phone for verification. If multiple bookings exist, ask which one (current_date/current_time).
+    Then collect the new preferred date and time before calling this tool.
+    """
+    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+
+    missing = []
+    if (not email or "@" not in email) and (not phone or phone.strip() == ""):
+        missing.append("email or phone used for the booking")
+    if not new_date or new_date.strip() == "":
+        missing.append("new preferred date")
+    if not new_time or new_time.strip() == "":
+        missing.append("new preferred time")
+
+    if missing:
+        return f"Happy to reschedule — I just need your {', '.join(missing)}."
+
+    appts = await find_active_appointments(
+        email=email.strip() if email else None,
+        phone=phone.strip() if phone else None,
+        thread_id=thread_id,
+        date_str=current_date.strip() if current_date else None,
+        time_str=current_time.strip() if current_time else None,
+    )
+
+    if not appts:
+        return "I couldn't find an active appointment to reschedule. Would you like to book a new one instead?"
+
+    if len(appts) > 1 and (not current_date or not current_time):
+        summary = "; ".join(f"{a.get('date')} at {a.get('time')}" for a in appts)
+        return (
+            f"You have multiple appointments ({summary}). "
+            "Which one would you like to move — please tell me the current date and time."
+        )
+
+    target = appts[0]
+    new_date = new_date.strip()
+    new_time = new_time.strip()
+
+    if target.get("date") == new_date and target.get("time") == new_time:
+        return f"Your appointment is already scheduled for {new_date} at {new_time}. Anything else I can help with?"
+
+    available = await check_slot_available(new_date, new_time)
+    if not available:
+        return f"{new_date} at {new_time} is already taken. Could you suggest another date or time?"
+
+    updated = await reschedule_appointment_record(target["_id"], new_date, new_time)
+    if not updated:
+        return "I wasn't able to update that appointment. Would you like me to try again or connect you with a team member?"
+
+    return (
+        f"All set! I've moved your appointment to {new_date} at {new_time}. "
+        "You'll receive an updated confirmation shortly. Anything else I can help with?"
+    )
+
+
+@tool
+async def cancel_order(
+    order_id: int,
+    email: str,
+    phone: str,
+    config: RunnableConfig,
+) -> str:
+    """
+    Cancel a customer order.
+    Use when the caller wants to cancel a purchase they placed.
+    Requires order_id plus email or phone to verify ownership.
+    """
+    try:
+        oid = int(order_id) if order_id is not None else 0
+    except (TypeError, ValueError):
+        oid = 0
+
+    if not oid:
+        return "I can cancel that order — do you have your order number? It was shared when you placed the order."
+
+    if (not email or "@" not in email) and (not phone or phone.strip() == ""):
+        return "To cancel your order, I'll need the email or phone number you used when ordering."
+
+    orders = await find_active_orders(
+        order_id=oid,
+        email=email.strip() if email else None,
+        phone=phone.strip() if phone else None,
+    )
+
+    if not orders:
+        from backend.database import get_db
+        db = get_db()
+        any_order = await db.orders.find_one({"order_id": oid})
+        if any_order and any_order.get("status") == "cancelled":
+            return f"Order #{oid} is already cancelled. Is there anything else I can help with?"
+        return (
+            f"I couldn't find order #{oid} matching that email or phone. "
+            "Could you double-check the order number and contact details?"
+        )
+
+    target = orders[0]
+    if target.get("status") == "cancelled":
+        return f"Order #{oid} is already cancelled. Can I help with anything else?"
+
+    cancelled = await cancel_order_record(oid)
+    if not cancelled:
+        return "I wasn't able to cancel that order right now. Would you like me to connect you with a team member?"
+
+    product = target.get("product_name", "your order")
+    return (
+        f"Your order #{oid} for {product} has been cancelled. "
+        "A team member won't charge you for this order. Is there anything else I can help with today?"
+    )
 

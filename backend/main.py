@@ -33,7 +33,8 @@ from backend.database import (
     validate_api_key_in_db,
     rename_conversation,
     delete_conversation,
-    list_appointments
+    list_appointments,
+    list_orders
 )
 from backend.agent.graph import get_agent_graph
 
@@ -332,11 +333,46 @@ async def get_appointments(api_key: str = Depends(validate_api_key)):
     appts = await list_appointments()
     return {"appointments": appts}
 
+@app.get("/api/orders")
+async def get_orders(api_key: str = Depends(validate_api_key)):
+    """Returns all customer orders from MongoDB."""
+    orders = await list_orders()
+    return {"orders": orders}
+
+def _extract_assistant_text(messages_out: list) -> str:
+    """Pull the last speakable assistant text from graph output (handles tool-call turns)."""
+    import re
+
+    def _normalize_content(content) -> str:
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "") if isinstance(p, dict) else str(p) for p in content
+            )
+        elif not isinstance(content, str):
+            content = str(content)
+        if content and "<thought>" in content and "</thought>" in content:
+            content = re.sub(r"<thought>.*?</thought>", "", content, flags=re.DOTALL).strip()
+        return (content or "").strip()
+
+    # Prefer the last AI message with spoken content
+    for msg in reversed(messages_out):
+        if getattr(msg, "type", None) == "ai":
+            text = _normalize_content(getattr(msg, "content", ""))
+            if text:
+                return text
+
+    # Fall back to any tool result (all tools return user-facing strings)
+    for msg in reversed(messages_out):
+        if getattr(msg, "type", None) == "tool":
+            text = _normalize_content(getattr(msg, "content", ""))
+            if text:
+                return text
+
+    return "Got it! How else can I help you today?"
+
 @app.post("/api/voice/chat/completions")
 @app.post("/chat/completions")
 async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
-    import re
-
     messages_list = data.get("messages", [])
     wants_stream = data.get("stream", False)
 
@@ -372,23 +408,26 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
 
     # Run the LangGraph SDR brain
     graph = await get_agent_graph()
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 16}
     inputs = {"messages": [HumanMessage(content=user_content)], "thread_id": thread_id}
-    result = await graph.ainvoke(inputs, config=config)
 
-    # Extract plain text assistant response
-    assistant_msg = ""
-    messages_out = result.get("messages", [])
-    if messages_out:
-        last_out = messages_out[-1]
-        content = last_out.content
-        if isinstance(content, list):
-            content = " ".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
-        elif not isinstance(content, str):
-            content = str(content)
-        if "<thought>" in content and "</thought>" in content:
-            content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL).strip()
-        assistant_msg = content
+    try:
+        result = await graph.ainvoke(inputs, config=config)
+        messages_out = result.get("messages", [])
+        assistant_msg = _extract_assistant_text(messages_out)
+    except Exception as e:
+        logger.error(f"Vapi agent error for {thread_id}: {e}", exc_info=True)
+        error_msg = str(e)
+        if "RESOURCE_EXHAUSTED" in error_msg or "429" in error_msg:
+            assistant_msg = (
+                "I'm experiencing a brief system delay. "
+                "Could you repeat that, or I can have a team member call you back?"
+            )
+        else:
+            assistant_msg = (
+                "Sorry, I hit a small snag on my end. "
+                "Could you say that again, or would you like me to connect you with a team member?"
+            )
 
     await save_conversation_message(thread_id, "assistant", assistant_msg)
 

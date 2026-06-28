@@ -252,3 +252,248 @@ async def list_appointments() -> List[Dict[str, Any]]:
         appts.append(doc)
     return appts
 
+# ---------------------------------------------------------------------------
+# Customer order helpers (voice/chat purchases)
+# ---------------------------------------------------------------------------
+
+def _lookup_product(product_name: str) -> Optional[Dict[str, Any]]:
+    """Find a product in the SQLite POS catalog by fuzzy name match."""
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    cursor = conn.cursor()
+    try:
+        query = product_name.strip()
+        cursor.execute(
+            "SELECT id, name, price, stock_quantity, description FROM products WHERE LOWER(name) LIKE LOWER(?)",
+            (f"%{query}%",)
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                "id": row[0],
+                "name": row[1],
+                "price": row[2],
+                "stock_quantity": row[3],
+                "description": row[4],
+            }
+
+        # Map common shorthand / tier names to packages
+        aliases = {
+            "starter": "SaaS Starter",
+            "professional": "SaaS Professional",
+            "enterprise": "SaaS Enterprise",
+            "basic": "SaaS Starter",
+            "pro": "SaaS Professional",
+        }
+        lowered = query.lower()
+        for key, prefix in aliases.items():
+            if key in lowered:
+                cursor.execute(
+                    "SELECT id, name, price, stock_quantity, description FROM products WHERE LOWER(name) LIKE LOWER(?)",
+                    (f"%{prefix}%",)
+                )
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        "id": row[0],
+                        "name": row[1],
+                        "price": row[2],
+                        "stock_quantity": row[3],
+                        "description": row[4],
+                    }
+        return None
+    finally:
+        conn.close()
+
+def _create_sqlite_order(
+    customer_email: str,
+    customer_phone: str,
+    product_name: str,
+    total_price: str,
+) -> int:
+    """Insert a new order into the SQLite POS database and return the order id."""
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO orders (customer_email, customer_phone, status, total_price, items)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                customer_email,
+                customer_phone or None,
+                "Pending Agent Follow-up",
+                total_price,
+                f"1x {product_name}",
+            ),
+        )
+        order_id = cursor.lastrowid
+        conn.commit()
+        return int(order_id)
+    finally:
+        conn.close()
+
+async def create_order(
+    thread_id: str,
+    customer_name: str,
+    customer_email: str,
+    customer_phone: str,
+    product_name: str,
+    total_price: str,
+    sqlite_order_id: int,
+) -> Dict[str, Any]:
+    """Persist a customer order to MongoDB."""
+    from datetime import datetime, timezone
+
+    db = get_db()
+    doc = {
+        "thread_id": thread_id,
+        "order_id": sqlite_order_id,
+        "customer_name": customer_name,
+        "customer_email": customer_email,
+        "customer_phone": customer_phone,
+        "product_name": product_name,
+        "total_price": total_price,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    result = await db.orders.insert_one(doc)
+    doc["_id"] = str(result.inserted_id)
+    return doc
+
+async def list_orders() -> List[Dict[str, Any]]:
+    """Returns all customer orders, newest first."""
+    db = get_db()
+    cursor = db.orders.find({}).sort([("created_at", -1)])
+    orders = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        orders.append(doc)
+    return orders
+
+def _normalize_phone(phone: str) -> str:
+    """Strip non-digits for loose phone matching."""
+    return "".join(c for c in phone if c.isdigit())
+
+async def find_active_appointments(
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    date_str: Optional[str] = None,
+    time_str: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Find non-cancelled appointments matching caller identity."""
+    db = get_db()
+    filters: List[Dict[str, Any]] = [{"status": {"$ne": "cancelled"}}]
+
+    if thread_id:
+        filters.append({"thread_id": thread_id})
+
+    identity_clauses: List[Dict[str, Any]] = []
+    if email and email.strip():
+        identity_clauses.append({"email": {"$regex": f"^{email.strip()}$", "$options": "i"}})
+    if phone and phone.strip():
+        normalized = _normalize_phone(phone)
+        if normalized:
+            identity_clauses.append({"phone": {"$regex": normalized[-10:]}})
+
+    if identity_clauses:
+        filters.append({"$or": identity_clauses})
+
+    if date_str and date_str.strip():
+        filters.append({"date": date_str.strip()})
+    if time_str and time_str.strip():
+        filters.append({"time": time_str.strip()})
+
+    query: Dict[str, Any] = {"$and": filters} if len(filters) > 1 else filters[0]
+    cursor = db.appointments.find(query).sort([("date", 1), ("time", 1)])
+    results = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        results.append(doc)
+    return results
+
+async def cancel_appointment_record(appt_id: str) -> bool:
+    """Mark an appointment as cancelled in MongoDB."""
+    from bson import ObjectId
+
+    db = get_db()
+    result = await db.appointments.update_one(
+        {"_id": ObjectId(appt_id), "status": {"$ne": "cancelled"}},
+        {"$set": {"status": "cancelled"}},
+    )
+    return result.modified_count > 0
+
+async def reschedule_appointment_record(
+    appt_id: str,
+    new_date: str,
+    new_time: str,
+) -> bool:
+    """Move an appointment to a new date/time."""
+    from bson import ObjectId
+
+    db = get_db()
+    result = await db.appointments.update_one(
+        {"_id": ObjectId(appt_id), "status": {"$ne": "cancelled"}},
+        {"$set": {"date": new_date.strip(), "time": new_time.strip()}},
+    )
+    return result.modified_count > 0
+
+async def find_active_orders(
+    order_id: Optional[int] = None,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Find non-cancelled orders matching caller identity."""
+    db = get_db()
+    filters: List[Dict[str, Any]] = [{"status": {"$ne": "cancelled"}}]
+
+    if order_id is not None:
+        filters.append({"order_id": order_id})
+    if thread_id:
+        filters.append({"thread_id": thread_id})
+
+    identity_clauses: List[Dict[str, Any]] = []
+    if email and email.strip():
+        identity_clauses.append({"customer_email": {"$regex": f"^{email.strip()}$", "$options": "i"}})
+    if phone and phone.strip():
+        normalized = _normalize_phone(phone)
+        if normalized:
+            identity_clauses.append({"customer_phone": {"$regex": normalized[-10:]}})
+
+    if identity_clauses:
+        filters.append({"$or": identity_clauses})
+
+    query: Dict[str, Any] = {"$and": filters} if len(filters) > 1 else filters[0]
+    cursor = db.orders.find(query).sort([("created_at", -1)])
+    results = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        results.append(doc)
+    return results
+
+def _cancel_sqlite_order(order_id: int) -> bool:
+    """Mark a SQLite POS order as cancelled."""
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE orders SET status = ? WHERE id = ? AND status != ?",
+            ("Cancelled", order_id, "Cancelled"),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+async def cancel_order_record(order_id: int) -> bool:
+    """Mark an order as cancelled in MongoDB and SQLite."""
+    db = get_db()
+    result = await db.orders.update_one(
+        {"order_id": order_id, "status": {"$ne": "cancelled"}},
+        {"$set": {"status": "cancelled"}},
+    )
+    sqlite_updated = _cancel_sqlite_order(order_id)
+    return result.modified_count > 0 or sqlite_updated
+

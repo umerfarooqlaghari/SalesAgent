@@ -33,8 +33,9 @@ export default function Dashboard() {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [activeLead, setActiveLead] = useState<Lead | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [activeTab, setActiveTab] = useState<"sandbox" | "supervisor" | "leads" | "appointments">("sandbox");
+  const [activeTab, setActiveTab] = useState<"sandbox" | "supervisor" | "leads" | "appointments" | "orders">("sandbox");
   const [appointments, setAppointments] = useState<any[]>([]);
+  const [orders, setOrders] = useState<any[]>([]);
 
   // Real-time states
   const [connected, setConnected] = useState<boolean>(false);
@@ -60,6 +61,9 @@ export default function Dashboard() {
   const [chatInput, setChatInput] = useState<string>("");
   const [supervisorMessage, setSupervisorMessage] = useState<string>("");
   const [selectedHandoffThread, setSelectedHandoffThread] = useState<string>("");
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(false);
+  const [showLeadProfile, setShowLeadProfile] = useState<boolean>(false);
+  const [supervisorMobileView, setSupervisorMobileView] = useState<"queue" | "chat">("queue");
 
   // Refs to prevent closure stale states
   const ws = useRef<WebSocket | null>(null);
@@ -443,6 +447,7 @@ export default function Dashboard() {
     const newId = "thread_" + Math.random().toString(36).substring(2, 10);
     setThreadId(newId);
     setActiveTab("sandbox");
+    setSidebarOpen(false);
   };
 
   // Supervisor actions
@@ -499,6 +504,7 @@ export default function Dashboard() {
       pulse = true;
     } else if (s === "Human Claimed") bg = "bg-purple-950/60 text-purple-400 border-purple-800/80";
     else if (s === "Demo Scheduled") bg = "bg-cyan-950/60 text-cyan-400 border-cyan-800/80";
+    else if (s === "Order Placed") bg = "bg-green-950/60 text-green-400 border-green-800/80";
 
     return (
       <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold border ${bg}`}>
@@ -509,26 +515,51 @@ export default function Dashboard() {
   };
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[#0A0E1A] text-[#E2E8F0]">
+    <div className="flex h-[100dvh] overflow-hidden bg-[#0A0E1A] text-[#E2E8F0]">
+      {/* Mobile sidebar backdrop */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/60 lg:hidden"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
       {/* Sidebar */}
-      <aside className="w-80 bg-[#111726] border-r border-[#1F293D] flex flex-col shrink-0">
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 flex w-[min(20rem,85vw)] shrink-0 flex-col border-r border-[#1F293D] bg-[#111726] transition-transform duration-300 ease-in-out lg:relative lg:w-80 lg:translate-x-0 ${
+          sidebarOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"
+        }`}
+      >
         {/* Branding */}
-        <div className="p-6 border-b border-[#1F293D] flex items-center justify-between">
+        <div className="flex items-center justify-between border-b border-[#1F293D] p-4 sm:p-6">
           <div className="flex items-center gap-3">
-            <div className="h-8 w-8 rounded-lg bg-gradient-to-tr from-sky-500 to-indigo-600 flex items-center justify-center font-bold text-white shadow-md shadow-indigo-500/20">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-tr from-sky-500 to-indigo-600 text-sm font-bold text-white shadow-md shadow-indigo-500/20">
               A
             </div>
             <div>
-              <h1 className="font-extrabold text-sm tracking-wide text-white">ALPHA</h1>
-              <span className="text-[10px] text-slate-400 font-medium">B2B SDR AGENT CONSOLE</span>
+              <h1 className="text-sm font-extrabold tracking-wide text-white">ALPHA</h1>
+              <span className="text-[10px] font-medium text-slate-400">B2B SDR AGENT CONSOLE</span>
             </div>
           </div>
-          {/* Glowing Status Dot */}
-          <div className="flex items-center gap-1.5 bg-[#1A2333] px-2.5 py-1 rounded-full border border-slate-700">
-            <span className={`h-2.5 w-2.5 rounded-full ${connected ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.5)]" : "bg-rose-500"}`} />
-            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-300">
-              {connected ? "LIVE" : "OFF"}
-            </span>
+          <div className="flex items-center gap-2">
+            {/* Glowing Status Dot */}
+            <div className="flex items-center gap-1.5 rounded-full border border-slate-700 bg-[#1A2333] px-2.5 py-1">
+              <span className={`h-2.5 w-2.5 rounded-full ${connected ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.5)]" : "bg-rose-500"}`} />
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-300">
+                {connected ? "LIVE" : "OFF"}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(false)}
+              className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-800 hover:text-white lg:hidden"
+              aria-label="Close sidebar"
+            >
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
           </div>
         </div>
 
@@ -599,6 +630,7 @@ export default function Dashboard() {
                   <button
                     onClick={() => {
                       setThreadId(id);
+                      setSidebarOpen(false);
                       if (activeTab === "supervisor") {
                         setSelectedHandoffThread(id);
                       }
@@ -612,7 +644,7 @@ export default function Dashboard() {
                       )}
                     </div>
                   </button>
-                  <div className="hidden group-hover:flex items-center gap-1.5 pr-2 shrink-0">
+                  <div className="hidden max-lg:flex lg:group-hover:flex shrink-0 items-center gap-1.5 pr-2">
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -646,32 +678,46 @@ export default function Dashboard() {
       </aside>
 
       {/* Main Workspace */}
-      <main className="flex-1 flex flex-col overflow-hidden bg-[#0C1220]">
+      <main className="flex min-w-0 flex-1 flex-col overflow-hidden bg-[#0C1220]">
         {/* Navigation Tabs Header */}
-        <header className="h-16 border-b border-[#1F293D] px-8 bg-[#111726]/40 backdrop-blur-md flex items-center justify-between shrink-0">
-          <nav className="flex gap-4">
+        <header className="flex shrink-0 flex-col gap-3 border-b border-[#1F293D] bg-[#111726]/40 px-4 py-3 backdrop-blur-md sm:px-6 lg:h-16 lg:flex-row lg:items-center lg:justify-between lg:px-8 lg:py-0">
+          <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(true)}
+              className="shrink-0 rounded-lg border border-slate-700 p-2 text-slate-400 transition-all hover:bg-[#1E293B] hover:text-white lg:hidden"
+              aria-label="Open sidebar"
+            >
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
+            <nav className="scrollbar-hide flex flex-1 gap-2 overflow-x-auto pb-0.5 sm:gap-3 lg:gap-4">
             <button
               onClick={() => setActiveTab("sandbox")}
-              className={`px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${activeTab === "sandbox"
-                  ? "bg-[#1E293B] text-sky-400 border border-sky-500/20"
+              className={`shrink-0 rounded-lg px-3 py-2 text-[10px] font-bold uppercase tracking-wider transition-all sm:px-4 sm:text-xs ${activeTab === "sandbox"
+                  ? "border border-sky-500/20 bg-[#1E293B] text-sky-400"
                   : "text-slate-400 hover:text-white"
                 }`}
             >
-              Agent Chat Sandbox
+              <span className="sm:hidden">Chat</span>
+              <span className="hidden sm:inline">Agent Chat Sandbox</span>
             </button>
             <button
               onClick={() => {
                 setActiveTab("supervisor");
                 setSelectedHandoffThread(threadId);
+                setSupervisorMobileView("queue");
               }}
-              className={`relative px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${activeTab === "supervisor"
-                  ? "bg-[#1E293B] text-sky-400 border border-sky-500/20"
+              className={`relative shrink-0 rounded-lg px-3 py-2 text-[10px] font-bold uppercase tracking-wider transition-all sm:px-4 sm:text-xs ${activeTab === "supervisor"
+                  ? "border border-sky-500/20 bg-[#1E293B] text-sky-400"
                   : "text-slate-400 hover:text-white"
                 }`}
             >
-              Supervisor Console
+              <span className="sm:hidden">Supervisor</span>
+              <span className="hidden sm:inline">Supervisor Console</span>
               {leads.some((l) => l.status === "Handoff Requested") && (
-                <span className="absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[8px] font-black text-black">
+                <span className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[8px] font-black text-black">
                   !
                 </span>
               )}
@@ -681,12 +727,13 @@ export default function Dashboard() {
                 setActiveTab("leads");
                 fetchLeads();
               }}
-              className={`px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${activeTab === "leads"
-                  ? "bg-[#1E293B] text-sky-400 border border-sky-500/20"
+              className={`shrink-0 rounded-lg px-3 py-2 text-[10px] font-bold uppercase tracking-wider transition-all sm:px-4 sm:text-xs ${activeTab === "leads"
+                  ? "border border-sky-500/20 bg-[#1E293B] text-sky-400"
                   : "text-slate-400 hover:text-white"
                 }`}
             >
-              CRM Synced Leads
+              <span className="sm:hidden">Leads</span>
+              <span className="hidden sm:inline">CRM Synced Leads</span>
             </button>
             <button
               onClick={async () => {
@@ -701,42 +748,65 @@ export default function Dashboard() {
                   }
                 } catch { }
               }}
-              className={`px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${activeTab === "appointments"
-                  ? "bg-[#1E293B] text-sky-400 border border-sky-500/20"
+              className={`shrink-0 rounded-lg px-3 py-2 text-[10px] font-bold uppercase tracking-wider transition-all sm:px-4 sm:text-xs ${activeTab === "appointments"
+                  ? "border border-sky-500/20 bg-[#1E293B] text-sky-400"
                   : "text-slate-400 hover:text-white"
                 }`}
             >
-              📅 Appointments
+              📅 <span className="sm:hidden">Appts</span><span className="hidden sm:inline">Appointments</span>
+            </button>
+            <button
+              onClick={async () => {
+                setActiveTab("orders");
+                try {
+                  const res = await fetch(`${backendUrl}/api/orders`, {
+                    headers: { Authorization: `Bearer ${apiKey}` }
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    setOrders(data.orders || []);
+                  }
+                } catch { }
+              }}
+              className={`shrink-0 rounded-lg px-3 py-2 text-[10px] font-bold uppercase tracking-wider transition-all sm:px-4 sm:text-xs ${activeTab === "orders"
+                  ? "border border-sky-500/20 bg-[#1E293B] text-sky-400"
+                  : "text-slate-400 hover:text-white"
+                }`}
+            >
+              🛒 <span className="sm:hidden">Orders</span><span className="hidden sm:inline">Orders</span>
             </button>
           </nav>
+          </div>
 
           {/* Voice Mode & Refresh Panel (v2) */}
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center justify-end gap-2 sm:gap-3">
             <button
               onClick={handleToggleVapiCall}
-              className={`px-3.5 py-1.5 rounded-lg border text-xs font-bold uppercase tracking-wider transition-all duration-300 flex items-center gap-2 ${isCalling
-                  ? "bg-rose-950/60 text-rose-400 border-rose-800/80 shadow-[0_0_8px_rgba(244,63,94,0.15)] animate-pulse"
-                  : "bg-slate-800/50 hover:bg-slate-700/50 text-sky-400 border-sky-500/20"
+              className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider transition-all duration-300 sm:gap-2 sm:px-3.5 sm:text-xs ${isCalling
+                  ? "animate-pulse border-rose-800/80 bg-rose-950/60 text-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.15)]"
+                  : "border-sky-500/20 bg-slate-800/50 text-sky-400 hover:bg-slate-700/50"
                 }`}
             >
               {isCalling ? (
                 <>
-                  <span className="h-2 w-2 rounded-full bg-rose-500 animate-ping" />
-                  🛑 End Vapi Call
+                  <span className="h-2 w-2 animate-ping rounded-full bg-rose-500" />
+                  <span className="hidden sm:inline">🛑 End Vapi Call</span>
+                  <span className="sm:hidden">🛑 End</span>
                 </>
               ) : (
                 <>
-                  <span className="h-2 w-2 rounded-full bg-sky-400 animate-pulse" />
-                  📞 Start Vapi Call
+                  <span className="h-2 w-2 animate-pulse rounded-full bg-sky-400" />
+                  <span className="hidden sm:inline">📞 Start Vapi Call</span>
+                  <span className="sm:hidden">📞 Call</span>
                 </>
               )}
             </button>
 
 
-            <div className="flex items-center gap-3">
-              <div className="text-right">
-                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Agent Engine Status</div>
-                <div className="text-xs font-semibold text-slate-200">{statusText}</div>
+            <div className="flex items-center gap-2 sm:gap-3">
+              <div className="hidden text-right sm:block">
+                <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Agent Engine Status</div>
+                <div className="max-w-[140px] truncate text-xs font-semibold text-slate-200 sm:max-w-none">{statusText}</div>
               </div>
               <button
                 onClick={() => {
@@ -744,10 +814,10 @@ export default function Dashboard() {
                   fetchLeads();
                   if (threadId) fetchLeadProfile(threadId);
                 }}
-                className="p-2 hover:bg-[#1E293B] rounded-lg transition-all border border-slate-700 text-slate-400 hover:text-white"
+                className="rounded-lg border border-slate-700 p-2 text-slate-400 transition-all hover:bg-[#1E293B] hover:text-white"
                 title="Refresh lists"
               >
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 7.89M9 11l3-3m0 0l3 3m-3-3v12" />
                 </svg>
               </button>
@@ -757,11 +827,11 @@ export default function Dashboard() {
 
         {/* Sandbox view */}
         {activeTab === "sandbox" && (
-          <div className="flex-1 flex overflow-hidden">
+          <div className="flex flex-1 flex-col overflow-hidden lg:flex-row">
             {/* Chat Frame */}
-            <div className="flex-1 flex flex-col min-w-0 border-r border-[#1F293D]">
+            <div className="flex min-w-0 flex-1 flex-col lg:border-r lg:border-[#1F293D]">
               {/* Messages feed */}
-              <div className="flex-1 overflow-y-auto p-6 space-y-6">
+              <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:space-y-6 sm:p-6">
                 {messages.length === 0 && !streamingResponse && !streamingThought && !toolCalls.length ? (
                   <div className="h-full flex flex-col items-center justify-center text-slate-500 text-center max-w-md mx-auto">
                     <div className="h-12 w-12 rounded-full bg-slate-800/80 border border-slate-700 flex items-center justify-center text-slate-400 text-lg mb-4">
@@ -876,36 +946,36 @@ export default function Dashboard() {
               </div>
 
               {/* Chat Input block */}
-              <div className="p-4 border-t border-[#1F293D] bg-[#111726]/40 backdrop-blur-md">
+              <div className="border-t border-[#1F293D] bg-[#111726]/40 p-3 backdrop-blur-md sm:p-4">
                 {activeLead?.status === "Handoff Requested" || activeLead?.status === "Human Claimed" ? (
-                  <div className="bg-amber-950/20 border border-amber-800/30 rounded-lg p-3 flex items-center justify-between">
-                    <span className="text-xs text-amber-400 font-semibold">
+                  <div className="flex flex-col items-start gap-2 rounded-lg border border-amber-800/30 bg-amber-950/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+                    <span className="text-xs font-semibold text-amber-400">
                       ⚠️ Chat is in Human Intervention Mode (Twilio Handoff Triggered). Use the **Supervisor Console** to respond.
                     </span>
                     <button
                       onClick={() => setActiveTab("supervisor")}
-                      className="px-3 py-1 bg-amber-600 hover:bg-amber-500 text-black text-xs font-bold rounded-lg transition-all"
+                      className="shrink-0 rounded-lg bg-amber-600 px-3 py-1 text-xs font-bold text-black transition-all hover:bg-amber-500"
                     >
                       Go to Supervisor
                     </button>
                   </div>
                 ) : (
-                  <div className="flex gap-3">
+                  <div className="flex gap-2 sm:gap-3">
                     <input
                       type="text"
                       value={chatInput}
                       onChange={(e) => setChatInput(e.target.value)}
                       onKeyDown={(e) => e.key === "Enter" && handleSendMessage()}
                       placeholder="Type a message as a lead..."
-                      className="flex-1 bg-[#1A2234] border border-[#2D3D54] rounded-lg px-4 py-2.5 text-sm text-[#F1F5F9] placeholder-slate-500 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 transition-all"
+                      className="min-w-0 flex-1 rounded-lg border border-[#2D3D54] bg-[#1A2234] px-3 py-2.5 text-sm text-[#F1F5F9] placeholder-slate-500 transition-all focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 sm:px-4"
                     />
                     <button
                       onClick={handleSendMessage}
                       disabled={!chatInput.trim() || !connected}
-                      className="px-5 py-2.5 bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 disabled:opacity-40 disabled:pointer-events-none text-white text-sm font-semibold rounded-lg shadow-md shadow-indigo-600/10 transition-all flex items-center gap-1.5"
+                      className="flex shrink-0 items-center gap-1.5 rounded-lg bg-gradient-to-r from-sky-500 to-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-indigo-600/10 transition-all hover:from-sky-400 hover:to-indigo-500 disabled:pointer-events-none disabled:opacity-40 sm:px-5"
                     >
-                      Send
-                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <span className="hidden sm:inline">Send</span>
+                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                         <path strokeLinecap="round" strokeLinejoin="round" d="M14 5l7 7m0 0l-7 7m7-7H3" />
                       </svg>
                     </button>
@@ -915,7 +985,24 @@ export default function Dashboard() {
             </div>
 
             {/* Sandbox Side Panel - Real-time Lead profile details */}
-            <div className="w-80 overflow-y-auto p-6 space-y-6">
+            <div className="w-full shrink-0 border-t border-[#1F293D] lg:w-80 lg:border-l lg:border-t-0">
+              <button
+                type="button"
+                onClick={() => setShowLeadProfile((prev) => !prev)}
+                className="flex w-full items-center justify-between border-b border-[#1F293D] px-4 py-2.5 text-xs font-bold uppercase tracking-wider text-slate-400 lg:hidden"
+              >
+                <span>Lead Profile {activeLead?.company ? `· ${activeLead.company}` : ""}</span>
+                <svg
+                  className={`h-4 w-4 transition-transform ${showLeadProfile ? "rotate-180" : ""}`}
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                </svg>
+              </button>
+              <div className={`max-h-[45vh] space-y-6 overflow-y-auto p-4 sm:p-6 lg:max-h-none ${showLeadProfile ? "block" : "hidden lg:block"}`}>
               <div>
                 <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Enriched Lead Profile</h3>
                 {activeLead ? (
@@ -981,15 +1068,16 @@ export default function Dashboard() {
                   Ask about stock (e.g. *"Do you have professional packages?"*) or look up order status (e.g. *"Check order status for 1001 with email cto@cloudgrid.io"*). Handoffs push live alerts via Twilio's WhatsApp gateway.
                 </p>
               </div>
+              </div>
             </div>
           </div>
         )}
 
         {/* Handoff Supervisor view */}
         {activeTab === "supervisor" && (
-          <div className="flex-1 flex overflow-hidden">
+          <div className="flex flex-1 flex-col overflow-hidden lg:flex-row">
             {/* Left Queue */}
-            <div className="w-80 border-r border-[#1F293D] flex flex-col bg-[#111726]/20">
+            <div className={`flex w-full flex-col border-b border-[#1F293D] bg-[#111726]/20 lg:w-80 lg:border-b-0 lg:border-r ${selectedHandoffThread && supervisorMobileView === "chat" ? "hidden lg:flex" : "flex"}`}>
               <div className="p-4 border-b border-[#1F293D] text-[11px] font-bold text-slate-400 uppercase tracking-wider">
                 Handoff Inboxes ({leads.filter((l) => ["Handoff Requested", "Human Claimed"].includes(l.status || "")).length})
               </div>
@@ -1007,6 +1095,7 @@ export default function Dashboard() {
                         onClick={() => {
                           setSelectedHandoffThread(lead.thread_id);
                           setThreadId(lead.thread_id);
+                          setSupervisorMobileView("chat");
                         }}
                         className={`w-full text-left p-3.5 rounded-xl border transition-all ${selectedHandoffThread === lead.thread_id
                             ? "bg-[#1E293B] text-white border-sky-500/30"
@@ -1032,14 +1121,26 @@ export default function Dashboard() {
             </div>
 
             {/* Right Operator Console */}
-            <div className="flex-1 flex flex-col bg-[#0C1220] min-w-0">
+            <div className={`min-w-0 flex-1 flex-col bg-[#0C1220] ${selectedHandoffThread && supervisorMobileView === "chat" ? "flex" : "hidden lg:flex"} ${!selectedHandoffThread ? "lg:flex" : ""}`}>
               {selectedHandoffThread ? (
                 <>
                   {/* Console Header */}
-                  <div className="p-4 border-b border-[#1F293D] flex items-center justify-between bg-[#111726]/40 backdrop-blur-md shrink-0">
-                    <div>
-                      <h4 className="text-xs font-bold text-slate-400 uppercase">Selected Thread</h4>
-                      <h3 className="text-sm font-bold text-white font-mono">{selectedHandoffThread}</h3>
+                  <div className="flex shrink-0 flex-col gap-3 border-b border-[#1F293D] bg-[#111726]/40 p-4 backdrop-blur-md sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex min-w-0 items-start gap-3">
+                      <button
+                        type="button"
+                        onClick={() => setSupervisorMobileView("queue")}
+                        className="mt-0.5 shrink-0 rounded-lg border border-slate-700 p-1.5 text-slate-400 transition-all hover:bg-[#1E293B] hover:text-white lg:hidden"
+                        aria-label="Back to queue"
+                      >
+                        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+                        </svg>
+                      </button>
+                      <div className="min-w-0">
+                        <h4 className="text-xs font-bold uppercase text-slate-400">Selected Thread</h4>
+                        <h3 className="truncate text-sm font-bold font-mono text-white">{selectedHandoffThread}</h3>
+                      </div>
                     </div>
                     {leads.find((l) => l.thread_id === selectedHandoffThread)?.status === "Handoff Requested" ? (
                       <button
@@ -1059,7 +1160,7 @@ export default function Dashboard() {
                   </div>
 
                   {/* Active Transcript view */}
-                  <div className="flex-1 overflow-y-auto p-6 space-y-4">
+                  <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:p-6">
                     {messages.map((msg, idx) => (
                       <div
                         key={idx}
@@ -1089,23 +1190,24 @@ export default function Dashboard() {
                   </div>
 
                   {/* Operator send message interface */}
-                  <div className="p-4 border-t border-[#1F293D] bg-[#111726]/40 backdrop-blur-md shrink-0">
+                  <div className="shrink-0 border-t border-[#1F293D] bg-[#111726]/40 p-3 backdrop-blur-md sm:p-4">
                     {leads.find((l) => l.thread_id === selectedHandoffThread)?.status === "Human Claimed" ? (
-                      <div className="flex gap-3">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:gap-3">
                         <input
                           type="text"
                           value={supervisorMessage}
                           onChange={(e) => setSupervisorMessage(e.target.value)}
                           onKeyDown={(e) => e.key === "Enter" && handleSendSupervisorMessage(selectedHandoffThread)}
                           placeholder="Reply as human representative..."
-                          className="flex-1 bg-[#1A2234] border border-[#2D3D54] rounded-lg px-4 py-2.5 text-sm text-[#F1F5F9] focus:outline-none focus:border-purple-500 transition-all"
+                          className="min-w-0 flex-1 rounded-lg border border-[#2D3D54] bg-[#1A2234] px-4 py-2.5 text-sm text-[#F1F5F9] transition-all focus:border-purple-500 focus:outline-none"
                         />
                         <button
                           onClick={() => handleSendSupervisorMessage(selectedHandoffThread)}
                           disabled={!supervisorMessage.trim()}
-                          className="px-5 py-2.5 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 disabled:opacity-40 disabled:pointer-events-none text-white text-sm font-semibold rounded-lg shadow-md transition-all"
+                          className="shrink-0 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-md transition-all hover:from-purple-500 hover:to-indigo-500 disabled:pointer-events-none disabled:opacity-40 sm:px-5"
                         >
-                          Send Operator Message
+                          <span className="hidden sm:inline">Send Operator Message</span>
+                          <span className="sm:hidden">Send</span>
                         </button>
                       </div>
                     ) : (
@@ -1132,42 +1234,42 @@ export default function Dashboard() {
 
         {/* CRM leads view */}
         {activeTab === "leads" && (
-          <div className="flex-1 overflow-y-auto p-8 space-y-6">
+          <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:space-y-6 sm:p-6 lg:p-8">
             <div>
-              <h2 className="text-lg font-bold text-white mb-1">B2B Synced Leads</h2>
+              <h2 className="mb-1 text-lg font-bold text-white">B2B Synced Leads</h2>
               <p className="text-xs text-slate-400">
                 Leads automatically sync'd to MongoDB Atlas from LangGraph SDR qualifying tools.
               </p>
             </div>
 
-            <div className="bg-[#111726]/40 border border-[#1F293D] rounded-xl overflow-hidden shadow-xl">
-              <table className="w-full text-left border-collapse">
+            <div className="overflow-x-auto rounded-xl border border-[#1F293D] bg-[#111726]/40 shadow-xl">
+              <table className="w-full min-w-[640px] border-collapse text-left">
                 <thead>
-                  <tr className="border-b border-[#1F293D] bg-[#161F30]/40 text-slate-400 text-[10px] font-bold uppercase tracking-wider">
-                    <th className="py-4 px-6">Company</th>
-                    <th className="py-4 px-6">Job Title</th>
-                    <th className="py-4 px-6">Intent Score</th>
-                    <th className="py-4 px-6">B2B Fit</th>
-                    <th className="py-4 px-6">Status</th>
-                    <th className="py-4 px-6">Thread ID</th>
+                  <tr className="border-b border-[#1F293D] bg-[#161F30]/40 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                    <th className="px-4 py-3 sm:px-6 sm:py-4">Company</th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4">Job Title</th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4">Intent Score</th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4">B2B Fit</th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4">Status</th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4">Thread ID</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#1F293D] text-sm text-slate-200">
                   {leads.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="text-center py-12 text-xs text-slate-500 font-semibold">
+                      <td colSpan={6} className="py-12 text-center text-xs font-semibold text-slate-500">
                         No leads sync'd in database. Complete firmographic checks to qualify leads.
                       </td>
                     </tr>
                   ) : (
                     leads.map((lead, idx) => (
-                      <tr key={idx} className="hover:bg-[#1E293B]/20 transition-all">
-                        <td className="py-4 px-6 font-bold text-white">{lead.company || "N/A"}</td>
-                        <td className="py-4 px-6">{lead.job_title || "N/A"}</td>
-                        <td className="py-4 px-6">
+                      <tr key={idx} className="transition-all hover:bg-[#1E293B]/20">
+                        <td className="px-4 py-3 font-bold text-white sm:px-6 sm:py-4">{lead.company || "N/A"}</td>
+                        <td className="px-4 py-3 sm:px-6 sm:py-4">{lead.job_title || "N/A"}</td>
+                        <td className="px-4 py-3 sm:px-6 sm:py-4">
                           <span className="font-mono font-bold text-slate-300">{lead.intent_score || 0}/10</span>
                         </td>
-                        <td className="py-4 px-6">
+                        <td className="px-4 py-3 sm:px-6 sm:py-4">
                           {lead.fit === true ? (
                             <span className="text-emerald-400 font-bold text-xs flex items-center gap-1">
                               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> Yes
@@ -1180,8 +1282,8 @@ export default function Dashboard() {
                             <span className="text-slate-500 font-semibold text-xs">Unknown</span>
                           )}
                         </td>
-                        <td className="py-4 px-6">{renderStatusBadge(lead.status)}</td>
-                        <td className="py-4 px-6 font-mono text-xs text-slate-400">{lead.thread_id}</td>
+                        <td className="px-4 py-3 sm:px-6 sm:py-4">{renderStatusBadge(lead.status)}</td>
+                        <td className="max-w-[120px] truncate px-4 py-3 font-mono text-xs text-slate-400 sm:max-w-none sm:px-6 sm:py-4">{lead.thread_id}</td>
                       </tr>
                     ))
                   )}
@@ -1193,11 +1295,11 @@ export default function Dashboard() {
 
         {/* ── Appointments Panel ── */}
         {activeTab === "appointments" && (
-          <div className="p-6 h-full flex flex-col gap-5">
-            <div className="flex items-center justify-between">
+          <div className="flex h-full flex-col gap-4 p-4 sm:gap-5 sm:p-6">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
-                <h2 className="text-lg font-bold text-white tracking-tight">📅 Scheduled Appointments</h2>
-                <p className="text-xs text-slate-500 mt-0.5">Booked via voice or chat — stored in MongoDB</p>
+                <h2 className="text-lg font-bold tracking-tight text-white">📅 Scheduled Appointments</h2>
+                <p className="mt-0.5 text-xs text-slate-500">Booked via voice or chat — stored in MongoDB</p>
               </div>
               <button
                 onClick={async () => {
@@ -1216,24 +1318,24 @@ export default function Dashboard() {
                 ↻ Refresh
               </button>
             </div>
-            <div className="overflow-auto rounded-xl border border-[#1E293B] flex-1">
-              <table className="w-full text-sm text-slate-300 min-w-[860px]">
+            <div className="flex-1 overflow-auto rounded-xl border border-[#1E293B]">
+              <table className="w-full min-w-[860px] text-sm text-slate-300">
                 <thead>
-                  <tr className="bg-[#0F172A] border-b border-[#1E293B] text-xs uppercase tracking-widest text-slate-500">
-                    <th className="py-3 px-5 text-left">Name</th>
-                    <th className="py-3 px-5 text-left">Email</th>
-                    <th className="py-3 px-5 text-left">Phone</th>
-                    <th className="py-3 px-5 text-left">Date</th>
-                    <th className="py-3 px-5 text-left">Time</th>
-                    <th className="py-3 px-5 text-left">Status</th>
-                    <th className="py-3 px-5 text-left">Notes</th>
+                  <tr className="border-b border-[#1E293B] bg-[#0F172A] text-xs uppercase tracking-widest text-slate-500">
+                    <th className="px-3 py-3 text-left sm:px-5">Name</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Email</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Phone</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Date</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Time</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Status</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Notes</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#1E293B]/60">
                   {appointments.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="text-center py-16 text-xs text-slate-500 font-semibold">
-                        <div className="flex flex-col items-center gap-2">
+                      <td colSpan={7} className="py-16 text-center text-xs font-semibold text-slate-500">
+                        <div className="flex flex-col items-center gap-2 px-4">
                           <span className="text-3xl">📭</span>
                           <span>No appointments yet. Start a Vapi call and ask to book a meeting!</span>
                         </div>
@@ -1241,31 +1343,113 @@ export default function Dashboard() {
                     </tr>
                   ) : (
                     appointments.map((appt, idx) => (
-                      <tr key={idx} className="hover:bg-[#1E293B]/30 transition-all">
-                        <td className="py-4 px-5 font-bold text-white">{appt.name || "—"}</td>
-                        <td className="py-4 px-5 font-mono text-xs text-sky-300">{appt.email || "—"}</td>
-                        <td className="py-4 px-5 font-mono text-xs">{appt.phone || "—"}</td>
-                        <td className="py-4 px-5">
-                          <span className="px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-300 text-xs font-semibold border border-indigo-500/20">
+                      <tr key={idx} className="transition-all hover:bg-[#1E293B]/30">
+                        <td className="px-3 py-3 font-bold text-white sm:px-5 sm:py-4">{appt.name || "—"}</td>
+                        <td className="px-3 py-3 font-mono text-xs text-sky-300 sm:px-5 sm:py-4">{appt.email || "—"}</td>
+                        <td className="px-3 py-3 font-mono text-xs sm:px-5 sm:py-4">{appt.phone || "—"}</td>
+                        <td className="px-3 py-3 sm:px-5 sm:py-4">
+                          <span className="rounded border border-indigo-500/20 bg-indigo-500/10 px-2 py-0.5 text-xs font-semibold text-indigo-300">
                             {appt.date || "—"}
                           </span>
                         </td>
-                        <td className="py-4 px-5">
-                          <span className="px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 text-xs font-semibold border border-sky-500/20">
+                        <td className="px-3 py-3 sm:px-5 sm:py-4">
+                          <span className="rounded border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-xs font-semibold text-sky-300">
                             {appt.time || "—"}
                           </span>
                         </td>
-                        <td className="py-4 px-5">
-                          <span className={`px-2 py-0.5 rounded text-xs font-bold border ${appt.status === "confirmed"
-                              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                        <td className="px-3 py-3 sm:px-5 sm:py-4">
+                          <span className={`rounded border px-2 py-0.5 text-xs font-bold ${appt.status === "confirmed"
+                              ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-400"
                               : appt.status === "cancelled"
-                                ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
-                                : "bg-slate-500/10 text-slate-400 border-slate-500/20"
+                                ? "border-rose-500/20 bg-rose-500/10 text-rose-400"
+                                : "border-slate-500/20 bg-slate-500/10 text-slate-400"
                             }`}>
                             {appt.status || "pending"}
                           </span>
                         </td>
-                        <td className="py-4 px-5 text-xs text-slate-400 max-w-[180px] truncate">{appt.notes || "—"}</td>
+                        <td className="max-w-[120px] truncate px-3 py-3 text-xs text-slate-400 sm:max-w-[180px] sm:px-5 sm:py-4">{appt.notes || "—"}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ── Orders Panel ── */}
+        {activeTab === "orders" && (
+          <div className="flex h-full flex-col gap-4 p-4 sm:gap-5 sm:p-6">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <h2 className="text-lg font-bold tracking-tight text-white">🛒 Customer Orders</h2>
+                <p className="mt-0.5 text-xs text-slate-500">Placed via voice or chat — pending agent follow-up</p>
+              </div>
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await fetch(`${backendUrl}/api/orders`, {
+                      headers: { Authorization: `Bearer ${apiKey}` }
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      setOrders(data.orders || []);
+                    }
+                  } catch { }
+                }}
+                className="rounded-lg border border-sky-500/20 bg-sky-500/10 px-3 py-1.5 text-xs font-bold text-sky-400 transition-all hover:bg-sky-500/20"
+              >
+                ↻ Refresh
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto rounded-xl border border-[#1E293B]">
+              <table className="w-full min-w-[760px] text-sm text-slate-300">
+                <thead>
+                  <tr className="border-b border-[#1E293B] bg-[#0F172A] text-xs uppercase tracking-widest text-slate-500">
+                    <th className="px-3 py-3 text-left sm:px-5">Order #</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Customer</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Email</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Phone</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Product</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Total</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#1E293B]/60">
+                  {orders.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-16 text-center text-xs font-semibold text-slate-500">
+                        <div className="flex flex-col items-center gap-2 px-4">
+                          <span className="text-3xl">📦</span>
+                          <span>No orders yet. Say &quot;I&apos;ll take the professional package&quot; on a Vapi call to place one!</span>
+                        </div>
+                      </td>
+                    </tr>
+                  ) : (
+                    orders.map((order, idx) => (
+                      <tr key={idx} className="transition-all hover:bg-[#1E293B]/30">
+                        <td className="px-3 py-3 font-mono text-xs font-bold text-white sm:px-5 sm:py-4">#{order.order_id || "—"}</td>
+                        <td className="px-3 py-3 font-bold text-white sm:px-5 sm:py-4">{order.customer_name || "—"}</td>
+                        <td className="px-3 py-3 font-mono text-xs text-sky-300 sm:px-5 sm:py-4">{order.customer_email || "—"}</td>
+                        <td className="px-3 py-3 font-mono text-xs sm:px-5 sm:py-4">{order.customer_phone || "—"}</td>
+                        <td className="px-3 py-3 text-xs sm:px-5 sm:py-4">{order.product_name || "—"}</td>
+                        <td className="px-3 py-3 sm:px-5 sm:py-4">
+                          <span className="rounded border border-indigo-500/20 bg-indigo-500/10 px-2 py-0.5 text-xs font-semibold text-indigo-300">
+                            {order.total_price || "—"}
+                          </span>
+                        </td>
+                        <td className="px-3 py-3 sm:px-5 sm:py-4">
+                          <span className={`rounded border px-2 py-0.5 text-xs font-bold ${order.status === "pending"
+                              ? "border-amber-500/20 bg-amber-500/10 text-amber-400"
+                              : order.status === "completed"
+                                ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-400"
+                                : order.status === "cancelled"
+                                  ? "border-rose-500/20 bg-rose-500/10 text-rose-400"
+                                  : "border-slate-500/20 bg-slate-500/10 text-slate-400"
+                            }`}>
+                            {order.status || "pending"}
+                          </span>
+                        </td>
                       </tr>
                     ))
                   )}
