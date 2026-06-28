@@ -17,3 +17,4 @@ class AgentState(TypedDict):
     lead_profile: LeadProfile
     requires_handoff: bool
     thread_id: str
+    tenant_id: str
