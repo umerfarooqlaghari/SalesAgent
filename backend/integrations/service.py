@@ -37,7 +37,8 @@ def _disable_demo_stub_sources(integrations: Dict[str, Any]) -> None:
         return
     inv = integrations.get("inventory") or {}
     for src in inv.get("sources") or []:
-        if src.get("id") == "default_stub" or (src.get("provider") or "").lower() in ("stub", "sqlite"):
+        provider = (src.get("provider") or "").lower()
+        if provider in ("stub", "sqlite"):
             src["enabled"] = False
 
 

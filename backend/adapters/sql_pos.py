@@ -242,31 +242,165 @@ class SqlPOSAdapter:
         return _quote_ident(str(physical), self.sql.dialect)
 
     async def list_products(self, query: Optional[str] = None) -> str:
-        table = self.table_map.get("products_table", "products")
-        qt = self.sql._qualified(table)
-        name_c = self._col("products", "name")
-        price_c = self._col("products", "price")
-        stock_c = self._col("products", "stock")
-        desc_c = self._col("products", "description")
+        from backend.integrations.table_map_util import get_mapped_tables
 
+        mapped = get_mapped_tables(self.table_map, "inventory")
         generic = {"product", "products", "service", "services", "all", "list", "everything", ""}
-        if query and query.strip().lower() not in generic:
-            if self.sql.dialect == "sqlserver":
-                sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} LIKE :q"
-            elif self.sql.dialect == "mysql":
-                sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} LIKE :q"
-            else:
-                sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} ILIKE :q"
-            params = {"q": f"%{query.strip()}%"}
-        else:
-            sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt}"
-            params = None
+        q_clean = query.strip().lower() if query else ""
+        is_generic = not q_clean or q_clean in generic
 
-        rows = await self.sql.fetch_all(sql, params)
-        if not rows:
-            return "No products found in the database."
-        lines = [f"- {r[0]}: Price={r[1]}, In Stock={r[2]} ({r[3]})" for r in rows]
-        return "Product Catalog:\n" + "\n".join(lines)
+        if not mapped:
+            table = self.table_map.get("products_table", "products")
+            qt = self.sql._qualified(table)
+            name_c = self._col("products", "name")
+            price_c = self._col("products", "price")
+            stock_c = self._col("products", "stock")
+            desc_c = self._col("products", "description")
+
+            if not is_generic:
+                if self.sql.dialect == "sqlserver":
+                    sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} LIKE :q"
+                elif self.sql.dialect == "mysql":
+                    sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} LIKE :q"
+                else:
+                    sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} ILIKE :q"
+                params = {"q": f"%{query.strip()}%"}
+            else:
+                sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt}"
+                params = None
+
+            try:
+                rows = await self.sql.fetch_all(sql, params)
+            except Exception as e:
+                logger.error("Legacy list_products query failed: %s", e)
+                return f"Inventory query failed: {e}"
+
+            if not rows:
+                return "No products found in the database."
+            lines = [f"- {r[0]}: Price={r[1]}, In Stock={r[2]} ({r[3]})" for r in rows]
+            return "Product Catalog:\n" + "\n".join(lines)
+
+        results = []
+        for mapping in mapped:
+            table = mapping.get("table")
+            role = mapping.get("role")
+            label = mapping.get("label") or table
+            if not table:
+                continue
+
+            # Skip querying orders or appointments in list_products unless explicitly requested
+            if role in ("orders", "appointments") and not (q_clean and (role in q_clean or label.lower() in q_clean or table.lower() in q_clean)):
+                continue
+
+            table_matched = False
+            if not is_generic:
+                t_lower = table.lower()
+                l_lower = label.lower()
+                q_words = set(re.findall(r"\w+", q_clean))
+                t_words = set(re.findall(r"\w+", t_lower + " " + l_lower))
+                if q_words & t_words or any(qw in tw or tw in qw for qw in q_words for tw in t_words):
+                    table_matched = True
+
+                cols_map = mapping.get("columns") or {}
+                if isinstance(cols_map, list):
+                    cols_map = {c: c for c in cols_map}
+
+                # Construct query
+                qt = self.sql._qualified(table)
+                select_parts = []
+                field_names = []
+                seen = set()
+                for logical, physical in cols_map.items():
+                    p = str(physical)
+                    if p not in seen:
+                        select_parts.append(_quote_ident(p, self.sql.dialect))
+                        field_names.append(str(logical))
+                        seen.add(p)
+
+                if not select_parts:
+                    continue
+
+                search_cols = mapping.get("search_columns") or []
+                where_parts = []
+                like_op = "ILIKE" if self.sql.dialect == "postgres" else "LIKE"
+                for sc in search_cols:
+                    if sc:
+                        where_parts.append(f"{_quote_ident(str(sc), self.sql.dialect)} {like_op} :q")
+
+                if not where_parts and cols_map:
+                    name_col = cols_map.get("name") or cols_map.get("supplier_name") or cols_map.get("set_name") or list(cols_map.values())[0]
+                    where_parts.append(f"{_quote_ident(str(name_col), self.sql.dialect)} {like_op} :q")
+
+                where_sql = " OR ".join(where_parts)
+
+                if table_matched:
+                    sql = f"SELECT {', '.join(select_parts)} FROM {qt}"
+                    params = {}
+                else:
+                    if not where_sql:
+                        continue
+                    sql = f"SELECT {', '.join(select_parts)} FROM {qt} WHERE ({where_sql})"
+                    params = {"q": f"%{query.strip()}%"}
+
+                if self.sql.dialect == "sqlserver":
+                    sql = sql.replace("SELECT", "SELECT TOP 10", 1)
+                else:
+                    sql += " LIMIT 10"
+
+                try:
+                    rows = await self.sql.fetch_all(sql, params)
+                    if rows:
+                        lines = []
+                        for r in rows:
+                            pairs = ", ".join(f"{field_names[i]}={r[i]}" for i in range(min(len(r), len(field_names))))
+                            lines.append(f"  • {pairs}")
+                        results.append(f"[{label}]\n" + "\n".join(lines))
+                except Exception as e:
+                    logger.warning("Query failed for table %s: %s", table, e)
+            else:
+                # Generic list
+                if role == "products" or (not role and any(k in label.lower() or k in table.lower() for k in ("product", "catalog", "item", "supplier"))):
+                    qt = self.sql._qualified(table)
+                    cols_map = mapping.get("columns") or {}
+                    if isinstance(cols_map, list):
+                        cols_map = {c: c for c in cols_map}
+
+                    select_parts = []
+                    field_names = []
+                    seen = set()
+                    for logical, physical in cols_map.items():
+                        p = str(physical)
+                        if p not in seen:
+                            select_parts.append(_quote_ident(p, self.sql.dialect))
+                            field_names.append(str(logical))
+                            seen.add(p)
+
+                    if not select_parts:
+                        continue
+
+                    sql = f"SELECT {', '.join(select_parts)} FROM {qt}"
+                    if self.sql.dialect == "sqlserver":
+                        sql = sql.replace("SELECT", "SELECT TOP 10", 1)
+                    else:
+                        sql += " LIMIT 10"
+
+                    try:
+                        rows = await self.sql.fetch_all(sql)
+                        if rows:
+                            lines = []
+                            for r in rows:
+                                pairs = ", ".join(f"{field_names[i]}={r[i]}" for i in range(min(len(r), len(field_names))))
+                                lines.append(f"  • {pairs}")
+                            results.append(f"[{label}]\n" + "\n".join(lines))
+                    except Exception as e:
+                        logger.warning("Generic query failed for table %s: %s", table, e)
+                else:
+                    # just mention the table is available
+                    results.append(f"[{label} (Custom Table)] - Query for specific items or ask about '{label.lower()}' to search this table.")
+
+        if not results:
+            return "No matching records found across database tables."
+        return "\n\n".join(results)
 
     async def get_order_status(
         self,
