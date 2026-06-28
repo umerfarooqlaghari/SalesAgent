@@ -79,12 +79,22 @@ export default function Dashboard() {
   const apiKeyRef = useRef(apiKey);
   const backendUrlRef = useRef(backendUrl);
   const tenantIdRef = useRef("alpha_default");
+  const orgNameRef = useRef("");
 
   useEffect(() => { threadIdRef.current = threadId; }, [threadId]);
   useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
   useEffect(() => { backendUrlRef.current = backendUrl; }, [backendUrl]);
   useEffect(() => { isCallingRef.current = isCalling; }, [isCalling]);
   useEffect(() => { accessTokenRef.current = getAccessToken(); }, [authChecked]);
+
+  const orgDisplayName = tenantInfo?.org_name || sessionUser?.org_name || "Console";
+  const orgInitial = orgDisplayName.trim().charAt(0).toUpperCase() || "C";
+
+  useEffect(() => {
+    if (tenantInfo?.org_name) {
+      document.title = `${tenantInfo.org_name} — Sales Agent`;
+    }
+  }, [tenantInfo?.org_name]);
 
   useEffect(() => {
     const initAuth = async () => {
@@ -107,6 +117,7 @@ export default function Dashboard() {
       setSessionUser(me);
       setTenantInfo({ tenant_id: me.tenant_id, org_name: me.org_name || me.tenant_id });
       tenantIdRef.current = me.tenant_id;
+      orgNameRef.current = me.org_name || "";
       const savedKey = getStoredApiKey();
       if (savedKey) setApiKey(savedKey);
       setAuthChecked(true);
@@ -311,6 +322,7 @@ export default function Dashboard() {
           metadata: {
             console_thread_id: threadIdRef.current,
             tenant_id: tenantIdRef.current,
+            org_name: orgNameRef.current,
           },
         });
       } catch (err: any) {
@@ -725,10 +737,12 @@ export default function Dashboard() {
         <div className="flex items-center justify-between border-b border-[#1F293D] p-4 sm:p-6">
           <div className="flex items-center gap-3">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-tr from-sky-500 to-indigo-600 text-sm font-bold text-white shadow-md shadow-indigo-500/20">
-              A
+              {orgInitial}
             </div>
-            <div>
-              <h1 className="text-sm font-extrabold tracking-wide text-white">ALPHA</h1>
+            <div className="min-w-0">
+              <h1 className="text-sm font-extrabold tracking-wide text-white truncate max-w-[11rem] sm:max-w-none">
+                {orgDisplayName.toUpperCase()}
+              </h1>
               <span className="text-[10px] font-medium text-slate-400">B2B SDR AGENT CONSOLE</span>
             </div>
           </div>

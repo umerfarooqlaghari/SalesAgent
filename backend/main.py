@@ -128,9 +128,10 @@ async def startup_event():
     await ensure_all_indexes()
     await seed_default_tenant()
     await migrate_legacy_documents_to_default_tenant()
-    await seed_default_api_key()
-    from backend.tenant.registry import seed_default_knowledge
+    from backend.tenant.registry import migrate_stale_tenant_prompts, seed_default_knowledge
 
+    await migrate_stale_tenant_prompts()
+    await seed_default_api_key()
     await seed_default_knowledge()
     await seed_super_admin()
     try:
@@ -499,6 +500,13 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     agent_thread_id, console_thread_id, tenant_id = await resolve_voice_thread(call_data, data)
     call_id = call_data.get("id") or "vapi_default_session"
     greeting = await _voice_greeting(tenant_id)
+    logger.info(
+        "Vapi LLM request: call_id=%s tenant_id=%s thread=%s console=%s",
+        call_id,
+        tenant_id,
+        agent_thread_id,
+        console_thread_id,
+    )
 
     # Find last user message from Vapi payload
     user_content = ""

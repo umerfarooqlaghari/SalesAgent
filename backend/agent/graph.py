@@ -119,6 +119,7 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         status = lead_profile.status or "New"
         fit = str(lead_profile.fit) if lead_profile.fit is not None else "Unknown"
 
+    ctx = await get_tenant_by_id(tenant_id)
     prompt_template = await get_tenant_system_prompt(tenant_id, SYSTEM_PROMPT)
     system_prompt = prompt_template.format(
         thread_id=state.get("thread_id", "unknown"),
@@ -129,7 +130,14 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         fit=fit,
     )
 
-    ctx = await get_tenant_by_id(tenant_id)
+    if ctx and ctx.org_name and tenant_id != "alpha_default":
+        system_prompt = (
+            f"CRITICAL IDENTITY: You are the sales assistant for {ctx.org_name}. "
+            f"Your company name is {ctx.org_name}. Never say you work for Alpha or sell SaaS packages "
+            f"unless a tool explicitly returns that information.\n\n"
+            + system_prompt
+        )
+
     if ctx and ctx.settings.company_description:
         org = ctx.org_name or tenant_id
         system_prompt += f"\n\n--- ABOUT {org.upper()} ---\n{ctx.settings.company_description.strip()}"
