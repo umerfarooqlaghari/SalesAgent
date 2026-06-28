@@ -403,6 +403,27 @@ async def link_voice_call(call_id: str, console_thread_id: str) -> None:
         upsert=True,
     )
 
+async def resolve_voice_thread(call_data: Optional[Dict[str, Any]]) -> tuple[str, Optional[str]]:
+    """
+    Resolve which thread the voice agent should use.
+    Prefers explicit link, then call metadata from Vapi start(), else isolated vapi_{call_id} thread.
+    """
+    call_data = call_data or {}
+    call_id = call_data.get("id") or "vapi_default_session"
+    metadata = call_data.get("metadata") or {}
+    console_from_meta = metadata.get("console_thread_id") or metadata.get("consoleThreadId")
+
+    linked = await get_linked_console_thread(call_id)
+    if linked:
+        return linked, linked
+
+    if console_from_meta:
+        await link_voice_call(call_id, console_from_meta)
+        return console_from_meta, console_from_meta
+
+    isolated = f"vapi_{call_id}"
+    return isolated, None
+
 async def get_linked_console_thread(call_id: str) -> Optional[str]:
     db = get_db()
     doc = await db.voice_call_links.find_one({"call_id": call_id})

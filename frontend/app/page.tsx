@@ -55,8 +55,10 @@ export default function Dashboard() {
   const [voiceEnabled, setVoiceEnabled] = useState<boolean>(false);
   const voiceEnabledRef = useRef(false);
   const [isCalling, setIsCalling] = useState<boolean>(false);
+  const [activeVoiceCallId, setActiveVoiceCallId] = useState<string | null>(null);
   const vapiRef = useRef<any>(null);
   const activeVapiCallIdRef = useRef<string | null>(null);
+  const isCallingRef = useRef(false);
   const threadIdRef = useRef(threadId);
   const apiKeyRef = useRef(apiKey);
   const backendUrlRef = useRef(backendUrl);
@@ -64,6 +66,22 @@ export default function Dashboard() {
   useEffect(() => { threadIdRef.current = threadId; }, [threadId]);
   useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
   useEffect(() => { backendUrlRef.current = backendUrl; }, [backendUrl]);
+  useEffect(() => { isCallingRef.current = isCalling; }, [isCalling]);
+
+  const linkCallToThread = async (callId: string) => {
+    if (!callId || !threadIdRef.current) return;
+    activeVapiCallIdRef.current = callId;
+    setActiveVoiceCallId(callId);
+    try {
+      await fetch(`${backendUrlRef.current}/api/voice/link`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKeyRef.current}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ call_id: callId, console_thread_id: threadIdRef.current }),
+      });
+    } catch (e) {
+      console.error("Failed to link voice call to chat thread:", e);
+    }
+  };
 
   // Inputs
   const [chatInput, setChatInput] = useState<string>("");
@@ -150,24 +168,17 @@ export default function Dashboard() {
       vapiRef.current = new Vapi(vapiPublicKey);
 
       vapiRef.current.on("call-start", async (call: { id?: string }) => {
+        isCallingRef.current = true;
         setIsCalling(true);
         setStatusText("Vapi call connected!");
         const callId = call?.id;
-        activeVapiCallIdRef.current = callId || null;
-        if (callId && threadIdRef.current) {
-          try {
-            await fetch(`${backendUrlRef.current}/api/voice/link`, {
-              method: "POST",
-              headers: { Authorization: `Bearer ${apiKeyRef.current}`, "Content-Type": "application/json" },
-              body: JSON.stringify({ call_id: callId, console_thread_id: threadIdRef.current }),
-            });
-          } catch (e) {
-            console.error("Failed to link voice call to chat thread:", e);
-          }
+        if (callId) {
+          await linkCallToThread(callId);
         }
       });
 
       vapiRef.current.on("call-end", async () => {
+        isCallingRef.current = false;
         setIsCalling(false);
         setStatusText("Vapi call ended.");
         const callId = activeVapiCallIdRef.current;
@@ -181,11 +192,20 @@ export default function Dashboard() {
             console.error("Failed to unlink voice call:", e);
           }
           activeVapiCallIdRef.current = null;
+          setActiveVoiceCallId(null);
+        }
+      });
+
+      vapiRef.current.on("message", (message: { type?: string; call?: { id?: string } }) => {
+        const callId = message?.call?.id;
+        if (callId && !activeVapiCallIdRef.current) {
+          linkCallToThread(callId);
         }
       });
 
       vapiRef.current.on("error", (e: any) => {
         console.error("Vapi call error:", e);
+        isCallingRef.current = false;
         setIsCalling(false);
         setStatusText("Vapi error: " + (e.message || "Failed"));
       });
@@ -205,7 +225,11 @@ export default function Dashboard() {
       setStatusText("Connecting Vapi Call...");
       try {
         const assistantId = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID || "a5b5e387-3e26-4ad0-ad0f-8454b675f1c9";
-        vapiRef.current.start(assistantId);
+        vapiRef.current.start(assistantId, {
+          metadata: {
+            console_thread_id: threadIdRef.current,
+          },
+        });
       } catch (err: any) {
         console.error("Failed to start Vapi call:", err);
         setStatusText("Vapi Error: " + err.message);
@@ -463,9 +487,10 @@ export default function Dashboard() {
     if (!chatInput.trim()) return;
 
     const userMsg = chatInput.trim();
+    const duringCall = isCallingRef.current || !!activeVapiCallIdRef.current;
 
-    // During voice call: save typed detail for the voice agent — do not run chat agent
-    if (isCalling) {
+    // During voice call: save typed detail and inject into Vapi — do not run chat WebSocket agent
+    if (duringCall) {
       setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
       setChatInput("");
       try {
@@ -474,7 +499,16 @@ export default function Dashboard() {
           headers: getHeaders(),
           body: JSON.stringify({ message: userMsg }),
         });
-        setStatusText("Typed detail saved — the voice agent will use it on the next turn.");
+
+        // Push typed text into the live Vapi conversation so the voice agent responds immediately
+        if (vapiRef.current?.send) {
+          vapiRef.current.send({
+            type: "add-message",
+            message: { role: "user", content: userMsg },
+          });
+        }
+
+        setStatusText("Sent to voice agent — it should confirm what you typed shortly.");
       } catch (e) {
         console.error("Failed to save typed message:", e);
         setStatusText("Could not save typed message.");
@@ -567,6 +601,8 @@ export default function Dashboard() {
       </span>
     );
   };
+
+  const voiceActive = isCalling || !!activeVoiceCallId;
 
   return (
     <div className="flex h-[100dvh] overflow-hidden bg-[#0A0E1A] text-[#E2E8F0]">
@@ -1001,9 +1037,9 @@ export default function Dashboard() {
 
               {/* Chat Input block */}
               <div className="border-t border-[#1F293D] bg-[#111726]/40 p-3 backdrop-blur-md sm:p-4">
-                {isCalling && (
+                {(isCalling || activeVoiceCallId) && (
                   <div className="mb-3 rounded-lg border border-sky-500/20 bg-sky-500/10 px-3 py-2 text-xs text-sky-300">
-                    📞 <strong>Call active.</strong> When the agent asks for your name, email, or phone, type it here for accuracy. Spoken dictation may mishear numbers and letters (e.g. &quot;one&quot; vs &quot;1&quot;).
+                    📞 <strong>Call active.</strong> Type name, email, or phone here when asked — the voice agent will pick it up and read it back to confirm. Spoken dictation may mishear &quot;1&quot; vs &quot;one&quot;, etc.
                   </div>
                 )}
                 {activeLead?.status === "Handoff Requested" || activeLead?.status === "Human Claimed" ? (
@@ -1026,7 +1062,7 @@ export default function Dashboard() {
                       onChange={(e) => setChatInput(e.target.value)}
                       onKeyDown={(e) => e.key === "Enter" && handleSendMessage()}
                       placeholder={
-                        isCalling
+                        voiceActive
                           ? "Type name, email, or phone here when the agent asks..."
                           : "Type a message as a lead..."
                       }
@@ -1034,7 +1070,7 @@ export default function Dashboard() {
                     />
                     <button
                       onClick={handleSendMessage}
-                      disabled={!chatInput.trim() || (!isCalling && !connected)}
+                      disabled={!chatInput.trim() || (!voiceActive && !connected)}
                       className="flex shrink-0 items-center gap-1.5 rounded-lg bg-gradient-to-r from-sky-500 to-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-indigo-600/10 transition-all hover:from-sky-400 hover:to-indigo-500 disabled:pointer-events-none disabled:opacity-40 sm:px-5"
                     >
                       <span className="hidden sm:inline">Send</span>

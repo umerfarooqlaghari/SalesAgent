@@ -40,6 +40,7 @@ from backend.database import (
     get_linked_console_thread,
     unlink_voice_call,
     get_recent_typed_chat_messages,
+    resolve_voice_thread,
 )
 from backend.agent.graph import get_agent_graph
 
@@ -424,22 +425,12 @@ def _extract_assistant_text(messages_out: list) -> str:
 async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     messages_list = data.get("messages", [])
     wants_stream = data.get("stream", False)
+    call_data = data.get("call", {}) or {}
 
-    if not messages_list:
-        fallback = {
-            "choices": [{"message": {"role": "assistant", "content": "Hello! Welcome to Alpha. How can I assist you today?"}}]
-        }
-        if wants_stream:
-            async def fallback_gen():
-                chunk = {"choices": [{"delta": {"role": "assistant", "content": "Hello! Welcome to Alpha. How can I assist you today?"}, "finish_reason": None}]}
-                yield f"data: {json.dumps(chunk)}\n\n"
-                done = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
-                yield f"data: {json.dumps(done)}\n\n"
-                yield "data: [DONE]\n\n"
-            return StreamingResponse(fallback_gen(), media_type="text/event-stream")
-        return fallback
+    agent_thread_id, console_thread_id = await resolve_voice_thread(call_data)
+    call_id = call_data.get("id") or "vapi_default_session"
 
-    # Find last user message
+    # Find last user message from Vapi payload
     user_content = ""
     for msg in reversed(messages_list):
         if msg.get("role") == "user":
@@ -450,19 +441,71 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
                 user_content = str(raw)
             break
 
-    call_id = data.get("call", {}).get("id") or "vapi_default_session"
-    linked_thread = await get_linked_console_thread(call_id)
-    agent_thread_id = linked_thread or f"vapi_{call_id}"
-
-    # Merge typed chat context when console is linked to this call
+    # Pull typed chat context when console is linked to this call
     typed_context = ""
-    if linked_thread:
+    since_iso = None
+    if console_thread_id:
         db = get_db()
         link_doc = await db.voice_call_links.find_one({"call_id": call_id})
         since_iso = link_doc.get("linked_at") if link_doc else None
-        typed_context = await _get_typed_chat_context(linked_thread, since_iso=since_iso)
+        typed_context = await _get_typed_chat_context(console_thread_id, since_iso=since_iso)
 
-    enriched_user_content = user_content + typed_context
+    # If Vapi sent no user speech but caller typed in chat, use typed content instead of resetting
+    if not user_content.strip() and typed_context:
+        user_content = typed_context.replace(
+            "\n\n[TYPED CHAT MESSAGES — prefer these for name/email/phone over spoken dictation]:\n", ""
+        ).strip()
+        typed_context = ""  # already merged into user_content
+
+    # Avoid generic greeting when we have typed input or an ongoing linked conversation
+    if not messages_list and not user_content.strip():
+        if console_thread_id and typed_context:
+            user_content = typed_context.replace(
+                "\n\n[TYPED CHAT MESSAGES — prefer these for name/email/phone over spoken dictation]:\n", ""
+            ).strip()
+            typed_context = ""
+        elif not console_thread_id:
+            fallback = {
+                "choices": [{"message": {"role": "assistant", "content": "Hello! Welcome to Alpha. How can I assist you today?"}}]
+            }
+            if wants_stream:
+                async def fallback_gen():
+                    chunk = {"choices": [{"delta": {"role": "assistant", "content": "Hello! Welcome to Alpha. How can I assist you today?"}, "finish_reason": None}]}
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    done = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+                    yield f"data: {json.dumps(done)}\n\n"
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(fallback_gen(), media_type="text/event-stream")
+            return fallback
+
+    if not user_content.strip():
+        # Linked call with no speech yet — ask caller to type or speak rather than resetting
+        assistant_msg = (
+            "I'm still here with you. You can type your details in the chat box, "
+            "or say them out loud and I'll read them back to confirm."
+        )
+        await save_conversation_message(agent_thread_id, "assistant", assistant_msg, source="voice")
+
+        async def gentle_prompt_stream() -> AsyncIterator[str]:
+            chunk = {
+                "id": f"chatcmpl-{agent_thread_id}",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": assistant_msg}, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            done_chunk = {
+                "id": f"chatcmpl-{agent_thread_id}",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }
+            yield f"data: {json.dumps(done_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(gentle_prompt_stream(), media_type="text/event-stream")
+
+    enriched_user_content = user_content
+    if typed_context and typed_context not in user_content:
+        enriched_user_content = user_content + typed_context
 
     await save_conversation_message(agent_thread_id, "user", user_content, source="voice")
 
