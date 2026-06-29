@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="128" fill="#09090B"/>
+  <!-- Caret 'A' shape -->
+  <path d="M256 50 L80 430" stroke="#FFFFFF" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M256 50 L380 340" stroke="#FFFFFF" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Greek Alpha 'α' loops & tails -->
+  <path d="M230 320 C180 320 180 230 230 230 C280 230 280 320 230 320 Z" stroke="#FFFFFF" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M200 190 C280 240 330 280 430 420" stroke="#FFFFFF" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M200 425 C280 340 330 245 425 210" stroke="#FFFFFF" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
