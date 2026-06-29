@@ -1003,7 +1003,7 @@ export default function Dashboard() {
           </div>
 
           {activeTab !== "admin" && (
-          <div className="hidden sm:flex shrink-0 items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2 max-sm:justify-end">
             <button
               type="button"
               onClick={handleToggleVapiCall}

@@ -130,7 +130,9 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
   const [tenantId, setTenantId] = useState("");
   const [orgName, setOrgName] = useState("");
   const [companyDescription, setCompanyDescription] = useState("");
+  const [initialCompanyDescription, setInitialCompanyDescription] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
+  const [initialSystemPrompt, setInitialSystemPrompt] = useState("");
   const [resettingPrompt, setResettingPrompt] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [status, setStatus] = useState("");
@@ -186,8 +188,12 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
         setTenantId(data.tenant_id || "");
         setOrgName(data.org_name || "");
         setIntegrations(data.integrations);
-        setCompanyDescription(data.settings?.company_description || "");
-        setSystemPrompt(data.settings?.system_prompt || "");
+        const desc = data.settings?.company_description || "";
+        const prompt = data.settings?.system_prompt || "";
+        setCompanyDescription(desc);
+        setInitialCompanyDescription(desc);
+        setSystemPrompt(prompt);
+        setInitialSystemPrompt(prompt);
       }
     } catch (e) {
       console.error(e);
@@ -237,8 +243,12 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Save failed");
-      setCompanyDescription(data.settings?.company_description || "");
-      setSystemPrompt(data.settings?.system_prompt || "");
+      const desc = data.settings?.company_description || "";
+      const prompt = data.settings?.system_prompt || "";
+      setCompanyDescription(desc);
+      setInitialCompanyDescription(desc);
+      setSystemPrompt(prompt);
+      setInitialSystemPrompt(prompt);
       setMessage("Agent settings saved.", true);
     } catch (e: unknown) {
       setMessage(e instanceof Error ? e.message : "Save failed", false);
@@ -257,7 +267,9 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Reset failed");
-      setSystemPrompt(data.settings?.system_prompt || "");
+      const prompt = data.settings?.system_prompt || "";
+      setSystemPrompt(prompt);
+      setInitialSystemPrompt(prompt);
       setMessage("Agent prompt reset for your company.", true);
     } catch (e: unknown) {
       setMessage(e instanceof Error ? e.message : "Reset failed", false);
@@ -462,11 +474,15 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
             <div className="flex flex-wrap gap-3">
               <button
                 type="button"
-                disabled={savingSettings}
+                disabled={savingSettings || (companyDescription === initialCompanyDescription && systemPrompt === initialSystemPrompt)}
                 onClick={saveAgentSettings}
                 className={ui.btnPrimary}
               >
-                {savingSettings ? "Saving…" : "Save agent settings"}
+                {savingSettings
+                  ? "Saving…"
+                  : (!initialCompanyDescription && !initialSystemPrompt)
+                  ? "Save settings"
+                  : "Update settings"}
               </button>
               <button
                 type="button"

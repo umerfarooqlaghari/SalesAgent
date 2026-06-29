@@ -190,8 +190,8 @@ async def query_pos_database(
     config: RunnableConfig = None,
 ) -> str:
     """
-    Query the tenant's configured inventory/POS sources (Shopify, SQL, demo catalog, etc.).
-    Use this to check product pricing/stock or check order status for a customer.
+    Query the tenant's configured inventory/POS/custom database sources (Shopify, SQL, productions, sets, supplier catalogue, etc.).
+    Use this to check product pricing/stock, check order status for a customer, list productions/sets, or search custom database tables.
     
     To check order status, you MUST provide the order_id along with either customer_email or customer_phone to authenticate ownership and secure private data.
     """

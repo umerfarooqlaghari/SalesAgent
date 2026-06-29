@@ -400,6 +400,15 @@ async def websocket_endpoint(
 async def get_vapi_public_key(tenant: TenantContext = Depends(get_tenant_or_api_key)):
     return {"public_key": settings.VAPI_PUBLIC_KEY, "tenant_id": tenant.tenant_id}
 
+@app.get("/api/widget/config")
+async def get_widget_config(tenant: TenantContext = Depends(get_tenant_or_api_key)):
+    """Returns Vapi keys and tenant scoping info for the client-side wobbly widget."""
+    return {
+        "vapi_public_key": settings.VAPI_PUBLIC_KEY,
+        "vapi_assistant_id": settings.VAPI_ASSISTANT_ID,
+        "tenant_id": tenant.tenant_id
+    }
+
 @app.get("/api/appointments")
 async def get_appointments(tenant: TenantContext = Depends(get_tenant_or_api_key)):
     """Returns all scheduled appointments from MongoDB."""
