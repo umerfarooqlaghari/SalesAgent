@@ -33,6 +33,15 @@ def _merge_inventory(incoming: Dict[str, Any], default: Dict[str, Any]) -> Dict[
     return merged
 
 
+def _unwrap_nested_config(config: Any) -> Dict[str, Any]:
+    if not isinstance(config, dict):
+        return {}
+    curr = config
+    while isinstance(curr, dict) and list(curr.keys()) == ["config"]:
+        curr = curr["config"]
+    return curr if isinstance(curr, dict) else {}
+
+
 def normalize_integrations(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     raw = deepcopy(raw or {})
     result = deepcopy(DEFAULT_INTEGRATIONS)
@@ -56,19 +65,29 @@ def normalize_integrations(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if raw.get("crm"):
         crm = raw["crm"]
         if isinstance(crm, dict):
+            cfg = crm.get("config")
+            if isinstance(cfg, dict):
+                cfg = _unwrap_nested_config(cfg)
+            else:
+                cfg = {k: v for k, v in crm.items() if k not in ("provider", "enabled", "config")}
             result["crm"] = {
                 "enabled": crm.get("enabled", True),
                 "provider": crm.get("provider", "internal"),
-                "config": {k: v for k, v in crm.items() if k not in ("provider", "enabled")},
+                "config": cfg,
             }
 
     if raw.get("calendar"):
         cal = raw["calendar"]
         if isinstance(cal, dict):
+            cfg = cal.get("config")
+            if isinstance(cfg, dict):
+                cfg = _unwrap_nested_config(cfg)
+            else:
+                cfg = {k: v for k, v in cal.items() if k not in ("provider", "enabled", "config")}
             result["calendar"] = {
                 "enabled": cal.get("enabled", True),
                 "provider": cal.get("provider", "internal"),
-                "config": {k: v for k, v in cal.items() if k not in ("provider", "enabled")},
+                "config": cfg,
             }
 
     return result
