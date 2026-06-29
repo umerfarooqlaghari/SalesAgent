@@ -35,6 +35,22 @@ def _table_map(config: Dict[str, Any]) -> Dict[str, Any]:
     return tm
 
 
+_ENGINES = {}
+_ENGINES_LOCK = asyncio.Lock()
+
+async def get_engine(connection_url: str):
+    async with _ENGINES_LOCK:
+        if connection_url not in _ENGINES:
+            from sqlalchemy.ext.asyncio import create_async_engine
+            _ENGINES[connection_url] = create_async_engine(
+                connection_url,
+                pool_pre_ping=True,
+                pool_size=5,
+                max_overflow=10,
+                pool_recycle=1800
+            )
+        return _ENGINES[connection_url]
+
 class SqlConnection:
     """Async SQL access for Postgres, SQL Server, and MySQL."""
 
@@ -68,19 +84,14 @@ class SqlConnection:
         raise ValueError(f"Unsupported SQL provider: {self.provider}")
 
     async def _engine(self):
-        from sqlalchemy.ext.asyncio import create_async_engine
-
-        return create_async_engine(self._connection_url(), pool_pre_ping=True, pool_size=2, max_overflow=0)
+        return await get_engine(self._connection_url())
 
     async def test(self) -> None:
         from sqlalchemy import text
 
         engine = await self._engine()
-        try:
-            async with engine.connect() as conn:
-                await conn.execute(text("SELECT 1"))
-        finally:
-            await engine.dispose()
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
 
     async def list_tables_with_columns(self) -> List[Dict[str, Any]]:
         """Introspect schema for admin UI table picker."""
@@ -188,7 +199,7 @@ class SqlConnection:
                 else:
                     raise ValueError(f"Schema discovery not supported for {self.dialect}")
         finally:
-            await engine.dispose()
+            pass
         return tables
 
     def _qualified(self, table: str) -> str:
@@ -206,12 +217,9 @@ class SqlConnection:
             raise PermissionError("Integration is read-only — SELECT only.")
 
         engine = await self._engine()
-        try:
-            async with engine.connect() as conn:
-                result = await conn.execute(text(sql), params or {})
-                return list(result.fetchall())
-        finally:
-            await engine.dispose()
+        async with engine.connect() as conn:
+            result = await conn.execute(text(sql), params or {})
+            return list(result.fetchall())
 
     async def execute_write(self, sql: str, params: Optional[Dict[str, Any]] = None) -> None:
         if self.read_only:
@@ -219,11 +227,8 @@ class SqlConnection:
         from sqlalchemy import text
 
         engine = await self._engine()
-        try:
-            async with engine.begin() as conn:
-                await conn.execute(text(sql), params or {})
-        finally:
-            await engine.dispose()
+        async with engine.begin() as conn:
+            await conn.execute(text(sql), params or {})
 
 
 class SqlPOSAdapter:

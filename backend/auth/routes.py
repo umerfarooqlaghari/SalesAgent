@@ -79,3 +79,79 @@ async def regenerate_key(user: UserSession = Depends(get_current_user)):
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+@router.post("/forgot-password")
+async def forgot_password(payload: Dict[str, Any] = Body(...)):
+    """Request a password reset link. Sends via AWS SES email."""
+    import secrets
+    import hashlib
+    from datetime import datetime, timezone, timedelta
+    from backend.database import get_db
+    from backend.auth.email import send_reset_password_email
+    
+    email = (payload.get("email") or "").lower().strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+        
+    db = get_db()
+    user = await db.users.find_one({"email": email, "status": "active"})
+    if not user:
+        # Prevent email enumeration: always return success message
+        return {"message": "If this email is registered, a password reset link has been sent."}
+        
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+    
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {
+            "reset_token_hash": token_hash,
+            "reset_token_exp": expiry.isoformat()
+        }}
+    )
+    
+    await send_reset_password_email(email, token)
+    return {"message": "If this email is registered, a password reset link has been sent."}
+
+@router.post("/reset-password")
+async def reset_password(payload: Dict[str, Any] = Body(...)):
+    """Verify reset token and update password."""
+    import hashlib
+    from datetime import datetime, timezone
+    from backend.database import get_db
+    from backend.auth.security import hash_password
+    
+    token = (payload.get("token") or "").strip()
+    password = payload.get("password") or ""
+    
+    if not token or not password:
+        raise HTTPException(status_code=400, detail="token and password are required")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+        
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    db = get_db()
+    user = await db.users.find_one({"reset_token_hash": token_hash, "status": "active"})
+    
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+        
+    exp_str = user.get("reset_token_exp")
+    if not exp_str:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+        
+    exp_time = datetime.fromisoformat(exp_str)
+    if exp_time < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+        
+    # Valid token, update password and clear token
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {
+            "$set": {"password_hash": hash_password(password)},
+            "$unset": {"reset_token_hash": "", "reset_token_exp": ""}
+        }
+    )
+    
+    return {"message": "Password reset successfully. You can now log in with your new password."}

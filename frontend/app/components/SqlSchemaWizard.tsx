@@ -510,10 +510,13 @@ export default function SqlSchemaWizard({
 
       {!hasScan ? (
         <div className={`${ui.card} p-5`}>
-          <h4 className="text-base font-semibold text-gray-900">Scan your database</h4>
+          <h4 className="text-base font-semibold text-gray-900">
+            {mappedTables.length > 0 ? "Database mapped" : "Scan your database"}
+          </h4>
           <p className={`${ui.hint} mt-1 max-w-xl`}>
-            Enter connection details above, then scan. We&apos;ll list every table and column so you can choose what
-            the agent can access.
+            {mappedTables.length > 0
+              ? "You have already mapped tables from this database. Scan again to refresh the tables and columns list."
+              : "Enter connection details above, then scan. We'll list every table and column so you can choose what the agent can access."}
           </p>
           <button type="button" disabled={scanning} onClick={scanDatabase} className={`${ui.btnPrimary} mt-4`}>
             {scanning ? (
@@ -522,7 +525,7 @@ export default function SqlSchemaWizard({
                 Scanning…
               </>
             ) : (
-              "Connect & scan database"
+              mappedTables.length > 0 ? "Scan again" : "Connect & scan database"
             )}
           </button>
         </div>
