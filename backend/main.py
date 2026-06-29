@@ -57,6 +57,8 @@ from backend.auth.routes import router as auth_router
 from backend.superadmin.routes import router as superadmin_router
 from backend.tenant.registry import get_tenant_by_id
 
+from backend.billing.routes import router as billing_router
+
 active_connections: Dict[str, WebSocket] = {}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("backend.main")
@@ -65,6 +67,7 @@ app = FastAPI(title="B2B Sales SDR Agent API")
 app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(superadmin_router)
+app.include_router(billing_router)
 
 # Configure CORS
 app.add_middleware(
@@ -403,6 +406,14 @@ async def get_vapi_public_key(tenant: TenantContext = Depends(get_tenant_or_api_
 @app.get("/api/widget/config")
 async def get_widget_config(tenant: TenantContext = Depends(get_tenant_or_api_key)):
     """Returns Vapi keys and tenant scoping info for the client-side wobbly widget."""
+    db = get_db()
+    tenant_doc = await db.tenants.find_one({"tenant_id": tenant.tenant_id})
+    if tenant_doc:
+        used = tenant_doc.get("used_minutes", 0.0)
+        allowed = tenant_doc.get("allowed_minutes", 30)
+        if used >= allowed:
+            raise HTTPException(status_code=403, detail="SaaS billing limits exceeded. Please upgrade your plan.")
+
     return {
         "vapi_public_key": settings.VAPI_PUBLIC_KEY,
         "vapi_assistant_id": settings.VAPI_ASSISTANT_ID,
@@ -507,6 +518,27 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     call_data = data.get("call", {}) or {}
 
     agent_thread_id, console_thread_id, tenant_id = await resolve_voice_thread(call_data, data)
+    
+    # Check if tenant has exceeded billing minutes limit
+    db = get_db()
+    tenant_doc = await db.tenants.find_one({"tenant_id": tenant_id})
+    if tenant_doc:
+        used = tenant_doc.get("used_minutes", 0.0)
+        allowed = tenant_doc.get("allowed_minutes", 30)
+        if used >= allowed:
+            blocked_msg = "We're sorry, this assistant has exceeded its usage limits. Please upgrade the account on your dashboard."
+            fallback = {
+                "choices": [{"message": {"role": "assistant", "content": blocked_msg}}]
+            }
+            if wants_stream:
+                async def blocked_gen():
+                    chunk = {"choices": [{"delta": {"role": "assistant", "content": blocked_msg}, "finish_reason": None}]}
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    done = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+                    yield f"data: {json.dumps(done)}\n\n"
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(blocked_gen(), media_type="text/event-stream")
+            return fallback
     call_id = call_data.get("id") or "vapi_default_session"
     greeting = await _voice_greeting(tenant_id)
     logger.info(
@@ -653,4 +685,33 @@ async def vapi_webhook(data: Dict[str, Any] = Body(...)):
     message = data.get("message", {})
     msg_type = message.get("type")
     logger.info(f"Received Vapi webhook event: {msg_type}")
+    
+    if msg_type == "end-of-call-report":
+        call = message.get("call", {})
+        call_id = call.get("id")
+        duration = call.get("duration")  # In seconds
+        
+        if call_id and duration is not None:
+            db = get_db()
+            # Resolve tenant ID from call link or call sessions
+            tenant_id = None
+            link_doc = await db.voice_call_links.find_one({"call_id": call_id})
+            if link_doc:
+                tenant_id = link_doc.get("tenant_id")
+            else:
+                session = await db.voice_call_sessions.find_one({"call_id": call_id})
+                if session:
+                    tenant_id = session.get("tenant_id")
+                    
+            if tenant_id:
+                minutes_used = duration / 60.0
+                await db.tenants.update_one(
+                    {"tenant_id": tenant_id},
+                    {"$inc": {"used_minutes": minutes_used}}
+                )
+                logger.info(
+                    "Vapi call %s ended. Duration: %d seconds. Incremented tenant %s used_minutes by %.2f",
+                    call_id, duration, tenant_id, minutes_used
+                )
+                
     return {"status": "success", "event": msg_type}

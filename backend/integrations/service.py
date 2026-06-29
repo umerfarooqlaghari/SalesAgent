@@ -176,6 +176,10 @@ class IntegrationService:
             "tenant_id": tenant_id,
             "org_name": ctx.org_name,
             "integrations": integrations,
+            "tier": (doc or {}).get("tier", "free"),
+            "used_minutes": (doc or {}).get("used_minutes", 0.0),
+            "allowed_minutes": (doc or {}).get("allowed_minutes", 30),
+            "status": (doc or {}).get("status", "active"),
             "settings": {
                 "system_prompt": ctx.settings.system_prompt,
                 "company_description": ctx.settings.company_description,
