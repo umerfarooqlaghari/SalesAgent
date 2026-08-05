@@ -24,6 +24,15 @@ def generate_api_key(prefix: str = "sk_live") -> str:
     return f"{prefix}_{secrets.token_urlsafe(32)}"
 
 
+def generate_publishable_key() -> str:
+    """Website-safe key (pk_live_) — scoped to embed/query only."""
+    return generate_api_key("pk_live")
+
+
+def is_publishable_key(api_key: str) -> bool:
+    return bool(api_key) and api_key.startswith("pk_")
+
+
 def create_access_token(payload: Dict[str, Any], expires_hours: int = 72) -> str:
     secret = settings.JWT_SECRET
     data = {

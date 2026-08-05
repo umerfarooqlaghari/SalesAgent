@@ -1,4 +1,7 @@
 import os
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import dns.resolver
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -32,6 +35,9 @@ class Settings(BaseSettings):
     JWT_SECRET: str = "change-me-in-production-use-long-random-string"
     SUPER_ADMIN_EMAIL: str = "admin@alpha.dev"
     SUPER_ADMIN_PASSWORD: str = "Admin123!change"
+    ADAPTER_HUB_URL: str = "http://127.0.0.1:8001"
+    ADAPTER_HUB_MASTER_KEY: str = "adapter-hub-super-secret-key"
+    ADAPTER_HUB_ENABLED: bool = True
 
     model_config = SettingsConfigDict(
         env_file=os.path.join(os.path.dirname(__file__), ".env"),
@@ -40,3 +46,29 @@ class Settings(BaseSettings):
     )
 
 settings = Settings()
+
+
+def get_mongodb_connection_uri() -> str:
+    """Return a MongoDB URI that avoids Atlas TXT lookups on unreliable DNS."""
+    parsed_uri = urlsplit(settings.MONGODB_URI)
+    if parsed_uri.scheme != "mongodb+srv":
+        return settings.MONGODB_URI
+
+    if not parsed_uri.hostname:
+        return settings.MONGODB_URI
+
+    records = dns.resolver.resolve(
+        f"_mongodb._tcp.{parsed_uri.hostname}", "SRV", lifetime=10
+    )
+    hosts = ",".join(
+        f"{str(record.target).rstrip('.')}:{record.port}" for record in records
+    )
+    user_info, separator, _ = parsed_uri.netloc.rpartition("@")
+    netloc = f"{user_info}@{hosts}" if separator else hosts
+    query = dict(parse_qsl(parsed_uri.query, keep_blank_values=True))
+    if "tls" not in query and "ssl" not in query:
+        query["tls"] = "true"
+
+    return urlunsplit(
+        ("mongodb", netloc, parsed_uri.path, urlencode(query), "")
+    )

@@ -303,7 +303,84 @@ class IntegrationService:
                 }
             },
         )
-        return await IntegrationService.get_admin_view(tenant_id)
+
+        hub_sync = await IntegrationService.sync_to_adapter_hub(tenant_id, existing)
+        view = await IntegrationService.get_admin_view(tenant_id)
+        if hub_sync:
+            view["adapter_hub_sync"] = hub_sync
+        return view
+
+    @staticmethod
+    async def sync_to_adapter_hub(
+        tenant_id: str,
+        integrations: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Push inventory + CRM SQL mappings into adapter-hub and sync rows for RAG."""
+        from backend.integrations.adapter_hub_client import sync_tenant_inventory
+        from backend.integrations.table_map_util import get_mapped_tables, parse_table_map_raw
+
+        if integrations is None:
+            try:
+                integrations = await IntegrationService.get_tenant_integrations(tenant_id)
+            except ValueError:
+                return {"ok": False, "error": "Tenant not found"}
+
+        # Prefer one Postgres connection; merge all mapped tables so CRM doesn't wipe inventory
+        provider_id: Optional[str] = None
+        resolved: Dict[str, Any] = {}
+        all_mapped: List[Dict[str, Any]] = []
+
+        inv = integrations.get("inventory") or {}
+        for src in inv.get("sources") or []:
+            if not src.get("enabled", True):
+                continue
+            pid = (src.get("provider") or "").lower()
+            if pid not in SQL_PROVIDERS:
+                continue
+            resolved = IntegrationService.resolve_secrets(
+                "inventory", pid, src.get("config") or {}
+            )
+            provider_id = pid
+            tm = parse_table_map_raw(resolved)
+            all_mapped.extend(get_mapped_tables(tm, "inventory"))
+
+        crm = integrations.get("crm") or {}
+        crm_provider = (crm.get("provider") or "").lower()
+        if crm.get("enabled", True) and crm_provider in SQL_PROVIDERS:
+            crm_resolved = IntegrationService.resolve_secrets(
+                "crm", crm_provider, crm.get("config") or {}
+            )
+            if not provider_id:
+                provider_id = crm_provider
+                resolved = crm_resolved
+            tm = parse_table_map_raw(crm_resolved)
+            all_mapped.extend(get_mapped_tables(tm, "crm"))
+
+        if not provider_id or not all_mapped:
+            return {"ok": False, "skipped": True, "error": "No SQL inventory/CRM sources to sync"}
+
+        # Dedupe by table name
+        seen = set()
+        unique_mapped = []
+        for mt in all_mapped:
+            key = mt.get("table")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique_mapped.append(mt)
+
+        try:
+            res = await sync_tenant_inventory(tenant_id, provider_id, resolved, unique_mapped)
+            return {
+                "ok": bool(res.get("ok")),
+                "synchronized_count": int(res.get("synchronized_count") or 0),
+                "results": [res],
+                "error": res.get("error"),
+                "skipped": res.get("skipped"),
+            }
+        except Exception as e:
+            logger.warning("Adapter-hub sync failed for %s: %s", tenant_id, e)
+            return {"ok": False, "error": str(e)}
 
     @staticmethod
     async def test_connection(

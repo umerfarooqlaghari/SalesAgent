@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 
 from backend.config import settings
 from backend.tenant.context import TenantContext
-from backend.auth.dependencies import get_tenant_or_api_key
+from backend.auth.dependencies import require_secret_tenant as get_tenant_or_api_key
 from backend.database import get_db
 
 logger = logging.getLogger(__name__)

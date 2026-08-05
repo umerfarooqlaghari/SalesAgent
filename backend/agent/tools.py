@@ -190,10 +190,10 @@ async def query_pos_database(
     config: RunnableConfig = None,
 ) -> str:
     """
-    Query the tenant's configured inventory/POS/custom database sources (Shopify, SQL, productions, sets, supplier catalogue, etc.).
-    Use this to check product pricing/stock, check order status for a customer, list productions/sets, or search custom database tables.
-    
-    To check order status, you MUST provide the order_id along with either customer_email or customer_phone to authenticate ownership and secure private data.
+    Query tenant inventory/SQL sources: products, productions, production sets, scenery,
+    projects, POs/purchase orders, capabilities, and experience — not only SKUs.
+    Pass product_query like "production sets", "productions", or a project/client name.
+    For order status, provide order_id plus customer_email or customer_phone.
     """
     tenant = await _load_tenant_context(config or {})
     pos = AdapterFactory.pos(tenant)

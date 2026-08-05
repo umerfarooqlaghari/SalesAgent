@@ -5,7 +5,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from backend.integrations.providers import build_schemas_response
 from backend.integrations.service import IntegrationService
 from backend.tenant.context import TenantContext
-from backend.auth.dependencies import get_tenant_or_api_key
+from backend.auth.dependencies import require_secret_tenant as get_tenant_or_api_key
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -58,6 +58,30 @@ async def reset_agent_prompt(tenant: TenantContext = Depends(get_tenant_or_api_k
         return await IntegrationService.reset_agent_prompt(tenant.tenant_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@router.post("/integrations/sync-knowledge")
+async def sync_integration_knowledge(tenant: TenantContext = Depends(get_tenant_or_api_key)):
+    """
+    Push mapped SQL tables into Adapter-Hub and sync rows for RAG.
+    Run after saving Production / Sets / PO table mappings.
+    """
+    result = await IntegrationService.sync_to_adapter_hub(tenant.tenant_id)
+    if result.get("skipped"):
+        return {
+            "ok": False,
+            "message": result.get("error")
+            or "Adapter-Hub is not running. Start it on port 8001, or rely on live SQL queries.",
+            **result,
+        }
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "Sync failed")
+    count = result.get("synchronized_count") or 0
+    return {
+        "ok": True,
+        "message": f"Synced {count} record(s) into agent knowledge.",
+        **result,
+    }
 
 
 @router.post("/integrations/test")

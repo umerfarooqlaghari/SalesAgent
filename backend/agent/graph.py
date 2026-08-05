@@ -104,11 +104,40 @@ async def router_node(state: AgentState) -> Dict[str, Any]:
     return {"intent": intent, "lead_profile": lead_profile}
 
 
+_VOICE_FAST_TOOLS = [
+    handoff_to_human,
+    book_appointment,
+    place_order,
+    get_typed_chat_details,
+    lookup_appointments,
+    cancel_appointment,
+    reschedule_appointment,
+    cancel_order,
+]
+
+_ACTION_KEYWORDS = (
+    "book", "appointment", "schedule", "order", "buy", "purchase", "cancel",
+    "reschedule", "handoff", "human", "representative", "email", "phone",
+)
+
+
+def _needs_tools(user_text: str, has_catalog_cache: bool) -> bool:
+    text = (user_text or "").lower()
+    if any(k in text for k in _ACTION_KEYWORDS):
+        return True
+    if has_catalog_cache:
+        # Cache can answer identity / catalog / experience — skip tool round-trip
+        return False
+    return True
+
+
 async def sdr_node(state: AgentState) -> Dict[str, Any]:
     messages = state.get("messages", [])
     lead_profile = state.get("lead_profile")
     tenant_id = _tenant_id_from_state(state)
     user_text = _last_user_text(messages)
+    thread_id = state.get("thread_id", "unknown")
+    is_voice = str(thread_id).startswith("vapi_") or state.get("channel") == "voice"
 
     company = job_title = status = fit = "Unknown"
     intent_score = 0
@@ -122,7 +151,7 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
     ctx = await get_tenant_by_id(tenant_id)
     prompt_template = await get_tenant_system_prompt(tenant_id, SYSTEM_PROMPT)
     system_prompt = prompt_template.format(
-        thread_id=state.get("thread_id", "unknown"),
+        thread_id=thread_id,
         company=company,
         job_title=job_title,
         intent_score=intent_score,
@@ -142,24 +171,48 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         org = ctx.org_name or tenant_id
         system_prompt += f"\n\n--- ABOUT {org.upper()} ---\n{ctx.settings.company_description.strip()}"
 
-    rag_snippets = await retrieve_context(tenant_id, user_text)
-    if rag_snippets:
-        system_prompt += f"\n\n--- RETRIEVED KNOWLEDGE (prefer for factual answers) ---\n{rag_snippets}"
+    from backend.integrations.catalog_cache import get_cached_catalog, schedule_warmup
+
+    catalog = get_cached_catalog(tenant_id)
+    if catalog:
+        system_prompt += (
+            "\n\n--- CACHED CATALOG (answer from this first; prefer over tools) ---\n"
+            + catalog
+        )
+    else:
+        # Warm for next turn; this turn may still use tools
+        schedule_warmup(tenant_id)
+
+    # Skip heavy RAG when cache is warm (major voice latency win)
+    if not catalog:
+        rag_snippets = await retrieve_context(tenant_id, user_text)
+        if rag_snippets:
+            system_prompt += f"\n\n--- RETRIEVED KNOWLEDGE (prefer for factual answers) ---\n{rag_snippets}"
 
     intent = state.get("intent") or "Inquiry"
     system_prompt += f"\n\nDetected intent: {intent}. Keep replies concise for low latency."
+    if is_voice:
+        system_prompt += " Voice channel: 1 short sentence preferred. Handle interruptions gracefully."
 
     formatted_messages = [SystemMessage(content=system_prompt)] + list(messages)
 
-    llm = get_chat_llm(streaming=True, temperature=0.2)
-    llm_with_tools = llm.bind_tools(agent_tools)
+    llm = get_chat_llm(streaming=True, temperature=0.1 if is_voice else 0.2)
+    use_tools = _needs_tools(user_text, bool(catalog))
+    if use_tools:
+        tools = _VOICE_FAST_TOOLS if (is_voice and catalog) else agent_tools
+        # Still allow inventory lookup if cache missing
+        if is_voice and not catalog:
+            tools = agent_tools
+        bound = llm.bind_tools(tools)
+    else:
+        bound = llm
 
     gathered = None
-    async for chunk in llm_with_tools.astream(formatted_messages):
+    async for chunk in bound.astream(formatted_messages):
         gathered = chunk if gathered is None else gathered + chunk
 
     if gathered is None:
-        gathered = await llm_with_tools.ainvoke(formatted_messages)
+        gathered = await bound.ainvoke(formatted_messages)
 
     return {"messages": [gathered]}
 

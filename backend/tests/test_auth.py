@@ -11,7 +11,9 @@ from backend.auth.security import (
     create_access_token,
     decode_access_token,
     generate_api_key,
+    generate_publishable_key,
     hash_password,
+    is_publishable_key,
     verify_password,
 )
 
@@ -42,10 +44,21 @@ def test_api_key_generation():
     print("✓ API key generation")
 
 
+def test_publishable_vs_secret_keys():
+    pk = generate_publishable_key()
+    sk = generate_api_key("sk_live")
+    assert is_publishable_key(pk)
+    assert not is_publishable_key(sk)
+    assert pk.startswith("pk_live_")
+    assert sk.startswith("sk_live_")
+    print("✓ publishable vs secret key shapes")
+
+
 def main():
     test_password_hashing()
     test_jwt_roundtrip()
     test_api_key_generation()
+    test_publishable_vs_secret_keys()
     print("\nAll auth unit tests passed.")
 
 

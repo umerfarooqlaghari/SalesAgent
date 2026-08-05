@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from backend.auth.security import (
     create_access_token,
     generate_api_key,
+    generate_publishable_key,
     hash_password,
     verify_password,
 )
@@ -34,11 +35,12 @@ def _slugify_org(name: str) -> str:
     return base or "org"
 
 
-async def create_tenant(org_name: str, owner_email: str) -> tuple[str, str]:
-    """Create tenant + return (tenant_id, plaintext_api_key)."""
+async def create_tenant(org_name: str, owner_email: str) -> tuple[str, str, str]:
+    """Create tenant + return (tenant_id, secret_api_key, publishable_key)."""
     db = get_db()
     tenant_id = f"{_slugify_org(org_name)}_{uuid.uuid4().hex[:8]}"
     api_key = generate_api_key()
+    publishable_key = generate_publishable_key()
 
     from backend.agent.prompts import build_tenant_system_prompt
 
@@ -48,6 +50,7 @@ async def create_tenant(org_name: str, owner_email: str) -> tuple[str, str]:
             "org_name": org_name.strip(),
             "owner_email": owner_email.lower().strip(),
             "api_key_hash": hash_api_key(api_key),
+            "publishable_key": publishable_key,
             "status": "active",
             "integration_configs": normalize_integrations({}),
             "settings": {
@@ -60,7 +63,7 @@ async def create_tenant(org_name: str, owner_email: str) -> tuple[str, str]:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
-    return tenant_id, api_key
+    return tenant_id, api_key, publishable_key
 
 
 async def register_client(
@@ -82,7 +85,7 @@ async def register_client(
     if existing:
         raise ValueError("An account with this email already exists")
 
-    tenant_id, api_key = await create_tenant(org_name, email)
+    tenant_id, api_key, publishable_key = await create_tenant(org_name, email)
     user_id = str(uuid.uuid4())
 
     await db.users.insert_one(
@@ -119,7 +122,11 @@ async def register_client(
             "org_name": org_name.strip(),
         },
         "api_key": api_key,
-        "message": "Save your API key now — it will not be shown again.",
+        "publishable_key": publishable_key,
+        "message": (
+            "Save your secret API key now — it will not be shown again. "
+            "Use the publishable key (pk_live_…) on websites."
+        ),
     }
 
 
@@ -193,6 +200,45 @@ async def regenerate_api_key(user_id: str) -> str:
         },
     )
     return api_key
+
+
+async def get_or_create_publishable_key(tenant_id: str) -> str:
+    db = get_db()
+    doc = await db.tenants.find_one({"tenant_id": tenant_id, "status": "active"})
+    if not doc:
+        raise ValueError("Tenant not found")
+    existing = doc.get("publishable_key")
+    if existing:
+        return existing
+    pk = generate_publishable_key()
+    await db.tenants.update_one(
+        {"tenant_id": tenant_id},
+        {
+            "$set": {
+                "publishable_key": pk,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+    return pk
+
+
+async def regenerate_publishable_key(user_id: str) -> str:
+    db = get_db()
+    user = await db.users.find_one({"user_id": user_id, "status": "active"})
+    if not user or not user.get("tenant_id"):
+        raise ValueError("No tenant associated with this user")
+    pk = generate_publishable_key()
+    await db.tenants.update_one(
+        {"tenant_id": user["tenant_id"]},
+        {
+            "$set": {
+                "publishable_key": pk,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+    return pk
 
 
 async def seed_super_admin() -> None:

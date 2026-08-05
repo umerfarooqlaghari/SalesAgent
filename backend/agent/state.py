@@ -1,5 +1,5 @@
 from typing import Annotated, List, Optional
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
@@ -18,3 +18,4 @@ class AgentState(TypedDict):
     requires_handoff: bool
     thread_id: str
     tenant_id: str
+    channel: NotRequired[str]  # "voice" | "chat"

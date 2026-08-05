@@ -29,7 +29,7 @@ async def ensure_knowledge_indexes() -> None:
 
 
 async def retrieve_context(tenant_id: str, query: str, limit: int = 4) -> str:
-    """Return top matching knowledge snippets for injection into the system prompt."""
+    """Return top matching knowledge snippets (Mongo + adapter-hub) for the system prompt."""
     if not query or not query.strip():
         return ""
 
@@ -58,15 +58,27 @@ async def retrieve_context(tenant_id: str, query: str, limit: int = 4) -> str:
         scored.sort(key=lambda x: x[0], reverse=True)
         snippets = [d for s, d in scored if s > 0][:limit]
 
-    if not snippets:
-        return ""
-
     lines = []
     for doc in snippets:
         title = doc.get("title") or "Knowledge"
         text = (doc.get("text") or "").strip()
         if text:
             lines.append(f"- [{title}] {text[:600]}")
+
+    # Merge adapter-hub vector/keyword RAG (synced Production / PO / Sets rows)
+    try:
+        from backend.integrations.adapter_hub_client import retrieve as hub_retrieve
+
+        hub_hits = await hub_retrieve(tenant_id, query, top_k=limit)
+        for hit in hub_hits:
+            text = (hit.get("text") or "").strip()
+            if not text:
+                continue
+            etype = hit.get("entity_type") or "Record"
+            lines.append(f"- [Hub:{etype}] {text[:600]}")
+    except Exception as e:
+        logger.debug("Adapter-hub RAG merge skipped: %s", e)
+
     return "\n".join(lines)
 
 

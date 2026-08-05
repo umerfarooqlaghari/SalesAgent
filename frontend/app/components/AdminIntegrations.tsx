@@ -139,6 +139,7 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
   const [statusOk, setStatusOk] = useState<boolean | null>(null);
   const [testing, setTesting] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [syncingKnowledge, setSyncingKnowledge] = useState(false);
   const [discoveryCache, setDiscoveryCache] = useState<Record<string, DiscoverResult>>({});
 
   const setDiscovery = (key: string, data: DiscoverResult | null) => {
@@ -219,11 +220,36 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
       if (!res.ok) throw new Error(data.detail || "Save failed");
       setIntegrations(data.integrations);
       if (data.settings?.system_prompt) setSystemPrompt(data.settings.system_prompt);
-      setMessage("Settings saved successfully.", true);
+      const hub = data.adapter_hub_sync;
+      const hubMsg =
+        hub?.ok && hub?.synchronized_count
+          ? ` Knowledge sync: ${hub.synchronized_count} record(s).`
+          : hub?.skipped
+            ? " (Adapter-Hub offline — live SQL queries still work.)"
+            : "";
+      setMessage(`Settings saved successfully.${hubMsg}`, true);
     } catch (e: unknown) {
       setMessage(e instanceof Error ? e.message : "Save failed", false);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const syncKnowledge = async () => {
+    setSyncingKnowledge(true);
+    setMessage("");
+    try {
+      const res = await fetch(`${backendUrl}/api/admin/integrations/sync-knowledge`, {
+        method: "POST",
+        headers: getHeaders(),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || data.message || "Sync failed");
+      setMessage(data.message || "Knowledge sync complete.", Boolean(data.ok));
+    } catch (e: unknown) {
+      setMessage(e instanceof Error ? e.message : "Knowledge sync failed", false);
+    } finally {
+      setSyncingKnowledge(false);
     }
   };
 
@@ -712,9 +738,23 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
           <button type="button" onClick={save} disabled={saving} className={ui.btnPrimary}>
             {saving ? "Saving…" : "Save changes"}
           </button>
+          <button
+            type="button"
+            onClick={syncKnowledge}
+            disabled={syncingKnowledge}
+            className={ui.btnSecondary}
+            title="Push mapped Production / Sets / PO tables into Adapter-Hub so the agent can answer experience questions"
+          >
+            {syncingKnowledge ? "Syncing…" : "Sync knowledge to agent"}
+          </button>
           <button type="button" onClick={load} className={ui.btnSecondary}>
             Reload
           </button>
+          <p className="w-full text-xs text-gray-500 mt-1">
+            After mapping Production, Sets, or PO tables under Inventory, save then click{" "}
+            <span className="font-medium text-gray-700">Sync knowledge to agent</span>. The agent also
+            queries those tables live via <code className="text-[11px]">query_pos_database</code>.
+          </p>
         </div>
       </div>
     </div>

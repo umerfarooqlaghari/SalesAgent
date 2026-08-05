@@ -25,6 +25,12 @@ async def _ensure_tenant_indexes() -> None:
     db = get_db()
     await db.tenants.create_index("tenant_id", unique=True, name="tenants_tenant_id")
     await db.tenants.create_index("api_key_hash", unique=True, name="tenants_api_key_hash")
+    await db.tenants.create_index(
+        "publishable_key",
+        unique=True,
+        sparse=True,
+        name="tenants_publishable_key",
+    )
     await db.tenants.create_index("status", name="tenants_status")
     await db.tenants.create_index("owner_email", name="tenants_owner_email")
     await db.api_keys.create_index("key", name="api_keys_key")

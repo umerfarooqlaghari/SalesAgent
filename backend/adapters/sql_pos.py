@@ -285,126 +285,126 @@ class SqlPOSAdapter:
             lines = [f"- {r[0]}: Price={r[1]}, In Stock={r[2]} ({r[3]})" for r in rows]
             return "Product Catalog:\n" + "\n".join(lines)
 
+        # Capability / experience questions should hit production / sets / PO tables too
+        experience_terms = {
+            "production", "productions", "set", "sets", "scenery", "scenic",
+            "po", "purchase", "order", "orders", "project", "projects",
+            "experience", "capability", "capabilities", "service", "services",
+            "film", "tv", "event", "events", "construction",
+        }
+        q_words = set(re.findall(r"\w+", q_clean)) if q_clean else set()
+        is_capability_query = bool(q_words & experience_terms)
+
         results = []
         for mapping in mapped:
             table = mapping.get("table")
-            role = mapping.get("role")
+            role = (mapping.get("role") or "").lower()
             label = mapping.get("label") or table
-            if not table:
+            if not table or mapping.get("enabled") is False:
                 continue
 
-            # Skip querying orders or appointments in list_products unless explicitly requested
-            if role in ("orders", "appointments") and not (q_clean and (role in q_clean or label.lower() in q_clean or table.lower() in q_clean)):
+            # Skip appointments unless explicitly asked
+            if role == "appointments" and not (
+                q_clean and ("appointment" in q_clean or "booking" in q_clean or "schedule" in q_clean)
+            ):
                 continue
 
-            table_matched = False
-            if not is_generic:
-                t_lower = table.lower()
-                l_lower = label.lower()
-                q_words = set(re.findall(r"\w+", q_clean))
-                t_words = set(re.findall(r"\w+", t_lower + " " + l_lower))
-                if q_words & t_words or any(qw in tw or tw in qw for qw in q_words for tw in t_words):
-                    table_matched = True
-
-                cols_map = mapping.get("columns") or {}
-                if isinstance(cols_map, list):
-                    cols_map = {c: c for c in cols_map}
-
-                # Construct query
-                qt = self.sql._qualified(table)
-                select_parts = []
-                field_names = []
-                seen = set()
-                for logical, physical in cols_map.items():
-                    p = str(physical)
-                    if p not in seen:
-                        select_parts.append(_quote_ident(p, self.sql.dialect))
-                        field_names.append(str(logical))
-                        seen.add(p)
-
-                if not select_parts:
+            # Skip pure orders on open catalog lists unless asked / capability query
+            if role == "orders" and is_generic and not is_capability_query:
+                if not (q_clean and ("order" in q_clean or "po" in q_clean or "purchase" in q_clean)):
                     continue
 
-                search_cols = mapping.get("search_columns") or []
-                where_parts = []
-                like_op = "ILIKE" if self.sql.dialect == "postgres" else "LIKE"
-                for sc in search_cols:
-                    if sc:
-                        where_parts.append(f"{_quote_ident(str(sc), self.sql.dialect)} {like_op} :q")
+            cols_map = mapping.get("columns") or {}
+            if isinstance(cols_map, list):
+                cols_map = {c: c for c in cols_map}
+            if not cols_map:
+                continue
 
-                if not where_parts and cols_map:
-                    name_col = cols_map.get("name") or cols_map.get("supplier_name") or cols_map.get("set_name") or list(cols_map.values())[0]
-                    where_parts.append(f"{_quote_ident(str(name_col), self.sql.dialect)} {like_op} :q")
+            qt = self.sql._qualified(table)
+            select_parts = []
+            field_names = []
+            seen = set()
+            for logical, physical in cols_map.items():
+                p = str(physical)
+                if p not in seen:
+                    select_parts.append(_quote_ident(p, self.sql.dialect))
+                    field_names.append(str(logical))
+                    seen.add(p)
+            if not select_parts:
+                continue
 
-                where_sql = " OR ".join(where_parts)
+            t_lower = table.lower()
+            l_lower = label.lower()
+            t_words = set(re.findall(r"\w+", t_lower + " " + l_lower + " " + role))
+            table_matched = bool(q_words & t_words) or any(
+                qw in tw or tw in qw for qw in q_words for tw in t_words if len(qw) > 2 and len(tw) > 2
+            )
 
-                if table_matched:
-                    sql = f"SELECT {', '.join(select_parts)} FROM {qt}"
-                    params = {}
-                else:
-                    if not where_sql:
-                        continue
+            like_op = "ILIKE" if self.sql.dialect == "postgres" else "LIKE"
+            search_cols = mapping.get("search_columns") or []
+            where_parts = []
+            for sc in search_cols:
+                if sc:
+                    where_parts.append(f"{_quote_ident(str(sc), self.sql.dialect)} {like_op} :q")
+            if not where_parts and cols_map:
+                name_col = (
+                    cols_map.get("name")
+                    or cols_map.get("title")
+                    or cols_map.get("supplier_name")
+                    or cols_map.get("set_name")
+                    or cols_map.get("description")
+                    or list(cols_map.values())[0]
+                )
+                where_parts.append(f"{_quote_ident(str(name_col), self.sql.dialect)} {like_op} :q")
+                # Also search description-like columns when asking about experience
+                for key in ("description", "details", "notes", "summary", "type", "category"):
+                    if key in cols_map and cols_map[key] != name_col:
+                        where_parts.append(
+                            f"{_quote_ident(str(cols_map[key]), self.sql.dialect)} {like_op} :q"
+                        )
+
+            where_sql = " OR ".join(where_parts)
+            params: Dict[str, Any] = {}
+
+            # Generic / capability: dump sample rows from every enabled table
+            if is_generic or is_capability_query or table_matched:
+                sql = f"SELECT {', '.join(select_parts)} FROM {qt}"
+                if not is_generic and not table_matched and where_sql:
+                    # Capability query with specific words — also filter when possible
                     sql = f"SELECT {', '.join(select_parts)} FROM {qt} WHERE ({where_sql})"
                     params = {"q": f"%{query.strip()}%"}
-
-                if self.sql.dialect == "sqlserver":
-                    sql = sql.replace("SELECT", "SELECT TOP 10", 1)
-                else:
-                    sql += " LIMIT 10"
-
-                try:
-                    rows = await self.sql.fetch_all(sql, params)
-                    if rows:
-                        lines = []
-                        for r in rows:
-                            pairs = ", ".join(f"{field_names[i]}={r[i]}" for i in range(min(len(r), len(field_names))))
-                            lines.append(f"  • {pairs}")
-                        results.append(f"[{label}]\n" + "\n".join(lines))
-                except Exception as e:
-                    logger.warning("Query failed for table %s: %s", table, e)
             else:
-                # Generic list
-                if role == "products" or (not role and any(k in label.lower() or k in table.lower() for k in ("product", "catalog", "item", "supplier"))):
-                    qt = self.sql._qualified(table)
-                    cols_map = mapping.get("columns") or {}
-                    if isinstance(cols_map, list):
-                        cols_map = {c: c for c in cols_map}
+                if not where_sql:
+                    continue
+                sql = f"SELECT {', '.join(select_parts)} FROM {qt} WHERE ({where_sql})"
+                params = {"q": f"%{query.strip()}%"}
 
-                    select_parts = []
-                    field_names = []
-                    seen = set()
-                    for logical, physical in cols_map.items():
-                        p = str(physical)
-                        if p not in seen:
-                            select_parts.append(_quote_ident(p, self.sql.dialect))
-                            field_names.append(str(logical))
-                            seen.add(p)
+            if self.sql.dialect == "sqlserver":
+                sql = sql.replace("SELECT", "SELECT TOP 15", 1)
+            else:
+                sql += " LIMIT 15"
 
-                    if not select_parts:
-                        continue
-
-                    sql = f"SELECT {', '.join(select_parts)} FROM {qt}"
-                    if self.sql.dialect == "sqlserver":
-                        sql = sql.replace("SELECT", "SELECT TOP 10", 1)
-                    else:
-                        sql += " LIMIT 10"
-
-                    try:
-                        rows = await self.sql.fetch_all(sql)
-                        if rows:
-                            lines = []
-                            for r in rows:
-                                pairs = ", ".join(f"{field_names[i]}={r[i]}" for i in range(min(len(r), len(field_names))))
-                                lines.append(f"  • {pairs}")
-                            results.append(f"[{label}]\n" + "\n".join(lines))
-                    except Exception as e:
-                        logger.warning("Generic query failed for table %s: %s", table, e)
-                else:
-                    # just mention the table is available
-                    results.append(f"[{label} (Custom Table)] - Query for specific items or ask about '{label.lower()}' to search this table.")
+            try:
+                rows = await self.sql.fetch_all(sql, params or None)
+                if rows:
+                    lines = []
+                    for r in rows:
+                        pairs = ", ".join(
+                            f"{field_names[i]}={r[i]}" for i in range(min(len(r), len(field_names)))
+                        )
+                        lines.append(f"  • {pairs}")
+                    results.append(f"[{label}]\n" + "\n".join(lines))
+                elif is_generic or is_capability_query:
+                    results.append(f"[{label}] — table is connected but returned no rows.")
+            except Exception as e:
+                logger.warning("Query failed for table %s: %s", table, e)
+                results.append(f"[{label}] — query error: {e}")
 
         if not results:
-            return "No matching records found across database tables."
+            return (
+                "No matching records found across mapped database tables. "
+                "Confirm Production / Sets / PO tables are mapped under Integrations → Inventory."
+            )
         return "\n\n".join(results)
 
     async def get_order_status(
