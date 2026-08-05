@@ -19,20 +19,20 @@ from backend.tenant.context import IntegrationConfigs, TenantContext, TenantSett
 
 
 def test_needs_tools_skips_when_cache_warm():
-    assert _needs_tools("What productions do you have?", has_catalog_cache=True) is False
-    assert _needs_tools("Tell me about your sets", has_catalog_cache=True) is False
-    print("✓ positive: cache warm → skip tools for catalog Q")
+    assert _needs_tools("What productions do you have?", has_fact_cache=True) is False
+    assert _needs_tools("Tell me about your services", has_fact_cache=True) is False
+    print("✓ positive: fact cache warm → skip tools for FAQ/catalog Q")
 
 
 def test_needs_tools_required_without_cache():
-    assert _needs_tools("What productions do you have?", has_catalog_cache=False) is True
+    assert _needs_tools("What productions do you have?", has_fact_cache=False) is True
     print("✓ negative: no cache → tools still needed")
 
 
 def test_needs_tools_actions_always():
-    assert _needs_tools("Book a meeting tomorrow", has_catalog_cache=True) is True
-    assert _needs_tools("I want to buy this package", has_catalog_cache=True) is True
-    assert _needs_tools("Can I speak to a human?", has_catalog_cache=True) is True
+    assert _needs_tools("Book a meeting tomorrow", has_fact_cache=True) is True
+    assert _needs_tools("I want to buy this package", has_fact_cache=True) is True
+    assert _needs_tools("Can I speak to a human?", has_fact_cache=True) is True
     print("✓ positive: action keywords still force tools with cache")
 
 
@@ -64,6 +64,12 @@ async def test_embed_session_returns_before_slow_warmup():
         "backend.integrations.catalog_cache.schedule_warmup"
     ) as scheduled, patch(
         "backend.integrations.catalog_cache.warmup_catalog", side_effect=slow_warmup
+    ), patch(
+        "backend.integrations.knowledge_cache.warmup_knowledge",
+        new=AsyncMock(return_value={"ok": True, "cached": True, "chars": 50}),
+    ), patch(
+        "backend.integrations.knowledge_cache.get_cached_knowledge",
+        return_value="[Services] Fast FAQ",
     ):
         t0 = time.perf_counter()
         body = await create_embed_session(data={}, tenant=tenant)
@@ -76,9 +82,10 @@ async def test_embed_session_returns_before_slow_warmup():
     assert body["vapi_assistant_id"] == "asst_test_123"
     assert body["metadata"]["tenant_id"] == "alpha_devs_test"
     assert body["metadata"]["console_thread_id"]
-    assert body["warmup"]["status"] == "warming"
-    assert elapsed_ms < 500, f"embed/session too slow ({elapsed_ms:.0f}ms) — warmup likely blocking"
-    print(f"✓ latency: embed/session non-blocking ({elapsed_ms:.0f}ms)")
+    # Knowledge is ready; SQL catalog may still be warming in background
+    assert body["warmup"]["status"] == "ready"
+    assert elapsed_ms < 500, f"embed/session too slow ({elapsed_ms:.0f}ms) — SQL warmup likely blocking"
+    print(f"✓ latency: embed/session non-blocking for SQL ({elapsed_ms:.0f}ms)")
 
 
 async def test_cached_catalog_injected_flags_ready():

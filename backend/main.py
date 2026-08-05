@@ -425,11 +425,25 @@ async def get_widget_config(tenant: TenantContext = Depends(get_tenant_or_api_ke
 @app.post("/api/embed/warmup")
 @app.post("/api/voice/warmup")
 async def warmup_catalog_route(tenant: TenantContext = Depends(get_tenant_or_api_key)):
-    """Prefetch mapped SQL catalogs into memory before a voice call (cuts 1–2s off first answer)."""
-    from backend.integrations.catalog_cache import warmup_catalog
+    """Prefetch knowledge (await) + SQL catalog (background) before a voice call."""
+    import asyncio
 
-    result = await warmup_catalog(tenant.tenant_id, force=False)
-    return {"tenant_id": tenant.tenant_id, **result}
+    from backend.integrations.catalog_cache import schedule_warmup
+    from backend.integrations.knowledge_cache import warmup_knowledge
+
+    # Knowledge is what answers services/packages — must be fast.
+    # SQL catalog probes can hang for tens of seconds; never block voice on them.
+    try:
+        k = await asyncio.wait_for(warmup_knowledge(tenant.tenant_id, force=False), timeout=3.0)
+    except Exception as e:
+        k = {"ok": False, "error": str(e)}
+    schedule_warmup(tenant.tenant_id)
+    return {
+        "tenant_id": tenant.tenant_id,
+        "ok": bool(k.get("ok")),
+        "knowledge": k,
+        "catalog": {"ok": True, "status": "warming_in_background"},
+    }
 
 
 @app.post("/api/embed/session")
@@ -444,13 +458,24 @@ async def create_embed_session(
     """
     import uuid
 
+    import asyncio
+
     from backend.integrations.catalog_cache import get_cached_catalog, schedule_warmup
+    from backend.integrations.knowledge_cache import get_cached_knowledge, warmup_knowledge
 
     console_thread_id = (data or {}).get("console_thread_id") or f"embed_{uuid.uuid4().hex[:12]}"
     await register_voice_session(tenant.tenant_id, console_thread_id)
-    # Warm in background so website embeds don't block call start
+
+    # Knowledge/FAQ must be ready before first spoken turn (SQL catalog can warm in background)
+    try:
+        await asyncio.wait_for(warmup_knowledge(tenant.tenant_id), timeout=2.5)
+    except Exception as e:
+        logger.warning("Knowledge warmup on embed/session: %s", e)
     schedule_warmup(tenant.tenant_id)
+
+    knowledge = get_cached_knowledge(tenant.tenant_id)
     cached = get_cached_catalog(tenant.tenant_id)
+    facts_ready = bool(knowledge or cached)
 
     return {
         "ok": True,
@@ -461,9 +486,11 @@ async def create_embed_session(
         "vapi_assistant_id": settings.VAPI_ASSISTANT_ID,
         "warmup": {
             "ok": True,
-            "cached": bool(cached),
-            "chars": len(cached or ""),
-            "status": "ready" if cached else "warming",
+            "cached": facts_ready,
+            "chars": len(knowledge or "") + len(cached or ""),
+            "status": "ready" if facts_ready else "warming",
+            "knowledge_chars": len(knowledge or ""),
+            "catalog_chars": len(cached or ""),
         },
         "metadata": {
             "tenant_id": tenant.tenant_id,
@@ -737,13 +764,20 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     if typed_context and typed_context not in user_content:
         enriched_user_content = user_content + typed_context
 
-    await save_conversation_message(tenant_id, agent_thread_id, "user", user_content, source="voice")
+    # Persist user turn in background — do not block first TTS byte
+    import asyncio
 
-    # Run the LangGraph SDR brain
-    graph = await get_agent_graph()
+    asyncio.create_task(
+        save_conversation_message(tenant_id, agent_thread_id, "user", user_content, source="voice")
+    )
+
+    from backend.agent.graph import get_voice_agent_graph
+    from backend.integrations.knowledge_cache import get_cached_knowledge
+    from backend.integrations.voice_fastpath import try_voice_faq_answer
+
     config = {
         "configurable": {"thread_id": agent_thread_id, "tenant_id": tenant_id},
-        "recursion_limit": 16,
+        "recursion_limit": 6,
     }
     inputs = {
         "messages": [HumanMessage(content=enriched_user_content)],
@@ -752,42 +786,91 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
         "channel": "voice",
     }
 
-    try:
-        result = await graph.ainvoke(inputs, config=config)
-        messages_out = result.get("messages", [])
-        assistant_msg = _extract_assistant_text(messages_out)
-    except Exception as e:
-        logger.error(f"Vapi agent error for {agent_thread_id}: {e}", exc_info=True)
-        error_msg = str(e)
-        if "RESOURCE_EXHAUSTED" in error_msg or "429" in error_msg:
-            assistant_msg = (
-                "I'm experiencing a brief system delay. "
-                "Could you repeat that, or I can have a team member call you back?"
-            )
-        else:
-            assistant_msg = (
-                "Sorry, I hit a small snag on my end. "
-                "Could you say that again, or would you like me to connect you with a team member?"
-            )
-
-    await save_conversation_message(tenant_id, agent_thread_id, "assistant", assistant_msg, source="voice")
-
-    # Always stream SSE — Vapi requires streaming to feed TTS pipeline
-    async def stream_response() -> AsyncIterator[str]:
-        # Send the full content in one chunk then close
+    def _sse(content: str = "", *, role: Optional[str] = None, finish: Optional[str] = None) -> str:
+        delta: Dict[str, Any] = {}
+        if role:
+            delta["role"] = role
+        if content:
+            delta["content"] = content
         chunk = {
             "id": f"chatcmpl-{agent_thread_id}",
             "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": assistant_msg}, "finish_reason": None}]
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
         }
-        yield f"data: {json.dumps(chunk)}\n\n"
-        done_chunk = {
-            "id": f"chatcmpl-{agent_thread_id}",
-            "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-        }
-        yield f"data: {json.dumps(done_chunk)}\n\n"
+        return f"data: {json.dumps(chunk)}\n\n"
+
+    async def _timeout_fallback() -> str:
+        knowledge = get_cached_knowledge(tenant_id) or ""
+        if knowledge:
+            snippet = " ".join(knowledge.split())[:220]
+            return f"We offer {snippet}"
+        return (
+            "We build AI ERP, computer vision, SaaS, ed-tech, and sales intelligence solutions. "
+            "Want details on any one of those?"
+        )
+
+    # Stream IMMEDIATELY so Vapi does not drop the call waiting on Gemini/Mongo
+    async def stream_response() -> AsyncIterator[str]:
+        yield _sse(role="assistant")
+        assistant_msg = ""
+        t0 = asyncio.get_event_loop().time()
+        try:
+            # FAQ fast-path: no LangGraph, no tools — prevents "let me check" stalls
+            fast = await asyncio.wait_for(
+                try_voice_faq_answer(tenant_id, enriched_user_content),
+                timeout=4.5,
+            )
+            if fast:
+                assistant_msg = fast
+                logger.info(
+                    "Voice FAQ fast-path ok call_id=%s tenant=%s ms=%.0f",
+                    call_id,
+                    tenant_id,
+                    (asyncio.get_event_loop().time() - t0) * 1000,
+                )
+            else:
+                graph = await get_voice_agent_graph()
+                result = await asyncio.wait_for(
+                    graph.ainvoke(inputs, config=config),
+                    timeout=5.5,
+                )
+                assistant_msg = _extract_assistant_text(result.get("messages", []))
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Vapi agent timed out call_id=%s tenant=%s — using knowledge fallback",
+                call_id,
+                tenant_id,
+            )
+            assistant_msg = await _timeout_fallback()
+        except Exception as e:
+            logger.error("Vapi agent error for %s: %s", agent_thread_id, e, exc_info=True)
+            error_msg = str(e)
+            if "RESOURCE_EXHAUSTED" in error_msg or "429" in error_msg:
+                assistant_msg = (
+                    "I'm experiencing a brief system delay. "
+                    "Could you repeat that, or I can have a team member call you back?"
+                )
+            else:
+                assistant_msg = "Sorry, I hit a small snag. Could you say that again?"
+
+        if not (assistant_msg or "").strip():
+            assistant_msg = await _timeout_fallback()
+
+        # Strip stall phrases if the model still produced one
+        low = assistant_msg.lower()
+        if "let me check" in low or "one moment" in low or "pull that up" in low:
+            assistant_msg = await _timeout_fallback()
+
+        yield _sse(assistant_msg)
+        yield _sse(finish="stop")
         yield "data: [DONE]\n\n"
+
+        try:
+            await save_conversation_message(
+                tenant_id, agent_thread_id, "assistant", assistant_msg, source="voice"
+            )
+        except Exception:
+            logger.debug("Failed to persist voice assistant message", exc_info=True)
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")
 

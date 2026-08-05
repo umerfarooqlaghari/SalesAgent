@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Literal, Dict, Any
 
@@ -77,11 +78,13 @@ async def router_node(state: AgentState) -> Dict[str, Any]:
     thread_id = state.get("thread_id", "default_thread")
     tenant_id = _tenant_id_from_state(state)
     user_text = _last_user_text(messages)
+    is_voice = thread_id.startswith("vapi_") or state.get("channel") == "voice"
 
-    if thread_id.startswith("vapi_"):
-        intent = "Inquiry"
-    else:
-        intent = _heuristic_intent(user_text)
+    intent = "Inquiry" if is_voice else _heuristic_intent(user_text)
+
+    # Voice: skip lead Mongo round-trip (saves ~100–400ms per turn)
+    if is_voice:
+        return {"intent": intent}
 
     lead_doc = await get_lead(tenant_id, thread_id)
     lead_profile_dict = state.get("lead_profile") or {}
@@ -120,15 +123,26 @@ _ACTION_KEYWORDS = (
     "reschedule", "handoff", "human", "representative", "email", "phone",
 )
 
+_FAQ_KEYWORDS = (
+    "service", "services", "package", "packages", "pricing", "price", "offer",
+    "product", "products", "what do you", "who are you", "about", "capabilities",
+    "solutions", "how does", "consultancy", "consulting",
+)
 
-def _needs_tools(user_text: str, has_catalog_cache: bool) -> bool:
+
+def _needs_tools(user_text: str, has_fact_cache: bool) -> bool:
     text = (user_text or "").lower()
     if any(k in text for k in _ACTION_KEYWORDS):
         return True
-    if has_catalog_cache:
-        # Cache can answer identity / catalog / experience — skip tool round-trip
+    if has_fact_cache:
+        # Knowledge and/or SQL catalog can answer FAQ / catalog questions — skip tools
         return False
     return True
+
+
+def _is_faq_question(user_text: str) -> bool:
+    text = (user_text or "").lower()
+    return any(k in text for k in _FAQ_KEYWORDS)
 
 
 async def sdr_node(state: AgentState) -> Dict[str, Any]:
@@ -162,46 +176,74 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
     if ctx and ctx.org_name and tenant_id != "alpha_default":
         system_prompt = (
             f"CRITICAL IDENTITY: You are the sales assistant for {ctx.org_name}. "
-            f"Your company name is {ctx.org_name}. Never say you work for Alpha or sell SaaS packages "
-            f"unless a tool explicitly returns that information.\n\n"
+            f"Your company name is {ctx.org_name}. Do not invent other company names. "
+            f"Answer services/packages from CACHED KNOWLEDGE when present.\n\n"
             + system_prompt
         )
 
-    if ctx and ctx.settings.company_description:
-        org = ctx.org_name or tenant_id
-        system_prompt += f"\n\n--- ABOUT {org.upper()} ---\n{ctx.settings.company_description.strip()}"
-
     from backend.integrations.catalog_cache import get_cached_catalog, schedule_warmup
+    from backend.integrations.knowledge_cache import get_cached_knowledge, warmup_knowledge
+
+    knowledge = get_cached_knowledge(tenant_id)
+    if not knowledge and is_voice:
+        # Voice FAQ must not wait on cold Mongo mid-turn if session warmup missed
+        try:
+            await asyncio.wait_for(warmup_knowledge(tenant_id), timeout=1.5)
+            knowledge = get_cached_knowledge(tenant_id)
+        except Exception:
+            pass
+
+    if knowledge:
+        system_prompt += (
+            "\n\n--- CACHED KNOWLEDGE (services/packages/about — answer from this FIRST) ---\n"
+            + knowledge
+        )
 
     catalog = get_cached_catalog(tenant_id)
     if catalog:
         system_prompt += (
-            "\n\n--- CACHED CATALOG (answer from this first; prefer over tools) ---\n"
+            "\n\n--- CACHED CATALOG (inventory/productions — prefer over tools) ---\n"
             + catalog
         )
-    else:
-        # Warm for next turn; this turn may still use tools
+    elif not is_voice:
         schedule_warmup(tenant_id)
 
-    # Skip heavy RAG when cache is warm (major voice latency win)
-    if not catalog:
+    # Live RAG only when caches miss (avoid double Mongo + hub latency on warm voice)
+    has_facts = bool(knowledge or catalog)
+    if not has_facts:
         rag_snippets = await retrieve_context(tenant_id, user_text)
         if rag_snippets:
             system_prompt += f"\n\n--- RETRIEVED KNOWLEDGE (prefer for factual answers) ---\n{rag_snippets}"
+            has_facts = True
 
     intent = state.get("intent") or "Inquiry"
     system_prompt += f"\n\nDetected intent: {intent}. Keep replies concise for low latency."
     if is_voice:
-        system_prompt += " Voice channel: 1 short sentence preferred. Handle interruptions gracefully."
+        system_prompt += (
+            " Voice channel: ONE short spoken sentence (max ~25 words) unless they ask for a list — "
+            "then at most 2 short sentences. Handle interruptions gracefully."
+        )
 
-    formatted_messages = [SystemMessage(content=system_prompt)] + list(messages)
+    # Voice FAQ: only the latest user turn (smaller prompt → faster Gemini)
+    if is_voice and _is_faq_question(user_text):
+        from langchain_core.messages import HumanMessage
 
-    llm = get_chat_llm(streaming=True, temperature=0.1 if is_voice else 0.2)
-    use_tools = _needs_tools(user_text, bool(catalog))
+        formatted_messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_text),
+        ]
+    else:
+        formatted_messages = [SystemMessage(content=system_prompt)] + list(messages)
+
+    llm = get_chat_llm(
+        streaming=True,
+        temperature=0.1 if is_voice else 0.2,
+        max_retries=1 if is_voice else 2,
+    )
+    use_tools = _needs_tools(user_text, has_facts)
     if use_tools:
-        tools = _VOICE_FAST_TOOLS if (is_voice and catalog) else agent_tools
-        # Still allow inventory lookup if cache missing
-        if is_voice and not catalog:
+        tools = _VOICE_FAST_TOOLS if (is_voice and has_facts) else agent_tools
+        if is_voice and not has_facts:
             tools = agent_tools
         bound = llm.bind_tools(tools)
     else:
@@ -269,6 +311,26 @@ builder.add_edge("tools", "post_tool_processor")
 builder.add_conditional_edges("post_tool_processor", route_after_post_tool, {"sdr_agent": "sdr_agent", END: END})
 
 
+_compiled_graph = None
+_voice_graph = None
+
+
 async def get_agent_graph():
-    checkpointer = await get_checkpointer()
-    return builder.compile(checkpointer=checkpointer)
+    """Dashboard/chat graph with Mongo checkpointer (multi-turn state)."""
+    global _compiled_graph
+    if _compiled_graph is None:
+        checkpointer = await get_checkpointer()
+        _compiled_graph = builder.compile(checkpointer=checkpointer)
+    return _compiled_graph
+
+
+async def get_voice_agent_graph():
+    """
+    Voice graph WITHOUT Mongo checkpointer.
+    Checkpoint I/O on every turn was a major cause of Vapi timeouts / dropped calls.
+    Conversation history is still persisted via save_conversation_message.
+    """
+    global _voice_graph
+    if _voice_graph is None:
+        _voice_graph = builder.compile()
+    return _voice_graph
