@@ -31,22 +31,21 @@ _ALPHA_DEVS_BASELINE = [
 
 
 async def _seed_baseline_knowledge(tenant_id: str, org_name: str) -> list[tuple[str, str]]:
-    """Insert baseline FAQ chunks once so voice has something instant to speak from."""
+    """
+    Insert baseline FAQ chunks only for pure service businesses (e.g. Alpha Devs).
+    Never seed generic About blurbs for SQL/inventory tenants — that caused repeating scripts.
+    """
     from backend.agent.rag import upsert_knowledge_chunk
+    from backend.integrations.tenant_inventory import tenant_has_sql_inventory
+
+    if await tenant_has_sql_inventory(tenant_id):
+        return []
 
     org_l = (org_name or "").lower()
     tid_l = (tenant_id or "").lower()
     chunks: list[tuple[str, str]] = []
     if "alpha" in org_l or "alpha_devs" in tid_l:
         chunks = list(_ALPHA_DEVS_BASELINE)
-    elif org_name:
-        chunks = [
-            (
-                "About",
-                f"{org_name} helps customers with products and services. "
-                f"Ask what they need and offer to book a follow-up.",
-            )
-        ]
     for title, text in chunks:
         try:
             await upsert_knowledge_chunk(tenant_id, text, title=title, source="baseline_seed")

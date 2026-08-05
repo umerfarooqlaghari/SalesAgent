@@ -123,26 +123,21 @@ _ACTION_KEYWORDS = (
     "reschedule", "handoff", "human", "representative", "email", "phone",
 )
 
-_FAQ_KEYWORDS = (
-    "service", "services", "package", "packages", "pricing", "price", "offer",
-    "product", "products", "what do you", "who are you", "about", "capabilities",
-    "solutions", "how does", "consultancy", "consulting",
-)
-
-
-def _needs_tools(user_text: str, has_fact_cache: bool) -> bool:
+def _needs_tools(
+    user_text: str,
+    has_fact_cache: bool,
+    has_catalog_cache: bool = False,
+    inventory_intent: bool = False,
+) -> bool:
     text = (user_text or "").lower()
     if any(k in text for k in _ACTION_KEYWORDS):
         return True
+    # Tenant-mapped inventory: tools unless their SQL catalog is already warm
+    if inventory_intent:
+        return not has_catalog_cache
     if has_fact_cache:
-        # Knowledge and/or SQL catalog can answer FAQ / catalog questions — skip tools
         return False
     return True
-
-
-def _is_faq_question(user_text: str) -> bool:
-    text = (user_text or "").lower()
-    return any(k in text for k in _FAQ_KEYWORDS)
 
 
 async def sdr_node(state: AgentState) -> Dict[str, Any]:
@@ -183,38 +178,48 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
 
     from backend.integrations.catalog_cache import get_cached_catalog, schedule_warmup
     from backend.integrations.knowledge_cache import get_cached_knowledge, warmup_knowledge
+    from backend.integrations.tenant_inventory import (
+        format_mapped_entities_for_prompt,
+        is_inventory_question_for_tenant,
+        load_inventory_mappings,
+    )
+
+    inventory_intent = await is_inventory_question_for_tenant(tenant_id, user_text)
+    mapped = await load_inventory_mappings(tenant_id)
+    mapped_hint = format_mapped_entities_for_prompt(mapped)
+    if mapped_hint:
+        system_prompt += f"\n\n--- TENANT DATA MODEL ---\n{mapped_hint}"
 
     knowledge = get_cached_knowledge(tenant_id)
-    if not knowledge and is_voice:
-        # Voice FAQ must not wait on cold Mongo mid-turn if session warmup missed
+    if not knowledge and is_voice and not inventory_intent:
         try:
             await asyncio.wait_for(warmup_knowledge(tenant_id), timeout=1.5)
             knowledge = get_cached_knowledge(tenant_id)
         except Exception:
             pass
 
-    if knowledge:
+    if knowledge and not inventory_intent:
         system_prompt += (
-            "\n\n--- CACHED KNOWLEDGE (services/packages/about — answer from this FIRST) ---\n"
+            "\n\n--- CACHED KNOWLEDGE (company FAQ — not a substitute for live tables) ---\n"
             + knowledge
         )
 
     catalog = get_cached_catalog(tenant_id)
     if catalog:
         system_prompt += (
-            "\n\n--- CACHED CATALOG (inventory/productions — prefer over tools) ---\n"
+            "\n\n--- CACHED CATALOG (this tenant's approved SQL tables — prefer over tools) ---\n"
             + catalog
         )
     elif not is_voice:
         schedule_warmup(tenant_id)
 
-    # Live RAG only when caches miss (avoid double Mongo + hub latency on warm voice)
-    has_facts = bool(knowledge or catalog)
-    if not has_facts:
-        rag_snippets = await retrieve_context(tenant_id, user_text)
-        if rag_snippets:
-            system_prompt += f"\n\n--- RETRIEVED KNOWLEDGE (prefer for factual answers) ---\n{rag_snippets}"
-            has_facts = True
+    has_facts = bool((knowledge and not inventory_intent) or catalog)
+    if (not has_facts) or (inventory_intent and not catalog):
+        if not catalog or not knowledge:
+            rag_snippets = await retrieve_context(tenant_id, user_text)
+            if rag_snippets:
+                system_prompt += f"\n\n--- RETRIEVED KNOWLEDGE (prefer for factual answers) ---\n{rag_snippets}"
+                has_facts = True
 
     intent = state.get("intent") or "Inquiry"
     system_prompt += f"\n\nDetected intent: {intent}. Keep replies concise for low latency."
@@ -223,9 +228,13 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
             " Voice channel: ONE short spoken sentence (max ~25 words) unless they ask for a list — "
             "then at most 2 short sentences. Handle interruptions gracefully."
         )
+        if catalog and inventory_intent:
+            system_prompt += (
+                " Answer from CACHED CATALOG using this tenant's entity names/labels — "
+                "do not invent a generic products/services script."
+            )
 
-    # Voice FAQ: only the latest user turn (smaller prompt → faster Gemini)
-    if is_voice and _is_faq_question(user_text):
+    if is_voice and not inventory_intent and knowledge:
         from langchain_core.messages import HumanMessage
 
         formatted_messages = [
@@ -240,10 +249,18 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         temperature=0.1 if is_voice else 0.2,
         max_retries=1 if is_voice else 2,
     )
-    use_tools = _needs_tools(user_text, has_facts)
+    use_tools = _needs_tools(
+        user_text,
+        has_facts,
+        has_catalog_cache=bool(catalog),
+        inventory_intent=inventory_intent,
+    )
     if use_tools:
-        tools = _VOICE_FAST_TOOLS if (is_voice and has_facts) else agent_tools
-        if is_voice and not has_facts:
+        if is_voice and inventory_intent:
+            tools = list(dict.fromkeys([*_VOICE_FAST_TOOLS, query_pos_database]))
+        elif is_voice and has_facts:
+            tools = _VOICE_FAST_TOOLS
+        else:
             tools = agent_tools
         bound = llm.bind_tools(tools)
     else:

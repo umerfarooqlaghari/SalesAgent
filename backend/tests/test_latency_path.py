@@ -19,14 +19,31 @@ from backend.tenant.context import IntegrationConfigs, TenantContext, TenantSett
 
 
 def test_needs_tools_skips_when_cache_warm():
-    assert _needs_tools("What productions do you have?", has_fact_cache=True) is False
-    assert _needs_tools("Tell me about your services", has_fact_cache=True) is False
-    print("✓ positive: fact cache warm → skip tools for FAQ/catalog Q")
+    assert (
+        _needs_tools(
+            "What productions do you have?",
+            has_fact_cache=True,
+            has_catalog_cache=True,
+            inventory_intent=True,
+        )
+        is False
+    )
+    assert _needs_tools("Tell me about your company", has_fact_cache=True) is False
+    print("✓ positive: catalog/FAQ warm → skip tools")
 
 
 def test_needs_tools_required_without_cache():
-    assert _needs_tools("What productions do you have?", has_fact_cache=False) is True
-    print("✓ negative: no cache → tools still needed")
+    # Tenant-mapped inventory with no catalog must still tool-call SQL
+    assert (
+        _needs_tools(
+            "What productions do you have?",
+            has_fact_cache=True,
+            has_catalog_cache=False,
+            inventory_intent=True,
+        )
+        is True
+    )
+    print("✓ negative: inventory without catalog → tools required")
 
 
 def test_needs_tools_actions_always():
