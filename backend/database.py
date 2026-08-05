@@ -1,21 +1,10 @@
 import os
 import logging
 import sqlite3
-import dns.resolver
-
-# Monkeypatch dnspython Resolver to force reliable nameservers globally, bypassing router SERVFAIL DNS errors
-_orig_resolver_init = dns.resolver.Resolver.__init__
-def _patched_resolver_init(self, *args, **kwargs):
-    _orig_resolver_init(self, *args, **kwargs)
-    self.nameservers = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
-dns.resolver.Resolver.__init__ = _patched_resolver_init
-dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
-dns.resolver.default_resolver.nameservers = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
-
 
 from typing import Dict, Any, List, Optional
 from motor.motor_asyncio import AsyncIOMotorClient
-from .config import settings
+from .config import get_mongodb_connection_uri, settings
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +18,7 @@ class Database:
 
     def connect(self):
         if not self.client:
-            self.client = AsyncIOMotorClient(settings.MONGODB_URI)
+            self.client = AsyncIOMotorClient(get_mongodb_connection_uri())
             self.db = self.client[settings.DATABASE_NAME]
             logger.info("Connected to MongoDB Atlas")
             

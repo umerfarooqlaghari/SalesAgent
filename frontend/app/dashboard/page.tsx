@@ -46,6 +46,8 @@ export default function Dashboard() {
   const [authChecked, setAuthChecked] = useState(false);
   const [sessionUser, setSessionUser] = useState<AuthUser | null>(null);
   const [regeneratedKey, setRegeneratedKey] = useState<string | null>(null);
+  const [publishableKey, setPublishableKey] = useState<string | null>(null);
+  const [pkBusy, setPkBusy] = useState(false);
   const [regeneratingKey, setRegeneratingKey] = useState(false);
   const [threadId, setThreadId] = useState<string>("");
   const [threads, setThreads] = useState<Array<{ thread_id: string, title?: string }>>([]);
@@ -122,6 +124,17 @@ export default function Dashboard() {
       const savedKey = getStoredApiKey();
       if (savedKey) setApiKey(savedKey);
       setAuthChecked(true);
+      try {
+        const pkRes = await fetch(`${backendUrl}/api/auth/publishable-key`, {
+          headers: authHeaders(),
+        });
+        if (pkRes.ok) {
+          const pkData = await pkRes.json();
+          if (pkData.publishable_key) setPublishableKey(pkData.publishable_key);
+        }
+      } catch {
+        /* ignore */
+      }
     };
     initAuth();
   }, [router, backendUrl]);
@@ -196,7 +209,7 @@ export default function Dashboard() {
   };
 
   const handleRegenerateApiKey = async () => {
-    if (!confirm("This will invalidate your current API key. Continue?")) return;
+    if (!confirm("This will invalidate your current secret API key (sk_live_). Continue?")) return;
     setRegeneratingKey(true);
     try {
       const res = await fetch(`${backendUrl}/api/auth/regenerate-api-key`, {
@@ -212,6 +225,24 @@ export default function Dashboard() {
       alert(e instanceof Error ? e.message : "Failed to regenerate API key");
     } finally {
       setRegeneratingKey(false);
+    }
+  };
+
+  const handleRegeneratePublishableKey = async () => {
+    if (!confirm("Rotate the website publishable key (pk_live_)? Update any embeds using the old key.")) return;
+    setPkBusy(true);
+    try {
+      const res = await fetch(`${backendUrl}/api/auth/regenerate-publishable-key`, {
+        method: "POST",
+        headers: getHeaders(),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to regenerate");
+      setPublishableKey(data.publishable_key);
+    } catch (e: unknown) {
+      alert(e instanceof Error ? e.message : "Failed to regenerate publishable key");
+    } finally {
+      setPkBusy(false);
     }
   };
 
@@ -317,6 +348,15 @@ export default function Dashboard() {
             headers: { ...getHeaders() },
             body: JSON.stringify({ console_thread_id: threadIdRef.current }),
           });
+        }
+        // Prefetch catalog so first spoken answer can skip live SQL (major latency win)
+        try {
+          await fetch(`${backendUrlRef.current}/api/voice/warmup`, {
+            method: "POST",
+            headers: { ...getHeaders() },
+          });
+        } catch {
+          /* non-blocking */
         }
         const assistantId = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID || "a5b5e387-3e26-4ad0-ad0f-8454b675f1c9";
         vapiRef.current.start(assistantId, {
@@ -793,24 +833,36 @@ export default function Dashboard() {
               ✓ {tenantInfo.org_name} ({tenantInfo.tenant_id})
             </p>
           )}
-          <button
-            type="button"
-            onClick={handleRegenerateApiKey}
-            disabled={regeneratingKey}
-            className="w-full py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-lg border border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100/70 disabled:opacity-50"
-          >
-            {regeneratingKey ? "Generating…" : "Regenerate API key"}
-          </button>
-          {regeneratedKey && (
-            <div className="mt-2 rounded-lg bg-emerald-50 border border-emerald-200 p-2">
-              <p className="text-[9px] text-emerald-800 mb-1 font-bold uppercase">New API key — copy now</p>
-              <p className="font-mono text-[10px] text-indigo-600 break-all">{regeneratedKey}</p>
+          {publishableKey && (
+            <div className="mb-2 rounded-lg bg-sky-50 border border-sky-200 p-2">
+              <p className="text-[9px] text-sky-800 mb-1 font-bold uppercase">Publishable key (websites)</p>
+              <p className="font-mono text-[10px] text-sky-900 break-all select-all">{publishableKey}</p>
+              <p className="text-[9px] text-sky-600 mt-1">Safe for frontend. Embed / chat only.</p>
             </div>
           )}
-          {!apiKey && !regeneratedKey && (
-            <p className="text-[10px] text-slate-500 mt-2">
-              No API key on this device. Regenerate for voice agents.
-            </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={handleRegeneratePublishableKey}
+              disabled={pkBusy}
+              className="flex-1 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-lg border border-sky-300 text-sky-700 bg-sky-50 hover:bg-sky-100/70 disabled:opacity-50"
+            >
+              {pkBusy ? "…" : "Rotate pk"}
+            </button>
+            <button
+              type="button"
+              onClick={handleRegenerateApiKey}
+              disabled={regeneratingKey}
+              className="flex-1 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-lg border border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100/70 disabled:opacity-50"
+            >
+              {regeneratingKey ? "…" : "Rotate sk"}
+            </button>
+          </div>
+          {regeneratedKey && (
+            <div className="mt-2 rounded-lg bg-emerald-50 border border-emerald-200 p-2">
+              <p className="text-[9px] text-emerald-800 mb-1 font-bold uppercase">New secret key — copy now</p>
+              <p className="font-mono text-[10px] text-indigo-600 break-all">{regeneratedKey}</p>
+            </div>
           )}
           <div className="flex items-center justify-between mt-3 mb-1.5">
             <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">

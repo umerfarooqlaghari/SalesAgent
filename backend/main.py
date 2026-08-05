@@ -1,16 +1,5 @@
 import os
 import logging
-import dns.resolver
-
-# Monkeypatch dnspython Resolver to force reliable nameservers globally, bypassing router SERVFAIL DNS errors
-_orig_resolver_init = dns.resolver.Resolver.__init__
-def _patched_resolver_init(self, *args, **kwargs):
-    _orig_resolver_init(self, *args, **kwargs)
-    self.nameservers = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
-dns.resolver.Resolver.__init__ = _patched_resolver_init
-dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
-dns.resolver.default_resolver.nameservers = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
-
 
 from typing import Dict, Any, List, Optional, AsyncIterator
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body, Depends
@@ -21,7 +10,7 @@ import json
 
 from backend.config import settings
 from backend.tenant.context import TenantContext
-from backend.auth.dependencies import get_tenant_or_api_key
+from backend.auth.dependencies import get_tenant_or_api_key, require_secret_tenant
 from backend.auth.security import decode_access_token
 from backend.auth.service import get_user_session, seed_super_admin
 from backend.tenant.registry import (
@@ -131,9 +120,14 @@ async def startup_event():
     await ensure_all_indexes()
     await seed_default_tenant()
     await migrate_legacy_documents_to_default_tenant()
-    from backend.tenant.registry import migrate_stale_tenant_prompts, seed_default_knowledge
+    from backend.tenant.registry import (
+        ensure_publishable_keys,
+        migrate_stale_tenant_prompts,
+        seed_default_knowledge,
+    )
 
     await migrate_stale_tenant_prompts()
+    await ensure_publishable_keys()
     await seed_default_api_key()
     await seed_default_knowledge()
     await seed_super_admin()
@@ -151,11 +145,11 @@ async def shutdown_event():
     logger.info("Shutdown complete: Database connection closed.")
 
 @app.get("/api/leads")
-async def get_all_leads(tenant: TenantContext = Depends(get_tenant_or_api_key)):
+async def get_all_leads(tenant: TenantContext = Depends(require_secret_tenant)):
     return await list_leads(tenant.tenant_id)
 
 @app.get("/api/leads/{thread_id}")
-async def get_lead_by_id(thread_id: str, tenant: TenantContext = Depends(get_tenant_or_api_key)):
+async def get_lead_by_id(thread_id: str, tenant: TenantContext = Depends(require_secret_tenant)):
     lead = await get_lead(tenant.tenant_id, thread_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
@@ -168,17 +162,17 @@ async def get_lead_by_id(thread_id: str, tenant: TenantContext = Depends(get_ten
 async def update_lead_profile(
     thread_id: str,
     data: Dict[str, Any] = Body(...),
-    tenant: TenantContext = Depends(get_tenant_or_api_key),
+    tenant: TenantContext = Depends(require_secret_tenant),
 ):
     await save_lead(tenant.tenant_id, thread_id, data)
     return {"status": "success", "lead": data}
 
 @app.get("/api/conversations")
-async def get_all_conversations(tenant: TenantContext = Depends(get_tenant_or_api_key)):
+async def get_all_conversations(tenant: TenantContext = Depends(require_secret_tenant)):
     return await list_conversations(tenant.tenant_id)
 
 @app.get("/api/conversations/{thread_id}")
-async def get_thread_conversation(thread_id: str, tenant: TenantContext = Depends(get_tenant_or_api_key)):
+async def get_thread_conversation(thread_id: str, tenant: TenantContext = Depends(require_secret_tenant)):
     conv = await get_conversation(tenant.tenant_id, thread_id)
     if not conv:
         return {"thread_id": thread_id, "messages": []}
@@ -188,7 +182,7 @@ async def get_thread_conversation(thread_id: str, tenant: TenantContext = Depend
 async def update_conversation_title(
     thread_id: str,
     data: Dict[str, str] = Body(...),
-    tenant: TenantContext = Depends(get_tenant_or_api_key),
+    tenant: TenantContext = Depends(require_secret_tenant),
 ):
     title = data.get("title")
     if not title:
@@ -197,7 +191,7 @@ async def update_conversation_title(
     return {"status": "success", "thread_id": thread_id, "title": title}
 
 @app.delete("/api/conversations/{thread_id}")
-async def delete_conversation_route(thread_id: str, tenant: TenantContext = Depends(get_tenant_or_api_key)):
+async def delete_conversation_route(thread_id: str, tenant: TenantContext = Depends(require_secret_tenant)):
     await delete_conversation(tenant.tenant_id, thread_id)
     return {"status": "success", "thread_id": thread_id}
 
@@ -205,7 +199,7 @@ async def delete_conversation_route(thread_id: str, tenant: TenantContext = Depe
 async def append_typed_message(
     thread_id: str,
     data: Dict[str, Any] = Body(...),
-    tenant: TenantContext = Depends(get_tenant_or_api_key),
+    tenant: TenantContext = Depends(require_secret_tenant),
 ):
     """
     Append a user-typed message during an active voice call without running the chat agent.
@@ -404,8 +398,9 @@ async def get_vapi_public_key(tenant: TenantContext = Depends(get_tenant_or_api_
     return {"public_key": settings.VAPI_PUBLIC_KEY, "tenant_id": tenant.tenant_id}
 
 @app.get("/api/widget/config")
+@app.get("/api/embed/config")
 async def get_widget_config(tenant: TenantContext = Depends(get_tenant_or_api_key)):
-    """Returns Vapi keys and tenant scoping info for the client-side wobbly widget."""
+    """Returns Vapi keys + tenant_id for website embed widgets (API key auth)."""
     db = get_db()
     tenant_doc = await db.tenants.find_one({"tenant_id": tenant.tenant_id})
     if tenant_doc:
@@ -414,20 +409,133 @@ async def get_widget_config(tenant: TenantContext = Depends(get_tenant_or_api_ke
         if used >= allowed:
             raise HTTPException(status_code=403, detail="SaaS billing limits exceeded. Please upgrade your plan.")
 
+    from backend.integrations.catalog_cache import schedule_warmup
+
+    schedule_warmup(tenant.tenant_id)
+
     return {
         "vapi_public_key": settings.VAPI_PUBLIC_KEY,
         "vapi_assistant_id": settings.VAPI_ASSISTANT_ID,
-        "tenant_id": tenant.tenant_id
+        "tenant_id": tenant.tenant_id,
+        "org_name": tenant.org_name,
+        "backend_url": settings.DASHBOARD_URL.replace("3000", "8765") if "localhost" in settings.DASHBOARD_URL else None,
+    }
+
+
+@app.post("/api/embed/warmup")
+@app.post("/api/voice/warmup")
+async def warmup_catalog_route(tenant: TenantContext = Depends(get_tenant_or_api_key)):
+    """Prefetch mapped SQL catalogs into memory before a voice call (cuts 1–2s off first answer)."""
+    from backend.integrations.catalog_cache import warmup_catalog
+
+    result = await warmup_catalog(tenant.tenant_id, force=False)
+    return {"tenant_id": tenant.tenant_id, **result}
+
+
+@app.post("/api/embed/session")
+async def create_embed_session(
+    data: Dict[str, Any] = Body(default={}),
+    tenant: TenantContext = Depends(get_tenant_or_api_key),
+):
+    """
+    One-shot tenant website integration:
+    returns Vapi keys + tenant_id, registers a voice session, and warms catalog cache.
+    Client should start Vapi with metadata.tenant_id + metadata.console_thread_id.
+    """
+    import uuid
+
+    from backend.integrations.catalog_cache import get_cached_catalog, schedule_warmup
+
+    console_thread_id = (data or {}).get("console_thread_id") or f"embed_{uuid.uuid4().hex[:12]}"
+    await register_voice_session(tenant.tenant_id, console_thread_id)
+    # Warm in background so website embeds don't block call start
+    schedule_warmup(tenant.tenant_id)
+    cached = get_cached_catalog(tenant.tenant_id)
+
+    return {
+        "ok": True,
+        "tenant_id": tenant.tenant_id,
+        "org_name": tenant.org_name,
+        "console_thread_id": console_thread_id,
+        "vapi_public_key": settings.VAPI_PUBLIC_KEY,
+        "vapi_assistant_id": settings.VAPI_ASSISTANT_ID,
+        "warmup": {
+            "ok": True,
+            "cached": bool(cached),
+            "chars": len(cached or ""),
+            "status": "ready" if cached else "warming",
+        },
+        "metadata": {
+            "tenant_id": tenant.tenant_id,
+            "org_name": tenant.org_name,
+            "console_thread_id": console_thread_id,
+        },
+    }
+
+@app.post("/api/widget/query")
+@app.post("/api/query")
+@app.post("/query")
+async def execute_query_route(
+    data: Dict[str, Any] = Body(...),
+    tenant: TenantContext = Depends(get_tenant_or_api_key),
+):
+    """
+    Direct text query endpoint for client applications sending { "question": "..." } or { "message": "..." }.
+    Executes the Sales SDR agent and returns the response.
+    """
+    question = (data.get("question") or data.get("message") or data.get("prompt") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="'question' or 'message' field is required in request body.")
+
+    thread_id = data.get("thread_id") or f"client_query_{tenant.tenant_id}"
+
+    await save_conversation_message(tenant.tenant_id, thread_id, "user", question, source="chat")
+
+    from backend.integrations.catalog_cache import schedule_warmup
+
+    schedule_warmup(tenant.tenant_id)
+
+    agent_graph = await get_agent_graph()
+    initial_state = {
+        "messages": [HumanMessage(content=question)],
+        "thread_id": thread_id,
+        "tenant_id": tenant.tenant_id,
+    }
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "tenant_id": tenant.tenant_id,
+        }
+    }
+
+    final_state = await agent_graph.ainvoke(initial_state, config)
+
+    output_messages = final_state.get("messages", [])
+    answer = "I'm sorry, I couldn't process your request."
+    for msg in reversed(output_messages):
+        if getattr(msg, "type", None) == "ai" and getattr(msg, "content", None):
+            answer = str(msg.content)
+            break
+
+    await save_conversation_message(tenant.tenant_id, thread_id, "assistant", answer, source="chat")
+
+    return {
+        "status": "success",
+        "question": question,
+        "answer": answer,
+        "response": answer,
+        "thread_id": thread_id,
+        "tenant_id": tenant.tenant_id,
     }
 
 @app.get("/api/appointments")
-async def get_appointments(tenant: TenantContext = Depends(get_tenant_or_api_key)):
+async def get_appointments(tenant: TenantContext = Depends(require_secret_tenant)):
     """Returns all scheduled appointments from MongoDB."""
     appts = await list_appointments(tenant.tenant_id)
     return {"appointments": appts}
 
 @app.get("/api/orders")
-async def get_orders(tenant: TenantContext = Depends(get_tenant_or_api_key)):
+async def get_orders(tenant: TenantContext = Depends(require_secret_tenant)):
     """Returns all customer orders from MongoDB."""
     orders = await list_orders(tenant.tenant_id)
     return {"orders": orders}
@@ -435,7 +543,7 @@ async def get_orders(tenant: TenantContext = Depends(get_tenant_or_api_key)):
 @app.post("/api/voice/link")
 async def link_voice_call_route(
     data: Dict[str, Any] = Body(...),
-    tenant: TenantContext = Depends(get_tenant_or_api_key),
+    tenant: TenantContext = Depends(require_secret_tenant),
 ):
     """Link a Vapi call ID to the console chat thread for typed detail capture."""
     call_id = data.get("call_id")
@@ -449,13 +557,16 @@ async def link_voice_call_route(
 @app.post("/api/voice/register-session")
 async def register_voice_session_route(
     data: Dict[str, Any] = Body(...),
-    tenant: TenantContext = Depends(get_tenant_or_api_key),
+    tenant: TenantContext = Depends(require_secret_tenant),
 ):
     """Register tenant scope for a console thread before Vapi assigns a call id."""
     console_thread_id = data.get("console_thread_id")
     if not console_thread_id:
         raise HTTPException(status_code=400, detail="console_thread_id is required")
     await register_voice_session(tenant.tenant_id, console_thread_id)
+    from backend.integrations.catalog_cache import schedule_warmup
+
+    schedule_warmup(tenant.tenant_id)
     return {"status": "registered", "console_thread_id": console_thread_id, "tenant_id": tenant.tenant_id}
 
 
@@ -465,7 +576,7 @@ async def _voice_greeting(tenant_id: str) -> str:
     return f"Hello! Welcome to {name}. How can I help you today?"
 
 @app.delete("/api/voice/link/{call_id}")
-async def unlink_voice_call_route(call_id: str, tenant: TenantContext = Depends(get_tenant_or_api_key)):
+async def unlink_voice_call_route(call_id: str, tenant: TenantContext = Depends(require_secret_tenant)):
     await unlink_voice_call(call_id)
     return {"status": "unlinked", "call_id": call_id}
 
@@ -638,6 +749,7 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
         "messages": [HumanMessage(content=enriched_user_content)],
         "thread_id": agent_thread_id,
         "tenant_id": tenant_id,
+        "channel": "voice",
     }
 
     try:

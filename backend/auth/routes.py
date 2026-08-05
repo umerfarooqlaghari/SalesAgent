@@ -5,9 +5,11 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from backend.auth.dependencies import get_current_user, require_super_admin
 from backend.auth.service import (
     UserSession,
+    get_or_create_publishable_key,
     login_user,
     platform_stats,
     regenerate_api_key,
+    regenerate_publishable_key,
     register_client,
 )
 from backend.tenant.registry import resolve_tenant_by_api_key
@@ -70,12 +72,42 @@ async def auth_me(user: UserSession = Depends(get_current_user)):
 
 @router.post("/regenerate-api-key")
 async def regenerate_key(user: UserSession = Depends(get_current_user)):
-    """Issue a new API key (shown once). Requires JWT login."""
+    """Issue a new secret API key (shown once). Requires JWT login."""
     try:
         api_key = await regenerate_api_key(user.user_id)
         return {
             "api_key": api_key,
-            "message": "Save this API key now — it will not be shown again.",
+            "message": "Save this secret API key now — it will not be shown again.",
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.get("/publishable-key")
+async def get_publishable_key(user: UserSession = Depends(get_current_user)):
+    """Return the website-safe publishable key (pk_live_…). Always visible after login."""
+    if not user.tenant_id:
+        raise HTTPException(status_code=403, detail="No tenant linked to this account")
+    try:
+        pk = await get_or_create_publishable_key(user.tenant_id)
+        return {
+            "publishable_key": pk,
+            "tenant_id": user.tenant_id,
+            "org_name": user.org_name,
+            "usage": "Use in website embeds. Scoped to /api/embed/* and /api/widget/query only.",
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.post("/regenerate-publishable-key")
+async def regenerate_pk(user: UserSession = Depends(get_current_user)):
+    """Rotate the publishable website key."""
+    try:
+        pk = await regenerate_publishable_key(user.user_id)
+        return {
+            "publishable_key": pk,
+            "message": "Publishable key rotated. Update any websites using the old pk_live_ key.",
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

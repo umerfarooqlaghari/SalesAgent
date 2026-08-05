@@ -94,14 +94,30 @@ async def migrate_legacy_documents_to_default_tenant() -> None:
 
 
 async def resolve_tenant_by_api_key(api_key: str) -> Optional[TenantContext]:
+    """
+    Resolve tenant from secret (sk_) or publishable (pk_) key.
+    Sets current_key_scope to 'secret' or 'publishable'.
+    """
     if not api_key:
         return None
 
-    db = get_db()
-    key_hash = hash_api_key(api_key)
+    from backend.auth.security import is_publishable_key
+    from backend.tenant.key_scope import set_key_scope
 
+    db = get_db()
+
+    # Publishable keys are stored in plaintext (designed for browser use)
+    if is_publishable_key(api_key):
+        doc = await db.tenants.find_one({"publishable_key": api_key, "status": "active"})
+        if doc:
+            set_key_scope("publishable")
+            return TenantContext.from_document(doc)
+        return None
+
+    key_hash = hash_api_key(api_key)
     doc = await db.tenants.find_one({"api_key_hash": key_hash, "status": "active"})
     if doc:
+        set_key_scope("secret")
         return TenantContext.from_document(doc)
 
     # Legacy fallback: api_keys collection → default tenant
@@ -110,9 +126,34 @@ async def resolve_tenant_by_api_key(api_key: str) -> Optional[TenantContext]:
         tenant_id = legacy.get("tenant_id", DEFAULT_TENANT_ID)
         tenant_doc = await db.tenants.find_one({"tenant_id": tenant_id, "status": "active"})
         if tenant_doc:
+            set_key_scope("secret")
             return TenantContext.from_document(tenant_doc)
 
     return None
+
+
+async def ensure_publishable_keys() -> int:
+    """Backfill publishable keys for tenants that only have a secret key."""
+    from backend.auth.security import generate_publishable_key
+
+    db = get_db()
+    created = 0
+    async for doc in db.tenants.find({"status": "active"}):
+        if doc.get("publishable_key"):
+            continue
+        pk = generate_publishable_key()
+        await db.tenants.update_one(
+            {"tenant_id": doc["tenant_id"]},
+            {
+                "$set": {
+                    "publishable_key": pk,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+        created += 1
+        logger.info("Issued publishable key for tenant %s", doc["tenant_id"])
+    return created
 
 
 async def get_tenant_by_id(tenant_id: str) -> Optional[TenantContext]:

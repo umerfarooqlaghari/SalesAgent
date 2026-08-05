@@ -1,0 +1,22 @@
+{
+  "connections": {
+    "tenant_alpha:agent_sales_bot": {
+      "provider": "shopify",
+      "config": {
+        "shop_domain": "alpha-store.myshopify.com",
+        "access_token": "gAAAAABqRb-rH3wMbwcn0kyiL_0HJmjzmucDMNgPXGNlcqPQ7EJx_bhKskSNXVYv39sL-w2M4CQ3Bz7Ti_SLwFVbtLZvdRaF8y-4B1q1RX85liOccsVB59s="
+      }
+    }
+  },
+  "whitelists": {
+    "tenant_alpha:agent_sales_bot": {
+      "products": {
+        "table": "products",
+        "columns": {
+          "id": "id",
+          "name": "title"
+        }
+      }
+    }
+  }
+}

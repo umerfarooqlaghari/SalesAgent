@@ -9,25 +9,29 @@ from backend.adapters.sql_pos import SqlConnection
 SQL_PROVIDERS = frozenset({"postgres", "sqlserver", "mysql"})
 
 COLUMN_HINTS: Dict[str, Tuple[str, ...]] = {
-    "name": ("name", "product_name", "item_name", "title", "product", "service_name"),
+    "name": ("name", "product_name", "item_name", "title", "product", "service_name", "set_name", "production_name", "project_name"),
     "price": ("price", "unit_price", "cost", "amount", "list_price"),
     "stock": ("stock", "stock_quantity", "quantity", "qty", "inventory", "in_stock"),
-    "description": ("description", "desc", "details", "summary", "body"),
-    "id": ("id", "order_id", "pk"),
+    "description": ("description", "desc", "details", "summary", "body", "notes", "scope"),
+    "id": ("id", "order_id", "pk", "production_id", "po_id", "set_id"),
     "email": ("email", "customer_email", "email_address", "contact_email"),
     "phone": ("phone", "customer_phone", "mobile", "tel", "phone_number"),
-    "status": ("status", "state", "order_status"),
+    "status": ("status", "state", "order_status", "production_status", "po_status"),
     "total": ("total", "total_price", "amount", "grand_total", "order_total"),
     "items": ("items", "line_items", "order_items", "product_list", "details"),
-    "company": ("company", "company_name", "organization", "org_name", "account_name", "customer_name", "name"),
+    "company": ("company", "company_name", "organization", "org_name", "account_name", "customer_name", "name", "client"),
     "fit": ("fit", "is_qualified", "qualified", "is_fit", "lead_fit"),
     "date": ("date", "appt_date", "appointment_date", "scheduled_date", "event_date", "start_date"),
     "time": ("time", "appt_time", "appointment_time", "scheduled_time", "start_time", "event_time"),
+    "type": ("type", "category", "kind", "production_type", "set_type"),
+    "client": ("client", "client_name", "customer", "customer_name", "company"),
 }
 
 TABLE_HINTS: Dict[str, Tuple[str, ...]] = {
     "products_table": ("product", "products", "catalog", "items", "services", "sku", "inventory"),
-    "orders_table": ("order", "orders", "sales", "purchase", "transactions"),
+    "orders_table": ("order", "orders", "sales", "purchase", "purchases", "po", "pos", "purchaseorder", "purchase_orders", "transactions"),
+    "productions_table": ("production", "productions", "project", "projects", "job", "jobs", "show", "shows"),
+    "sets_table": ("set", "sets", "scenery", "scenic", "build", "builds", "construction"),
     "companies_table": ("company", "companies", "customer", "customers", "client", "clients", "account", "accounts", "lead", "leads"),
     "appointments_table": ("appointment", "appointments", "booking", "bookings", "schedule", "calendar", "events"),
 }
@@ -36,7 +40,9 @@ ROLE_FIELDS: Dict[str, Dict[str, Any]] = {
     "inventory": {
         "tables": [
             ("products_table", "Product catalog", ("name", "price", "stock", "description")),
-            ("orders_table", "Orders", ("id", "email", "phone", "status", "total", "items")),
+            ("productions_table", "Productions / projects", ("id", "name", "description", "status", "client", "type")),
+            ("sets_table", "Sets / scenery", ("id", "name", "description", "status", "type")),
+            ("orders_table", "Orders / purchase orders", ("id", "email", "phone", "status", "total", "items", "name", "description")),
         ],
     },
     "crm": {
@@ -166,16 +172,24 @@ def suggest_mapped_tables(category: str, tables: List[Dict[str, Any]]) -> List[D
         return result
 
     role = ROLE_FIELDS.get(category, {})
+    used_tables: set[str] = set()
     for table_key, label, logical_cols in role.get("tables", []):
         picked = _pick_table(table_names, table_key)
-        if not picked:
+        if not picked or picked in used_tables:
             continue
+        used_tables.add(picked)
         available = cols_by_table.get(picked, [])
         col_map = {}
         for logical in logical_cols:
             physical = _pick_column(available, logical)
             if physical:
                 col_map[logical] = physical
+        search = []
+        for key in ("name", "description", "title", "company", "client"):
+            if key in col_map:
+                search.append(col_map[key])
+        if not search and col_map:
+            search = [list(col_map.values())[0]]
         result.append(
             {
                 "id": f"mt_{uuid.uuid4().hex[:8]}",
@@ -183,10 +197,44 @@ def suggest_mapped_tables(category: str, tables: List[Dict[str, Any]]) -> List[D
                 "label": label,
                 "role": table_key.replace("_table", ""),
                 "enabled": True,
-                "search_columns": [],
+                "search_columns": search,
                 "columns": col_map,
             }
         )
+
+    # Surface other inventory-like tables so Production / Sets / POs aren't missed
+    if category == "inventory":
+        extra_hints = (
+            TABLE_HINTS["productions_table"]
+            + TABLE_HINTS["sets_table"]
+            + TABLE_HINTS["orders_table"]
+            + TABLE_HINTS["products_table"]
+        )
+        scored = [(t, _score_table(t, extra_hints)) for t in table_names if t not in used_tables]
+        scored.sort(key=lambda x: (-x[1], x[0]))
+        for tname, score in scored[:20]:
+            if score < 40:
+                continue
+            cols = cols_by_table.get(tname, [])
+            col_map = {c: c for c in cols[:12]}
+            search = []
+            for c in cols:
+                cn = _norm(c)
+                if any(h in cn for h in ("name", "title", "desc", "client", "status", "type")):
+                    search.append(c)
+            if not search and cols:
+                search = [cols[0]]
+            result.append(
+                {
+                    "id": f"mt_{uuid.uuid4().hex[:8]}",
+                    "table": tname,
+                    "label": tname.replace("_", " ").title(),
+                    "role": "custom",
+                    "enabled": score >= 60,
+                    "search_columns": search[:4],
+                    "columns": col_map,
+                }
+            )
     return result
 
 

@@ -417,7 +417,7 @@ export default function SqlSchemaWizard({
       const suggested = (data.suggested_mapped_tables || []) as MappedTable[];
       const fallback =
         suggested.length > 0
-          ? suggested.filter((t) => t.enabled).slice(0, 3)
+          ? suggested.filter((t) => t.enabled).slice(0, 12)
           : migrateLegacyMapped(category, { ...tableMap, ...(data.suggested_table_map || {}) });
 
       onConfigChange({
