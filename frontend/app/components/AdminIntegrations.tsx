@@ -630,14 +630,19 @@ function ConnectionFields({
                   setMessage={setMessage}
                 />
 
-                <button
-                  type="button"
-                  disabled={testing === `inventory-${src.id}`}
-                  onClick={() => testSource("inventory", src.provider, src.config, src.id)}
-                  className={ui.btnSecondary}
-                >
-                  {testing === `inventory-${src.id}` ? "Testing…" : "Test connection"}
-                </button>
+                <div className="flex flex-wrap items-center gap-3 pt-2">
+                  <button type="button" onClick={save} disabled={saving} className={ui.btnPrimary}>
+                    {saving ? "Saving…" : "Save integration"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={testing === `inventory-${src.id}`}
+                    onClick={() => testSource("inventory", src.provider, src.config, src.id)}
+                    className={ui.btnSecondary}
+                  >
+                    {testing === `inventory-${src.id}` ? "Testing…" : "Test connection"}
+                  </button>
+                </div>
               </div>
             ))}
 
@@ -714,14 +719,19 @@ function ConnectionFields({
               setMessage={setMessage}
             />
 
-            <button
-              type="button"
-              disabled={testing === "crm-crm"}
-              onClick={() => testSource("crm", integrations.crm.provider, integrations.crm.config)}
-              className={`${ui.btnSecondary} mt-4`}
-            >
-              {testing === "crm-crm" ? "Testing…" : "Test connection"}
-            </button>
+            <div className="flex flex-wrap items-center gap-3 mt-4">
+              <button type="button" onClick={save} disabled={saving} className={ui.btnPrimary}>
+                {saving ? "Saving…" : "Save integration"}
+              </button>
+              <button
+                type="button"
+                disabled={testing === "crm-crm"}
+                onClick={() => testSource("crm", integrations.crm.provider, integrations.crm.config)}
+                className={ui.btnSecondary}
+              >
+                {testing === "crm-crm" ? "Testing…" : "Test connection"}
+              </button>
+            </div>
           </SectionCard>
         )}
 
@@ -771,18 +781,23 @@ function ConnectionFields({
               setMessage={setMessage}
             />
 
-            <button
-              type="button"
-              disabled={testing === "calendar-cal"}
-              onClick={() => testSource("calendar", integrations.calendar.provider, integrations.calendar.config)}
-              className={`${ui.btnSecondary} mt-4`}
-            >
-              {testing === "calendar-cal" ? "Testing…" : "Test connection"}
-            </button>
+            <div className="flex flex-wrap items-center gap-3 mt-4">
+              <button type="button" onClick={save} disabled={saving} className={ui.btnPrimary}>
+                {saving ? "Saving…" : "Save integration"}
+              </button>
+              <button
+                type="button"
+                disabled={testing === "calendar-cal"}
+                onClick={() => testSource("calendar", integrations.calendar.provider, integrations.calendar.config)}
+                className={ui.btnSecondary}
+              >
+                {testing === "calendar-cal" ? "Testing…" : "Test connection"}
+              </button>
+            </div>
           </SectionCard>
         )}
 
-        <div className="flex flex-wrap gap-3 pt-2 pb-10 border-t border-gray-200">
+        <div className="flex flex-wrap gap-3 pt-2 pb-16 border-t border-gray-200">
           <button type="button" onClick={save} disabled={saving} className={ui.btnPrimary}>
             {saving ? "Saving…" : "Save changes"}
           </button>
@@ -804,6 +819,19 @@ function ConnectionFields({
             queries those tables live via <code className="text-[11px]">query_pos_database</code>.
           </p>
         </div>
+      </div>
+
+      {/* Sticky Floating Save Bar */}
+      <div className="fixed bottom-4 right-4 sm:right-8 z-50 flex items-center gap-3 bg-slate-900/90 backdrop-blur text-white px-5 py-3 rounded-2xl shadow-xl border border-slate-700/80 animate-in fade-in slide-in-from-bottom-4">
+        <span className="text-xs font-medium text-slate-300 hidden sm:inline">Integration settings</span>
+        <button
+          type="button"
+          onClick={save}
+          disabled={saving}
+          className="rounded-xl bg-blue-600 px-4 py-2 text-xs font-bold text-white shadow-md hover:bg-blue-500 active:scale-95 disabled:opacity-50 transition-all"
+        >
+          {saving ? "Saving…" : "Save changes"}
+        </button>
       </div>
     </div>
   );
