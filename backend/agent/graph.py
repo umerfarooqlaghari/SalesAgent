@@ -234,7 +234,14 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
                 "do not invent a generic products/services script."
             )
 
-    if is_voice and not inventory_intent and knowledge:
+    # Check if messages contain tool results (i.e., this is a post-tool re-invocation).
+    # If so, we MUST include the full history so the LLM sees tool results and doesn't
+    # re-invoke the same tool (which would cause a recursion error / "snag").
+    has_tool_messages = any(
+        getattr(m, "type", None) in ("tool",) for m in messages
+    )
+
+    if is_voice and not inventory_intent and knowledge and not has_tool_messages:
         from langchain_core.messages import HumanMessage
 
         formatted_messages = [
@@ -267,11 +274,32 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         bound = llm
 
     gathered = None
-    async for chunk in bound.astream(formatted_messages):
-        gathered = chunk if gathered is None else gathered + chunk
+    try:
+        async for chunk in bound.astream(formatted_messages):
+            gathered = chunk if gathered is None else gathered + chunk
+    except Exception as e:
+        logger.error("LLM stream error in sdr_node: %s", e, exc_info=True)
 
     if gathered is None:
-        gathered = await bound.ainvoke(formatted_messages)
+        try:
+            gathered = await bound.ainvoke(formatted_messages)
+        except Exception as e:
+            logger.error("LLM invoke fallback error in sdr_node: %s", e, exc_info=True)
+
+    # Safety net: if Gemini returned an empty response (no text, no tool calls),
+    # produce a safe fallback so the graph doesn't crash with
+    # "model output must contain either output text or tool calls".
+    if gathered is None:
+        from langchain_core.messages import AIMessage
+        gathered = AIMessage(content="I'm here to help! Could you repeat that?")
+    else:
+        content = getattr(gathered, "content", None)
+        tool_calls = getattr(gathered, "tool_calls", None)
+        has_content = bool(content and str(content).strip()) if not isinstance(content, list) else bool(content)
+        has_tools = bool(tool_calls)
+        if not has_content and not has_tools:
+            from langchain_core.messages import AIMessage
+            gathered = AIMessage(content="I'm here to help! Could you repeat that?")
 
     return {"messages": [gathered]}
 

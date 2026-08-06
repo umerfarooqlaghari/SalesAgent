@@ -777,7 +777,7 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
 
     config = {
         "configurable": {"thread_id": agent_thread_id, "tenant_id": tenant_id},
-        "recursion_limit": 6,
+        "recursion_limit": 12,
     }
     inputs = {
         "messages": [HumanMessage(content=enriched_user_content)],
@@ -832,7 +832,7 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
                 graph = await get_voice_agent_graph()
                 result = await asyncio.wait_for(
                     graph.ainvoke(inputs, config=config),
-                    timeout=5.5,
+                    timeout=9.0,
                 )
                 assistant_msg = _extract_assistant_text(result.get("messages", []))
         except asyncio.TimeoutError:
