@@ -55,7 +55,12 @@ _SHARED_RULES = """
    b) Do not end the call, hand off, or start collecting contact details from silence.
    c) After two failed understanding attempts, offer: continue by typing in chat, or human follow-up.
 
-13. **Latency / tools:**
+13. **Context Tracking (Pronouns):**
+   a) If the caller asks a vague question like "what does it do?" or "tell me more about it", ASSUME "it" refers to the product/service you just discussed.
+   b) Use `query_pos_database` to fetch the specific description/packages/timings of that product if it's missing from the cache.
+   c) Do NOT default to reciting the company FAQ (CACHED KNOWLEDGE) unless they explicitly ask about the company as a whole.
+
+14. **Latency / tools:**
    a) Questions about this tenant's mapped tables → CACHED CATALOG or `query_pos_database`.
    b) Company identity FAQ (no SQL match) → CACHED KNOWLEDGE.
    c) Book/order/CRM actions → tools. Never "let me check" fillers on voice.
