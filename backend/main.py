@@ -115,7 +115,17 @@ app.include_router(billing_router)
 # paired with credentials). Embed/widget routes DO need to be callable from
 # arbitrary customer websites, but they authenticate with a publishable key,
 # never cookies/credentials — so they get their own credential-less policy.
-_EMBED_PATH_PREFIXES = ("/api/embed", "/api/widget", "/api/voice/public-key", "/api/query")
+# Must list every route reachable via enforce_minutes_quota/get_tenant_or_api_key
+# (publishable-key-eligible) — a route that doesn't match one of these prefixes
+# silently falls back to the ALLOWED_ORIGINS-restricted dashboard policy.
+_EMBED_PATH_PREFIXES = (
+    "/api/embed",
+    "/api/widget",
+    "/api/voice/public-key",
+    "/api/voice/warmup",
+    "/api/query",
+    "/query",
+)
 
 
 def _dashboard_allowed_origins() -> list[str]:
