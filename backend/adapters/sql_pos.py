@@ -285,13 +285,15 @@ class SqlPOSAdapter:
             lines = [f"- {r[0]}: Price={r[1]}, In Stock={r[2]} ({r[3]})" for r in rows]
             return "Product Catalog:\n" + "\n".join(lines)
 
-        # Capability / experience questions should hit production / sets / PO tables too
         experience_terms = {
             "production", "productions", "set", "sets", "scenery", "scenic",
             "po", "purchase", "order", "orders", "project", "projects",
             "experience", "capability", "capabilities", "service", "services",
             "film", "tv", "event", "events", "construction",
         }
+        q_words = set(re.findall(r"\w+", q_clean)) if q_clean else set()
+        is_capability_query = bool(q_words & experience_terms)
+
         # Determine category intention from query
         service_terms = {"service", "services", "package", "packages", "pricing", "cost", "costs", "plan", "plans", "development", "ecommerce", "e-commerce", "ai", "ml", "engineering"}
         product_terms = {"product", "products", "mentore", "grabengo", "catalog", "item", "items", "tool", "tools", "software", "sku", "skus"}
