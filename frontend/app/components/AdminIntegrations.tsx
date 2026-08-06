@@ -341,97 +341,20 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
   const crmCategory = schemas.find((c) => c.id === "crm");
   const calCategory = schemas.find((c) => c.id === "calendar");
 
-  const renderConnectionFields = (
-    categoryId: string,
-    category: CategorySchema | undefined,
-    providerId: string,
-    config: Record<string, unknown>,
-    onConfigChange: (cfg: Record<string, unknown>) => void,
-    sourceId?: string
-  ) => {
-    const provider = category?.providers.find((p) => p.id === providerId);
-    if (!provider) return null;
-    const isSql = SQL_PROVIDERS.has(providerId);
-    const fields = isSql ? provider.fields.filter((f) => f.key !== "table_map") : provider.fields;
-
-    return (
-      <div className="space-y-4">
-        {provider.description && <p className="text-sm text-gray-500">{provider.description}</p>}
-
-        {isSql && (
-          <div className={`${ui.card} p-5`}>
-            <h4 className="text-sm font-semibold text-gray-900 mb-4">Connection details</h4>
-            <div className="grid sm:grid-cols-2 gap-4">
-              {fields.map((field, idx) => (
-                <div key={`${field.key}-${idx}`} className={field.type === "boolean" ? "sm:col-span-2" : ""}>
-                  {field.type !== "boolean" && (
-                    <label className={ui.label}>
-                      {field.label}
-                      {field.required && <span className="text-red-500 ml-0.5">*</span>}
-                    </label>
-                  )}
-                  <FieldInput
-                    field={field}
-                    value={config[field.key]}
-                    onChange={(v) => onConfigChange({ ...config, [field.key]: v })}
-                  />
-                  {field.help_text && <p className={ui.hint}>{field.help_text}</p>}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {!isSql &&
-          fields.map((field, idx) => (
-            <div key={`${field.key}-${idx}`}>
-              {field.type !== "boolean" && (
-                <label className={ui.label}>
-                  {field.label}
-                  {field.required && <span className="text-red-500 ml-0.5">*</span>}
-                </label>
-              )}
-              <FieldInput
-                field={field}
-                value={config[field.key]}
-                onChange={(v) => onConfigChange({ ...config, [field.key]: v })}
-              />
-              {field.help_text && <p className={ui.hint}>{field.help_text}</p>}
-            </div>
-          ))}
-
-        {isSql && (
-          <SqlSchemaWizard
-            category={categoryId}
-            provider={providerId}
-            config={config}
-            onConfigChange={onConfigChange}
-            backendUrl={backendUrl}
-            getHeaders={getHeaders}
-            sourceId={sourceId}
-            discoveryKey={`${categoryId}-${sourceId ?? providerId}`}
-            discovered={getDiscovery(`${categoryId}-${sourceId ?? providerId}`)}
-            onDiscovered={(data) => setDiscovery(`${categoryId}-${sourceId ?? providerId}`, data)}
-            onMessage={(msg) => setMessage(msg, msg.toLowerCase().includes("found") || msg.toLowerCase().includes("success") ? true : msg ? null : null)}
-          />
-        )}
-      </div>
-    );
-  };
-
-  const SectionCard = ({
-    title,
-    description,
-    enabled,
-    onEnabledChange,
-    children,
-  }: {
-    title: string;
-    description?: string;
-    enabled: boolean;
-    onEnabledChange: (v: boolean) => void;
-    children: React.ReactNode;
-  }) => (
+function SectionCard({
+  title,
+  description,
+  enabled,
+  onEnabledChange,
+  children,
+}: {
+  title: string;
+  description?: string;
+  enabled: boolean;
+  onEnabledChange: (v: boolean) => void;
+  children: React.ReactNode;
+}) {
+  return (
     <section className={`${ui.card} overflow-hidden`}>
       <div className={`${ui.cardHeader} flex flex-wrap items-center justify-between gap-3 bg-white`}>
         <div>
@@ -443,16 +366,119 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
       <div className="p-5">{children}</div>
     </section>
   );
+}
+
+function ConnectionFields({
+  categoryId,
+  category,
+  providerId,
+  config,
+  onConfigChange,
+  backendUrl,
+  getHeaders,
+  sourceId,
+  getDiscovery,
+  setDiscovery,
+  setMessage,
+}: {
+  categoryId: string;
+  category: CategorySchema | undefined;
+  providerId: string;
+  config: Record<string, unknown>;
+  onConfigChange: (cfg: Record<string, unknown>) => void;
+  backendUrl: string;
+  getHeaders: () => Record<string, string>;
+  sourceId?: string;
+  getDiscovery: (key: string) => DiscoverResult | null;
+  setDiscovery: (key: string, data: DiscoverResult | null) => void;
+  setMessage: (msg: string, ok: boolean | null) => void;
+}) {
+  const provider = category?.providers.find((p) => p.id === providerId);
+  if (!provider) return null;
+  const isSql = SQL_PROVIDERS.has(providerId);
+  const fields = isSql ? provider.fields.filter((f) => f.key !== "table_map") : provider.fields;
+
+  return (
+    <div className="space-y-4">
+      {provider.description && <p className="text-sm text-gray-500">{provider.description}</p>}
+
+      {isSql && (
+        <div className={`${ui.card} p-5`}>
+          <h4 className="text-sm font-semibold text-gray-900 mb-4">Connection details</h4>
+          <div className="grid sm:grid-cols-2 gap-4">
+            {fields.map((field, idx) => (
+              <div key={`${field.key}-${idx}`} className={field.type === "boolean" ? "sm:col-span-2" : ""}>
+                {field.type !== "boolean" && (
+                  <label className={ui.label}>
+                    {field.label}
+                    {field.required && <span className="text-red-500 ml-0.5">*</span>}
+                  </label>
+                )}
+                <FieldInput
+                  field={field}
+                  value={config[field.key]}
+                  onChange={(v) => onConfigChange({ ...config, [field.key]: v })}
+                />
+                {field.help_text && <p className={ui.hint}>{field.help_text}</p>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!isSql &&
+        fields.map((field, idx) => (
+          <div key={`${field.key}-${idx}`}>
+            {field.type !== "boolean" && (
+              <label className={ui.label}>
+                {field.label}
+                {field.required && <span className="text-red-500 ml-0.5">*</span>}
+              </label>
+            )}
+            <FieldInput
+              field={field}
+              value={config[field.key]}
+              onChange={(v) => onConfigChange({ ...config, [field.key]: v })}
+            />
+            {field.help_text && <p className={ui.hint}>{field.help_text}</p>}
+          </div>
+        ))}
+
+      {isSql && (
+        <SqlSchemaWizard
+          category={categoryId}
+          provider={providerId}
+          config={config}
+          onConfigChange={onConfigChange}
+          backendUrl={backendUrl}
+          getHeaders={getHeaders}
+          sourceId={sourceId}
+          discoveryKey={`${categoryId}-${sourceId ?? providerId}`}
+          discovered={getDiscovery(`${categoryId}-${sourceId ?? providerId}`)}
+          onDiscovered={(data) => setDiscovery(`${categoryId}-${sourceId ?? providerId}`, data)}
+          onMessage={(msg) => setMessage(msg, msg.toLowerCase().includes("found") || msg.toLowerCase().includes("success") ? true : msg ? null : null)}
+        />
+      )}
+    </div>
+  );
+}
 
   return (
     <div className="flex-1 overflow-y-auto bg-slate-50 min-h-full">
       <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8 space-y-6">
-        <header className="border-b border-gray-200 pb-6">
-          <h2 className="text-2xl font-semibold text-gray-900 tracking-tight">Integrations</h2>
-          <p className="text-sm text-gray-500 mt-1">
-            Connect your databases and services. Organization:{" "}
-            <code className="rounded bg-gray-100 px-1.5 py-0.5 text-xs font-mono text-gray-700">{tenantId}</code>
-          </p>
+        <header className="border-b border-gray-200 pb-6 flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <h2 className="text-2xl font-semibold text-gray-900 tracking-tight">Integrations</h2>
+            <p className="text-sm text-gray-500 mt-1">
+              Connect your databases and services. Organization:{" "}
+              <code className="rounded bg-gray-100 px-1.5 py-0.5 text-xs font-mono text-gray-700">{tenantId}</code>
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            <button type="button" onClick={save} disabled={saving} className={ui.btnPrimary}>
+              {saving ? "Saving…" : "Save changes"}
+            </button>
+          </div>
         </header>
 
         {status && (
@@ -586,11 +612,23 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
                   </button>
                 </div>
 
-                {renderConnectionFields("inventory", invCategory, src.provider, src.config, (cfg) => {
-                  const sources = [...integrations.inventory.sources];
-                  sources[idx] = { ...src, config: cfg };
-                  setIntegrations({ ...integrations, inventory: { ...integrations.inventory, sources } });
-                }, src.id)}
+                <ConnectionFields
+                  categoryId="inventory"
+                  category={invCategory}
+                  providerId={src.provider}
+                  config={src.config}
+                  onConfigChange={(cfg) => {
+                    const sources = [...integrations.inventory.sources];
+                    sources[idx] = { ...src, config: cfg };
+                    setIntegrations({ ...integrations, inventory: { ...integrations.inventory, sources } });
+                  }}
+                  backendUrl={backendUrl}
+                  getHeaders={getHeaders}
+                  sourceId={src.id}
+                  getDiscovery={getDiscovery}
+                  setDiscovery={setDiscovery}
+                  setMessage={setMessage}
+                />
 
                 <button
                   type="button"
@@ -663,13 +701,18 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
               </select>
             </div>
 
-            {renderConnectionFields(
-              "crm",
-              crmCategory,
-              integrations.crm.provider,
-              integrations.crm.config,
-              (cfg) => setIntegrations({ ...integrations, crm: { ...integrations.crm, config: cfg } })
-            )}
+            <ConnectionFields
+              categoryId="crm"
+              category={crmCategory}
+              providerId={integrations.crm.provider}
+              config={integrations.crm.config}
+              onConfigChange={(cfg) => setIntegrations({ ...integrations, crm: { ...integrations.crm, config: cfg } })}
+              backendUrl={backendUrl}
+              getHeaders={getHeaders}
+              getDiscovery={getDiscovery}
+              setDiscovery={setDiscovery}
+              setMessage={setMessage}
+            />
 
             <button
               type="button"
@@ -715,13 +758,18 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
               </select>
             </div>
 
-            {renderConnectionFields(
-              "calendar",
-              calCategory,
-              integrations.calendar.provider,
-              integrations.calendar.config,
-              (cfg) => setIntegrations({ ...integrations, calendar: { ...integrations.calendar, config: cfg } })
-            )}
+            <ConnectionFields
+              categoryId="calendar"
+              category={calCategory}
+              providerId={integrations.calendar.provider}
+              config={integrations.calendar.config}
+              onConfigChange={(cfg) => setIntegrations({ ...integrations, calendar: { ...integrations.calendar, config: cfg } })}
+              backendUrl={backendUrl}
+              getHeaders={getHeaders}
+              getDiscovery={getDiscovery}
+              setDiscovery={setDiscovery}
+              setMessage={setMessage}
+            />
 
             <button
               type="button"
