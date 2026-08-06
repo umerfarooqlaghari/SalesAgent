@@ -124,6 +124,128 @@ function FieldInput({
   );
 }
 
+function SectionCard({
+  title,
+  description,
+  enabled,
+  onEnabledChange,
+  children,
+}: {
+  title: string;
+  description?: string;
+  enabled: boolean;
+  onEnabledChange: (v: boolean) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className={`${ui.card} overflow-hidden`}>
+      <div className={`${ui.cardHeader} flex flex-wrap items-center justify-between gap-3 bg-white`}>
+        <div>
+          <h3 className="text-base font-semibold text-gray-900">{title}</h3>
+          {description && <p className="text-sm text-gray-500 mt-0.5">{description}</p>}
+        </div>
+        <Toggle checked={enabled} onChange={onEnabledChange} label="Enabled" />
+      </div>
+      <div className="p-5">{children}</div>
+    </section>
+  );
+}
+
+function ConnectionFields({
+  categoryId,
+  category,
+  providerId,
+  config,
+  onConfigChange,
+  backendUrl,
+  getHeaders,
+  sourceId,
+  getDiscovery,
+  setDiscovery,
+  setMessage,
+}: {
+  categoryId: string;
+  category: CategorySchema | undefined;
+  providerId: string;
+  config: Record<string, unknown>;
+  onConfigChange: (cfg: Record<string, unknown>) => void;
+  backendUrl: string;
+  getHeaders: () => Record<string, string>;
+  sourceId?: string;
+  getDiscovery: (key: string) => DiscoverResult | null;
+  setDiscovery: (key: string, data: DiscoverResult | null) => void;
+  setMessage: (msg: string, ok: boolean | null) => void;
+}) {
+  const provider = category?.providers.find((p) => p.id === providerId);
+  if (!provider) return null;
+  const isSql = SQL_PROVIDERS.has(providerId);
+  const fields = isSql ? provider.fields.filter((f) => f.key !== "table_map") : provider.fields;
+
+  return (
+    <div className="space-y-4">
+      {provider.description && <p className="text-sm text-gray-500">{provider.description}</p>}
+
+      {isSql && (
+        <div className={`${ui.card} p-5`}>
+          <h4 className="text-sm font-semibold text-gray-900 mb-4">Connection details</h4>
+          <div className="grid sm:grid-cols-2 gap-4">
+            {fields.map((field, idx) => (
+              <div key={`${field.key}-${idx}`} className={field.type === "boolean" ? "sm:col-span-2" : ""}>
+                {field.type !== "boolean" && (
+                  <label className={ui.label}>
+                    {field.label}
+                    {field.required && <span className="text-red-500 ml-0.5">*</span>}
+                  </label>
+                )}
+                <FieldInput
+                  field={field}
+                  value={config[field.key]}
+                  onChange={(v) => onConfigChange({ ...config, [field.key]: v })}
+                />
+                {field.help_text && <p className={ui.hint}>{field.help_text}</p>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!isSql &&
+        fields.map((field, idx) => (
+          <div key={`${field.key}-${idx}`}>
+            {field.type !== "boolean" && (
+              <label className={ui.label}>
+                {field.label}
+                {field.required && <span className="text-red-500 ml-0.5">*</span>}
+              </label>
+            )}
+            <FieldInput
+              field={field}
+              value={config[field.key]}
+              onChange={(v) => onConfigChange({ ...config, [field.key]: v })}
+            />
+            {field.help_text && <p className={ui.hint}>{field.help_text}</p>}
+          </div>
+        ))}
+
+      {isSql && (
+        <SqlSchemaWizard
+          category={categoryId}
+          provider={providerId}
+          config={config}
+          onConfigChange={onConfigChange}
+          backendUrl={backendUrl}
+          getHeaders={getHeaders}
+          sourceId={sourceId}
+          discoveryKey={`${categoryId}-${sourceId ?? providerId}`}
+          discovered={getDiscovery(`${categoryId}-${sourceId ?? providerId}`)}
+          onDiscovered={(data) => setDiscovery(`${categoryId}-${sourceId ?? providerId}`, data)}
+          onMessage={(msg) => setMessage(msg, msg.toLowerCase().includes("found") || msg.toLowerCase().includes("success") ? true : msg ? null : null)}
+        />
+      )}
+    </div>
+  );
+}
+
 export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
   const [schemas, setSchemas] = useState<CategorySchema[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationsState | null>(null);
@@ -340,128 +462,6 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
   const invCategory = schemas.find((c) => c.id === "inventory");
   const crmCategory = schemas.find((c) => c.id === "crm");
   const calCategory = schemas.find((c) => c.id === "calendar");
-
-function SectionCard({
-  title,
-  description,
-  enabled,
-  onEnabledChange,
-  children,
-}: {
-  title: string;
-  description?: string;
-  enabled: boolean;
-  onEnabledChange: (v: boolean) => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className={`${ui.card} overflow-hidden`}>
-      <div className={`${ui.cardHeader} flex flex-wrap items-center justify-between gap-3 bg-white`}>
-        <div>
-          <h3 className="text-base font-semibold text-gray-900">{title}</h3>
-          {description && <p className="text-sm text-gray-500 mt-0.5">{description}</p>}
-        </div>
-        <Toggle checked={enabled} onChange={onEnabledChange} label="Enabled" />
-      </div>
-      <div className="p-5">{children}</div>
-    </section>
-  );
-}
-
-function ConnectionFields({
-  categoryId,
-  category,
-  providerId,
-  config,
-  onConfigChange,
-  backendUrl,
-  getHeaders,
-  sourceId,
-  getDiscovery,
-  setDiscovery,
-  setMessage,
-}: {
-  categoryId: string;
-  category: CategorySchema | undefined;
-  providerId: string;
-  config: Record<string, unknown>;
-  onConfigChange: (cfg: Record<string, unknown>) => void;
-  backendUrl: string;
-  getHeaders: () => Record<string, string>;
-  sourceId?: string;
-  getDiscovery: (key: string) => DiscoverResult | null;
-  setDiscovery: (key: string, data: DiscoverResult | null) => void;
-  setMessage: (msg: string, ok: boolean | null) => void;
-}) {
-  const provider = category?.providers.find((p) => p.id === providerId);
-  if (!provider) return null;
-  const isSql = SQL_PROVIDERS.has(providerId);
-  const fields = isSql ? provider.fields.filter((f) => f.key !== "table_map") : provider.fields;
-
-  return (
-    <div className="space-y-4">
-      {provider.description && <p className="text-sm text-gray-500">{provider.description}</p>}
-
-      {isSql && (
-        <div className={`${ui.card} p-5`}>
-          <h4 className="text-sm font-semibold text-gray-900 mb-4">Connection details</h4>
-          <div className="grid sm:grid-cols-2 gap-4">
-            {fields.map((field, idx) => (
-              <div key={`${field.key}-${idx}`} className={field.type === "boolean" ? "sm:col-span-2" : ""}>
-                {field.type !== "boolean" && (
-                  <label className={ui.label}>
-                    {field.label}
-                    {field.required && <span className="text-red-500 ml-0.5">*</span>}
-                  </label>
-                )}
-                <FieldInput
-                  field={field}
-                  value={config[field.key]}
-                  onChange={(v) => onConfigChange({ ...config, [field.key]: v })}
-                />
-                {field.help_text && <p className={ui.hint}>{field.help_text}</p>}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {!isSql &&
-        fields.map((field, idx) => (
-          <div key={`${field.key}-${idx}`}>
-            {field.type !== "boolean" && (
-              <label className={ui.label}>
-                {field.label}
-                {field.required && <span className="text-red-500 ml-0.5">*</span>}
-              </label>
-            )}
-            <FieldInput
-              field={field}
-              value={config[field.key]}
-              onChange={(v) => onConfigChange({ ...config, [field.key]: v })}
-            />
-            {field.help_text && <p className={ui.hint}>{field.help_text}</p>}
-          </div>
-        ))}
-
-      {isSql && (
-        <SqlSchemaWizard
-          category={categoryId}
-          provider={providerId}
-          config={config}
-          onConfigChange={onConfigChange}
-          backendUrl={backendUrl}
-          getHeaders={getHeaders}
-          sourceId={sourceId}
-          discoveryKey={`${categoryId}-${sourceId ?? providerId}`}
-          discovered={getDiscovery(`${categoryId}-${sourceId ?? providerId}`)}
-          onDiscovered={(data) => setDiscovery(`${categoryId}-${sourceId ?? providerId}`, data)}
-          onMessage={(msg) => setMessage(msg, msg.toLowerCase().includes("found") || msg.toLowerCase().includes("success") ? true : msg ? null : null)}
-        />
-      )}
-    </div>
-  );
-}
 
   return (
     <div className="flex-1 overflow-y-auto bg-slate-50 min-h-full">
