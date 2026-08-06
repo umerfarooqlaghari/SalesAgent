@@ -19,3 +19,4 @@ class AgentState(TypedDict):
     thread_id: str
     tenant_id: str
     channel: NotRequired[str]  # "voice" | "chat"
+    tool_rounds: NotRequired[int]      # V04: hard cap on agent<->tools loops

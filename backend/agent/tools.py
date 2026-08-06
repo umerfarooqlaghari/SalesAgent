@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import logging
 from typing import Optional
@@ -121,8 +122,13 @@ async def search_crm(company: str, config: RunnableConfig) -> str:
     from backend.database import get_db
 
     db = get_db()
+    # V14: `company` is transcribed caller speech. Unescaped, "." matches any lead
+    # and "(a+)+$" is a ReDoS against the Mongo server.
+    safe_company = re.escape((company or "").strip()[:64])
+    if not safe_company:
+        return "I didn't catch the company name — could you say it again?"
     lead = await db.leads.find_one(
-        {"tenant_id": tenant.tenant_id, "company": {"$regex": company, "$options": "i"}}
+        {"tenant_id": tenant.tenant_id, "company": {"$regex": safe_company, "$options": "i"}}
     )
     if lead:
         return f"Found CRM Record: Company={lead.get('company')}, Status={lead.get('status')}, Fit={lead.get('fit')}"

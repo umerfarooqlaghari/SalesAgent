@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import re
 from typing import Literal, Dict, Any
 
 from langchain_core.messages import BaseMessage, SystemMessage
@@ -48,6 +50,69 @@ agent_tools = [
     get_typed_chat_details,
 ]
 tool_node = build_parallel_tool_node(agent_tools)
+
+
+MAX_TOOL_ROUNDS = 3
+
+# Tools whose return string is already caller-ready prose. After these run there
+# is nothing for a second LLM pass to add, so we end the turn and speak the tool
+# result directly — removes a full Gemini round-trip (~800-1500ms) per booking.
+TERMINAL_TOOLS = {
+    "book_appointment",
+    "place_order",
+    "cancel_appointment",
+    "reschedule_appointment",
+    "cancel_order",
+    "handoff_to_human",
+}
+
+
+# Order matters: doubled braces are consumed first so `{{company}}` collapses to a
+# literal `{company}` exactly as str.format would, instead of being substituted.
+_PLACEHOLDER_RE = re.compile(r"\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def safe_format_prompt(template: str, **values) -> str:
+    """
+    V03: substitute ONLY the placeholders we actually supply, and leave every
+    other brace alone.
+
+    Tenant system prompts are free text typed into the admin UI. str.format
+    raises on a single stray '{' (a JSON example, "{price}", a code snippet, an
+    unbalanced brace), and that exception used to escape sdr_node and surface to
+    the caller as "Sorry, I hit a small snag" on every turn, permanently, for
+    that tenant.
+
+    A regex pass cannot raise, and — unlike a try/except around str.format — it
+    still substitutes the real placeholders in a template that also happens to
+    contain unbalanced braces.
+    """
+    if not template:
+        return ""
+
+    def _sub(match):
+        token = match.group(0)
+        if token == "{{":
+            return "{"
+        if token == "}}":
+            return "}"
+        key = match.group(1)
+        if key in values:
+            return str(values[key])
+        return token   # unknown placeholder: leave it visible, don't crash
+
+    return _PLACEHOLDER_RE.sub(_sub, template)
+
+
+def _tool_call_signatures(msg) -> set:
+    sigs = set()
+    for tc in (getattr(msg, "tool_calls", None) or []):
+        try:
+            args = json.dumps(tc.get("args", {}), sort_keys=True, default=str)
+        except Exception:
+            args = str(tc.get("args", {}))
+        sigs.add((tc.get("name"), args))
+    return sigs
 
 
 def _tenant_id_from_state(state: AgentState) -> str:
@@ -159,7 +224,8 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
 
     ctx = await get_tenant_by_id(tenant_id)
     prompt_template = await get_tenant_system_prompt(tenant_id, SYSTEM_PROMPT)
-    system_prompt = prompt_template.format(
+    system_prompt = safe_format_prompt(
+        prompt_template,
         thread_id=thread_id,
         company=company,
         job_title=job_title,
@@ -234,29 +300,29 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
                 "do not invent a generic products/services script."
             )
 
-    # Check if messages contain tool results (i.e., this is a post-tool re-invocation).
-    # If so, we MUST include the full history so the LLM sees tool results and doesn't
-    # re-invoke the same tool (which would cause a recursion error / "snag").
-    has_tool_messages = any(
-        getattr(m, "type", None) in ("tool",) for m in messages
-    )
-
-    if is_voice and not inventory_intent and knowledge and not has_tool_messages:
-        from langchain_core.messages import HumanMessage
-
-        formatted_messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_text),
-        ]
-    else:
-        formatted_messages = [SystemMessage(content=system_prompt)] + list(messages)
+    # V02: history is NEVER truncated. The voice graph has no checkpointer, so the
+    # inbound message list (built from Vapi's own payload) is the only memory the
+    # agent has. Dropping it made multi-turn collection impossible and caused the
+    # model to re-invoke the same tool every turn.
+    formatted_messages = [SystemMessage(content=system_prompt)] + list(messages)
 
     llm = get_chat_llm(
         streaming=True,
         temperature=0.1 if is_voice else 0.2,
         max_retries=1 if is_voice else 2,
     )
-    use_tools = _needs_tools(
+    # R5: once the tool budget is spent, force a final answer. Ending the turn
+    # here instead would leave a raw tool result as the last message — which the
+    # voice path either cannot speak (data tools are not in _SPEAKABLE_TOOLS) or
+    # would read out verbatim as a SQL dump.
+    budget_spent = (state.get("tool_rounds") or 0) >= MAX_TOOL_ROUNDS
+    if budget_spent:
+        system_prompt += (
+            "\n\nYou already have the tool results you need. Answer the caller now "
+            "in one or two short sentences using ONLY those results. Do not call any more tools."
+        )
+
+    use_tools = (not budget_spent) and _needs_tools(
         user_text,
         has_facts,
         has_catalog_cache=bool(catalog),
@@ -301,6 +367,10 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
             from langchain_core.messages import AIMessage
             gathered = AIMessage(content="I'm here to help! Could you repeat that?")
 
+    # R7: the built prompt is deliberately NOT returned into state. The chat graph
+    # is checkpointed to Mongo, and the prompt carries the full catalog + knowledge
+    # blocks — persisting it would balloon every checkpoint write. P03's reuse is
+    # handled with a request-scoped memo instead.
     return {"messages": [gathered]}
 
 
@@ -308,12 +378,24 @@ async def post_tool_node(state: AgentState) -> Dict[str, Any]:
     messages = state.get("messages", [])
     thread_id = state.get("thread_id", "default_thread")
     tenant_id = _tenant_id_from_state(state)
+    is_voice = str(thread_id).startswith("vapi_") or state.get("channel") == "voice"
 
     requires_handoff = state.get("requires_handoff", False)
     for msg in reversed(messages):
         if getattr(msg, "type", None) == "tool" and getattr(msg, "name", None) == "handoff_to_human":
             requires_handoff = True
             break
+
+    out: Dict[str, Any] = {
+        "requires_handoff": requires_handoff,
+        # V04: every trip through here is one agent<->tools round.
+        "tool_rounds": (state.get("tool_rounds") or 0) + 1,
+    }
+
+    # P06: router_node already skips this Mongo read on voice to save 100-400ms;
+    # doing it here on every tool round undid that saving.
+    if is_voice:
+        return out
 
     lead_doc = await get_lead(tenant_id, thread_id)
     lead_profile = state.get("lead_profile")
@@ -325,8 +407,8 @@ async def post_tool_node(state: AgentState) -> Dict[str, Any]:
             status=lead_doc.get("status", "New"),
             fit=lead_doc.get("fit"),
         )
-
-    return {"requires_handoff": requires_handoff, "lead_profile": lead_profile}
+    out["lead_profile"] = lead_profile
+    return out
 
 
 def route_after_agent(state: AgentState) -> Literal["tools", "__end__"]:
@@ -334,12 +416,56 @@ def route_after_agent(state: AgentState) -> Literal["tools", "__end__"]:
     if not messages:
         return END
     last_message = messages[-1]
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        return "tools"
-    return END
+    sig = _tool_call_signatures(last_message)
+    if not sig:
+        return END
+
+    # V04: hard budget, independent of LangGraph's recursion_limit.
+    if (state.get("tool_rounds") or 0) >= MAX_TOOL_ROUNDS:
+        logger.warning("Tool-round budget exhausted (%s) — ending turn", MAX_TOOL_ROUNDS)
+        return END
+
+    # V05: the model re-requesting a call it already made means the tool result
+    # did not satisfy it (e.g. book_appointment returning "I still need ...").
+    # Looping again cannot help and used to run into GraphRecursionError, which
+    # surfaced to the caller as the generic "snag" message.
+    prior = set()
+    for m in messages[:-1]:
+        prior |= _tool_call_signatures(m)
+    repeated = sig & prior
+    if repeated:
+        logger.warning("Repeated tool call %s — ending turn instead of looping", repeated)
+        return END
+
+    return "tools"
 
 
 def route_after_post_tool(state: AgentState) -> Literal["sdr_agent", "__end__"]:
+    messages = state.get("messages", [])
+    thread_id = state.get("thread_id", "")
+    is_voice = str(thread_id).startswith("vapi_") or state.get("channel") == "voice"
+
+    # R6: P14 is VOICE-ONLY. The voice endpoint reads the final message via
+    # _extract_assistant_text and can speak a ToolMessage directly. The dashboard
+    # WebSocket streams on_chat_model_stream tokens instead, so ending on a
+    # ToolMessage would leave the chat UI with nothing to render and nothing to
+    # persist to the transcript.
+    if not is_voice:
+        return "sdr_agent"
+
+    # P14: terminal tools already return caller-ready prose. Looping back for a
+    # paraphrase costs a whole extra LLM round-trip on the voice critical path.
+    tool_names = []
+    for msg in reversed(messages):
+        if getattr(msg, "type", None) != "tool":
+            break
+        tool_names.append(getattr(msg, "name", None))
+    if tool_names and all(n in TERMINAL_TOOLS for n in tool_names):
+        return END
+
+    # R5: when the budget is spent we still go back to the agent — sdr_node
+    # unbinds the tools, so it is forced to answer from the results it already
+    # has instead of dead-ending on a raw tool dump.
     return "sdr_agent"
 
 

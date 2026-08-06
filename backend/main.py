@@ -49,6 +49,27 @@ from backend.tenant.registry import get_tenant_by_id
 from backend.billing.routes import router as billing_router
 
 active_connections: Dict[str, WebSocket] = {}
+
+# V15: asyncio.create_task returns a task the loop only weakly references. Without
+# keeping a strong reference it can be garbage-collected mid-flight, silently
+# dropping the write.
+_BACKGROUND_TASKS: set = set()
+
+
+def spawn_background(coro, *, label: str = "task"):
+    import asyncio as _asyncio
+
+    task = _asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+
+    def _done(t):
+        _BACKGROUND_TASKS.discard(t)
+        exc = t.exception() if not t.cancelled() else None
+        if exc:
+            logger.error("Background %s failed: %s", label, exc, exc_info=exc)
+
+    task.add_done_callback(_done)
+    return task
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("backend.main")
 
@@ -67,52 +88,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_THOUGHT_OPEN = "<thought>"
+_THOUGHT_CLOSE = "</thought>"
+
+
 class ThoughtTokenParser:
+    """
+    Incremental splitter for `<thought>...</thought>` reasoning vs spoken response.
+
+    V13: the previous implementation re-scanned a growing buffer on every token
+    (O(n^2)) and indexed `emitted_response_idx` against a different substring in
+    each branch, so any prose emitted BEFORE a late `<thought>` tag was silently
+    dropped. This version is a single-pass state machine with one cursor.
+
+    Note: nothing in the current prompts instructs the model to emit these tags,
+    so in practice everything is treated as response text — which is exactly the
+    behaviour the dashboard needs. Kept working so the feature can be switched on
+    by adding the instruction to the system prompt.
+    """
+
     def __init__(self):
-        self.buffer = ""
-        self.emitted_thought_idx = 0
-        self.emitted_response_idx = 0
-        
+        self._pending = ""
+        self._inside = False
+
     def feed(self, token: str):
-        self.buffer += token
-        
-        # Check if we are inside <thought> ... </thought>
-        thought_start = self.buffer.find("<thought>")
-        thought_end = self.buffer.find("</thought>")
-        
-        thoughts_to_emit = ""
-        response_to_emit = ""
-        
-        if thought_start != -1:
-            if thought_end != -1:
-                # Both start and end found
-                thought_content = self.buffer[thought_start + 9:thought_end]
-                response_content = self.buffer[thought_end + 10:]
-                
-                new_thought = thought_content[self.emitted_thought_idx:]
-                self.emitted_thought_idx += len(new_thought)
-                if new_thought:
-                    thoughts_to_emit = new_thought
-                    
-                new_response = response_content[self.emitted_response_idx:]
-                self.emitted_response_idx += len(new_response)
-                if new_response:
-                    response_to_emit = new_response
+        self._pending += token or ""
+        thoughts, response = [], []
+
+        while True:
+            if self._inside:
+                idx = self._pending.find(_THOUGHT_CLOSE)
+                if idx == -1:
+                    # Hold back enough characters that a tag split across tokens
+                    # is never mistaken for content.
+                    keep = len(_THOUGHT_CLOSE) - 1
+                    if len(self._pending) > keep:
+                        thoughts.append(self._pending[:-keep])
+                        self._pending = self._pending[-keep:]
+                    break
+                thoughts.append(self._pending[:idx])
+                self._pending = self._pending[idx + len(_THOUGHT_CLOSE):]
+                self._inside = False
             else:
-                # Start found, but no end yet
-                thought_content = self.buffer[thought_start + 9:]
-                new_thought = thought_content[self.emitted_thought_idx:]
-                self.emitted_thought_idx += len(new_thought)
-                if new_thought:
-                    thoughts_to_emit = new_thought
-        else:
-            # No thought tag found
-            new_response = self.buffer[self.emitted_response_idx:]
-            self.emitted_response_idx += len(new_response)
-            if new_response:
-                response_to_emit = new_response
-                
-        return thoughts_to_emit, response_to_emit
+                idx = self._pending.find(_THOUGHT_OPEN)
+                if idx == -1:
+                    keep = len(_THOUGHT_OPEN) - 1
+                    if len(self._pending) > keep:
+                        response.append(self._pending[:-keep])
+                        self._pending = self._pending[-keep:]
+                    break
+                response.append(self._pending[:idx])
+                self._pending = self._pending[idx + len(_THOUGHT_OPEN):]
+                self._inside = True
+
+        return "".join(thoughts), "".join(response)
+
+    def flush(self):
+        """Emit whatever is still held back. Call once the stream is complete."""
+        tail, self._pending = self._pending, ""
+        return (tail, "") if self._inside else ("", tail)
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -239,7 +274,8 @@ async def websocket_endpoint(
         return
 
     tenant_id = tenant.tenant_id
-    active_connections[thread_id] = websocket
+    conn_key = f"{tenant_id}:{thread_id}"   # V16: thread_id alone collides across tenants
+    active_connections[conn_key] = websocket
     logger.info(f"WebSocket client connected for thread: {thread_id} (tenant={tenant_id})")
 
     try:
@@ -345,6 +381,15 @@ async def websocket_endpoint(
                             "output": str(output)
                         })
                 
+                # V13: emit any characters the parser held back for tag-boundary safety
+                tail_thought, tail_response = parser.flush()
+                if tail_thought:
+                    full_thought += tail_thought
+                    await websocket.send_json({"type": "thought", "token": tail_thought})
+                if tail_response:
+                    full_response += tail_response
+                    await websocket.send_json({"type": "response", "token": tail_response})
+
                 # Save assistant response to DB
                 if full_response or full_thought:
                     await save_conversation_message(
@@ -391,7 +436,7 @@ async def websocket_endpoint(
     except Exception as e:
         logger.error(f"WebSocket error on thread {thread_id}: {e}", exc_info=True)
     finally:
-        active_connections.pop(thread_id, None)
+        active_connections.pop(conn_key, None)
 
 @app.get("/api/voice/public-key")
 async def get_vapi_public_key(tenant: TenantContext = Depends(get_tenant_or_api_key)):
@@ -617,6 +662,63 @@ async def _get_typed_chat_context(tenant_id: str, console_thread_id: str, since_
         f"{lines}"
     )
 
+_VAPI_MAX_TURNS = 12
+
+# V11: total wall-clock budget for one spoken turn, shared by the fast path and
+# the graph. Vapi drops calls that stall; keep this comfortably under its limit.
+VOICE_TURN_DEADLINE = 7.0
+VOICE_FASTPATH_TIMEOUT = 2.0
+
+
+def _vapi_content_to_text(raw) -> str:
+    """Vapi content is either a string or a list of {type,text} parts."""
+    if isinstance(raw, list):
+        return " ".join(
+            p.get("text", "") if isinstance(p, dict) else str(p) for p in raw
+        ).strip()
+    return str(raw or "").strip()
+
+
+def _vapi_messages_to_lc(messages_list: list, max_turns: int = _VAPI_MAX_TURNS) -> list:
+    """
+    Convert Vapi's OpenAI-format history into LangChain messages.
+
+    The voice graph has no checkpointer (checkpoint I/O per turn was a major
+    cause of Vapi timeouts), so Vapi's own payload is our ONLY source of
+    conversation memory. Dropping it makes multi-turn detail collection
+    ("name, then email, then phone") structurally impossible and causes the
+    agent to re-invoke the same tool every turn.
+    """
+    from langchain_core.messages import AIMessage
+
+    out: list = []
+    for m in (messages_list or [])[-(max_turns * 2):]:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        # Vapi sends its own system prompt; we build ours in sdr_node.
+        if role not in ("user", "assistant"):
+            continue
+        content = _vapi_content_to_text(m.get("content", ""))
+        if not content:
+            continue
+        out.append(HumanMessage(content=content) if role == "user" else AIMessage(content=content))
+    return out
+
+
+# Tools whose return value is caller-ready prose. Everything else (SQL dumps,
+# CRM records, sanitised error refs) must never be read aloud verbatim.
+_SPEAKABLE_TOOLS = {
+    "book_appointment",
+    "place_order",
+    "cancel_appointment",
+    "reschedule_appointment",
+    "cancel_order",
+    "lookup_appointments",
+    "handoff_to_human",
+}
+
+
 def _extract_assistant_text(messages_out: list) -> str:
     """Pull the last speakable assistant text from graph output (handles tool-call turns)."""
     import re
@@ -639,9 +741,11 @@ def _extract_assistant_text(messages_out: list) -> str:
             if text:
                 return text
 
-    # Fall back to any tool result (all tools return user-facing strings)
+    # V08: fall back ONLY to tools whose output is written for a caller. Data tools
+    # can return SQL dumps, and adapter errors can embed a connection string with
+    # the tenant's database password — neither may ever reach TTS.
     for msg in reversed(messages_out):
-        if getattr(msg, "type", None) == "tool":
+        if getattr(msg, "type", None) == "tool" and getattr(msg, "name", None) in _SPEAKABLE_TOOLS:
             text = _normalize_content(getattr(msg, "content", ""))
             if text:
                 return text
@@ -690,12 +794,8 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     # Find last user message from Vapi payload
     user_content = ""
     for msg in reversed(messages_list):
-        if msg.get("role") == "user":
-            raw = msg.get("content", "")
-            if isinstance(raw, list):
-                user_content = " ".join(p.get("text", "") for p in raw if isinstance(p, dict))
-            else:
-                user_content = str(raw)
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            user_content = _vapi_content_to_text(msg.get("content", ""))
             break
 
     # Pull typed chat context when console is linked to this call
@@ -767,8 +867,9 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     # Persist user turn in background — do not block first TTS byte
     import asyncio
 
-    asyncio.create_task(
-        save_conversation_message(tenant_id, agent_thread_id, "user", user_content, source="voice")
+    spawn_background(
+        save_conversation_message(tenant_id, agent_thread_id, "user", user_content, source="voice"),
+        label="persist-voice-user-turn",
     )
 
     from backend.agent.graph import get_voice_agent_graph
@@ -779,8 +880,17 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
         "configurable": {"thread_id": agent_thread_id, "tenant_id": tenant_id},
         "recursion_limit": 12,
     }
+    # V01: Vapi already sends the full conversation — use it as the memory the
+    # checkpointer-less voice graph otherwise lacks. The final human turn is
+    # replaced with the typed-chat-enriched version.
+    _history = _vapi_messages_to_lc(messages_list)
+    if _history and isinstance(_history[-1], HumanMessage):
+        _history[-1] = HumanMessage(content=enriched_user_content)
+    else:
+        _history.append(HumanMessage(content=enriched_user_content))
+
     inputs = {
-        "messages": [HumanMessage(content=enriched_user_content)],
+        "messages": _history,
         "thread_id": agent_thread_id,
         "tenant_id": tenant_id,
         "channel": "voice",
@@ -800,58 +910,105 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
         return f"data: {json.dumps(chunk)}\n\n"
 
     async def _timeout_fallback() -> str:
+        """
+        V09: this must never name a specific industry. The previous hardcoded
+        "AI ERP, computer vision, SaaS, ed-tech..." line was Alpha's service list
+        and was being spoken to every tenant whose knowledge cache was cold.
+        """
         knowledge = get_cached_knowledge(tenant_id) or ""
         if knowledge:
             snippet = " ".join(knowledge.split())[:220]
-            return f"We offer {snippet}"
+            return f"Here's a quick overview: {snippet}"
+        try:
+            ctx = await get_tenant_by_id(tenant_id)
+            org = (ctx.org_name if ctx else None) or "our team"
+        except Exception:
+            org = "our team"
         return (
-            "We build AI ERP, computer vision, SaaS, ed-tech, and sales intelligence solutions. "
-            "Want details on any one of those?"
+            "Let me make sure I get that exactly right for you. "
+            f"Would you like someone from {org} to follow up, or can I help with something else?"
         )
 
     # Stream IMMEDIATELY so Vapi does not drop the call waiting on Gemini/Mongo
     async def stream_response() -> AsyncIterator[str]:
+        from langgraph.errors import GraphRecursionError
+
+        from backend.agent.graph import _ACTION_KEYWORDS
+
         yield _sse(role="assistant")
         assistant_msg = ""
         t0 = asyncio.get_event_loop().time()
-        try:
-            # FAQ fast-path: no LangGraph, no tools — prevents "let me check" stalls
-            fast = await asyncio.wait_for(
-                try_voice_faq_answer(tenant_id, enriched_user_content),
-                timeout=4.5,
-            )
-            if fast:
-                assistant_msg = fast
-                logger.info(
-                    "Voice FAQ fast-path ok call_id=%s tenant=%s ms=%.0f",
-                    call_id,
-                    tenant_id,
-                    (asyncio.get_event_loop().time() - t0) * 1000,
+
+        def _remaining() -> float:
+            # V11: ONE budget for the whole turn. Previously the fast path (4.5s)
+            # and the graph (9s) were sequential, so worst case was 13.5s — well
+            # past what Vapi tolerates.
+            return max(0.5, VOICE_TURN_DEADLINE - (asyncio.get_event_loop().time() - t0))
+
+        _low = (enriched_user_content or "").lower()
+        looks_like_action = any(k in _low for k in _ACTION_KEYWORDS)
+
+        # FAQ fast-path: no LangGraph, no tools — prevents "let me check" stalls.
+        # Skipped for action intents (book/order/cancel), which always need tools.
+        fast = None
+        if not looks_like_action:
+            try:
+                fast = await asyncio.wait_for(
+                    try_voice_faq_answer(tenant_id, enriched_user_content),
+                    timeout=min(VOICE_FASTPATH_TIMEOUT, _remaining()),
                 )
-            else:
+            except asyncio.TimeoutError:
+                # V10: a slow fast path must fall THROUGH to the real agent, not
+                # short-circuit the whole turn into a canned fallback.
+                logger.info("Voice fast-path timed out call_id=%s — falling through to graph", call_id)
+            except Exception:
+                logger.debug("Voice fast-path errored — falling through to graph", exc_info=True)
+
+        if fast:
+            assistant_msg = fast
+            logger.info(
+                "Voice FAQ fast-path ok call_id=%s tenant=%s ms=%.0f",
+                call_id,
+                tenant_id,
+                (asyncio.get_event_loop().time() - t0) * 1000,
+            )
+        else:
+            try:
                 graph = await get_voice_agent_graph()
                 result = await asyncio.wait_for(
                     graph.ainvoke(inputs, config=config),
-                    timeout=9.0,
+                    timeout=_remaining(),
                 )
                 assistant_msg = _extract_assistant_text(result.get("messages", []))
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Vapi agent timed out call_id=%s tenant=%s — using knowledge fallback",
-                call_id,
-                tenant_id,
-            )
-            assistant_msg = await _timeout_fallback()
-        except Exception as e:
-            logger.error("Vapi agent error for %s: %s", agent_thread_id, e, exc_info=True)
-            error_msg = str(e)
-            if "RESOURCE_EXHAUSTED" in error_msg or "429" in error_msg:
-                assistant_msg = (
-                    "I'm experiencing a brief system delay. "
-                    "Could you repeat that, or I can have a team member call you back?"
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Vapi agent timed out call_id=%s tenant=%s — using knowledge fallback",
+                    call_id,
+                    tenant_id,
                 )
-            else:
-                assistant_msg = "Sorry, I hit a small snag. Could you say that again?"
+                assistant_msg = await _timeout_fallback()
+            except GraphRecursionError:
+                # V06: this is not a TimeoutError, so it used to land in the generic
+                # handler below and surface as "Sorry, I hit a small snag."
+                logger.error(
+                    "Graph recursion limit hit call_id=%s tenant=%s thread=%s",
+                    call_id,
+                    tenant_id,
+                    agent_thread_id,
+                )
+                assistant_msg = (
+                    "Let me make sure I have this right — could you repeat that last detail for me?"
+                )
+            except Exception as e:
+                logger.error("Vapi agent error for %s: %s", agent_thread_id, e, exc_info=True)
+                error_msg = str(e)
+                if "RESOURCE_EXHAUSTED" in error_msg or "429" in error_msg:
+                    assistant_msg = (
+                        "I'm experiencing a brief system delay. "
+                        "Could you repeat that, or I can have a team member call you back?"
+                    )
+                else:
+                    assistant_msg = "Sorry, I hit a small snag. Could you say that again?"
 
         if not (assistant_msg or "").strip():
             assistant_msg = await _timeout_fallback()

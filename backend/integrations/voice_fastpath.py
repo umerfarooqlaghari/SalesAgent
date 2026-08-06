@@ -89,7 +89,9 @@ def _extract_entity_names(catalog: str, limit: int = 8) -> List[str]:
         if not raw or raw.startswith("["):
             continue
         # Skip pure key=value dumps already handled above
-        m = re.match(r"^([^(=\n]{2,80?}?)(?:\s*\(|$)", raw)
+        # V12: was {2,80?} — not a valid quantifier, so Python matched it as a
+        # literal and this branch never fired, killing bullet-format name extraction.
+        m = re.match(r"^([^(=\n]{2,80}?)(?:\s*\(|$)", raw)
         if not m:
             continue
         val = m.group(1).strip().strip("\"'")
