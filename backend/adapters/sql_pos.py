@@ -388,11 +388,27 @@ class SqlPOSAdapter:
                 rows = await self.sql.fetch_all(sql, params or None)
                 if rows:
                     lines = []
+                    name_keys = {
+                        "name", "title", "product_name", "set_name",
+                        "production_name", "project_name", "item_name", "service_name",
+                    }
                     for r in rows:
-                        pairs = ", ".join(
-                            f"{field_names[i]}={r[i]}" for i in range(min(len(r), len(field_names)))
-                        )
-                        lines.append(f"  • {pairs}")
+                        display_name = None
+                        extras = []
+                        for i in range(min(len(r), len(field_names))):
+                            key = str(field_names[i])
+                            val = r[i]
+                            if val is None or str(val).strip() == "":
+                                continue
+                            if key.lower() in name_keys and display_name is None:
+                                display_name = str(val).strip()
+                            elif key.lower() not in {"id"}:
+                                extras.append(f"{key}: {val}")
+                        if display_name:
+                            suffix = f" ({', '.join(extras[:3])})" if extras else ""
+                            lines.append(f"  • {display_name}{suffix}")
+                        elif extras:
+                            lines.append(f"  • {', '.join(extras[:4])}")
                     results.append(f"[{label}]\n" + "\n".join(lines))
                 elif is_generic or is_capability_query:
                     results.append(f"[{label}] — table is connected but returned no rows.")
