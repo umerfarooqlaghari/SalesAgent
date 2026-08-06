@@ -196,18 +196,34 @@ async def query_pos_database(
     For order status, provide order_id plus customer_email or customer_phone.
     """
     tenant = await _load_tenant_context(config or {})
+    tenant_id = tenant.tenant_id
+
+    cache_key = f"q:{product_query or ''}_ord:{order_id or ''}_em:{customer_email or ''}_ph:{customer_phone or ''}"
+    from backend.integrations.query_cache import get_query_cache, set_query_cache
+
+    cached_res = await get_query_cache(tenant_id, cache_key)
+    if cached_res is not None:
+        logger.info("Serving query_pos_database from cache for tenant %s (%s)", tenant_id, cache_key)
+        return cached_res
+
     pos = AdapterFactory.pos(tenant)
 
     try:
         if order_id is not None:
-            return await pos.get_order_status(
+            res = await pos.get_order_status(
                 int(order_id),
                 customer_email=customer_email,
                 customer_phone=customer_phone,
             )
-        if product_query is not None:
-            return await pos.list_products(product_query)
-        return await pos.list_products(None)
+        elif product_query is not None:
+            res = await pos.list_products(product_query)
+        else:
+            res = await pos.list_products(None)
+
+        if res and not str(res).startswith("Inventory query failed"):
+            await set_query_cache(tenant_id, cache_key, res, ttl=900)
+
+        return res
     except Exception as e:
         logger.error("query_pos_database failed for tenant %s: %s", tenant.tenant_id, e, exc_info=True)
         return f"Inventory query failed: {e}"

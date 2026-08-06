@@ -5,6 +5,7 @@ import asyncio
 import os
 import sys
 import time
+import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -57,6 +58,7 @@ def test_spoken_knowledge_clean():
     print("✓ knowledge spoken clean")
 
 
+@pytest.mark.asyncio
 async def test_inventory_does_not_dump_raw_sql():
     tid = "construct_test"
     catalog = (
@@ -94,6 +96,7 @@ async def test_inventory_does_not_dump_raw_sql():
     print("✓ inventory answer is spoken English, not SQL dump")
 
 
+@pytest.mark.asyncio
 async def test_company_faq_non_sql():
     tid = "alpha_faq"
     kc._CACHE[tid] = {

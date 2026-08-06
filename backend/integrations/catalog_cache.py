@@ -34,6 +34,12 @@ def get_cached_catalog(tenant_id: str) -> Optional[str]:
 
 def invalidate_catalog(tenant_id: str) -> None:
     _CACHE.pop(tenant_id, None)
+    from backend.integrations.query_cache import invalidate_tenant_query_cache
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(invalidate_tenant_query_cache(tenant_id))
+    except Exception:
+        pass
 
 
 async def warmup_catalog(tenant_id: str, force: bool = False) -> Dict[str, Any]:

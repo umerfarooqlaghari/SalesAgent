@@ -282,7 +282,7 @@ function MappedTableCard({
                 onChange={(e) => {
                   const name = e.target.value;
                   const cols = columnsForTable(tables, name);
-                  onUpdate(newMappedFromTable(name, cols));
+                  onUpdate({ ...newMappedFromTable(name, cols), id: entry.id });
                 }}
               >
                 {tables.map((t) => (
