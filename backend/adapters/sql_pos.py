@@ -292,8 +292,16 @@ class SqlPOSAdapter:
             "experience", "capability", "capabilities", "service", "services",
             "film", "tv", "event", "events", "construction",
         }
-        q_words = set(re.findall(r"\w+", q_clean)) if q_clean else set()
-        is_capability_query = bool(q_words & experience_terms)
+        # Determine category intention from query
+        service_terms = {"service", "services", "package", "packages", "pricing", "cost", "costs", "plan", "plans", "development", "ecommerce", "e-commerce", "ai", "ml", "engineering"}
+        product_terms = {"product", "products", "mentore", "grabengo", "catalog", "item", "items", "tool", "tools", "software", "sku", "skus"}
+        blog_terms = {"blog", "blogs", "post", "posts", "article", "articles", "news"}
+        faq_terms = {"faq", "faqs", "question", "questions", "answer", "answers", "help"}
+
+        asking_services = bool(q_words & service_terms)
+        asking_products = bool(q_words & product_terms)
+        asking_blogs = bool(q_words & blog_terms)
+        asking_faqs = bool(q_words & faq_terms)
 
         results = []
         for mapping in mapped:
@@ -301,6 +309,21 @@ class SqlPOSAdapter:
             role = (mapping.get("role") or "").lower()
             label = mapping.get("label") or table
             if not table or mapping.get("enabled") is False:
+                continue
+
+            t_lower = table.lower()
+            l_lower = label.lower()
+            t_combined = f"{t_lower} {l_lower} {role}"
+            t_words = set(re.findall(r"\w+", t_combined))
+
+            # Specific category routing: skip non-matching table families when user asks for specific category
+            if asking_services and not ({"service", "services", "package", "packages", "pricing", "plan", "content", "card", "cards"} & t_words):
+                continue
+            if asking_products and not ({"product", "products", "item", "items", "catalog", "content", "card", "cards"} & t_words):
+                continue
+            if asking_blogs and not ({"blog", "blogs", "post", "posts", "article", "articles"} & t_words):
+                continue
+            if asking_faqs and not ({"faq", "faqs", "question", "questions", "answer", "answers"} & t_words):
                 continue
 
             # Skip appointments unless explicitly asked
@@ -333,9 +356,6 @@ class SqlPOSAdapter:
             if not select_parts:
                 continue
 
-            t_lower = table.lower()
-            l_lower = label.lower()
-            t_words = set(re.findall(r"\w+", t_lower + " " + l_lower + " " + role))
             table_matched = bool(q_words & t_words) or any(
                 qw in tw or tw in qw for qw in q_words for tw in t_words if len(qw) > 2 and len(tw) > 2
             )
@@ -391,6 +411,7 @@ class SqlPOSAdapter:
                     name_keys = {
                         "name", "title", "product_name", "set_name",
                         "production_name", "project_name", "item_name", "service_name",
+                        "question",
                     }
                     for r in rows:
                         display_name = None
@@ -405,10 +426,11 @@ class SqlPOSAdapter:
                             elif key.lower() not in {"id"}:
                                 extras.append(f"{key}: {val}")
                         if display_name:
-                            suffix = f" ({', '.join(extras[:3])})" if extras else ""
+                            # Retain all rich details (description, content, features, hero text, answers)
+                            suffix = f" ({', '.join(extras)})" if extras else ""
                             lines.append(f"  • {display_name}{suffix}")
                         elif extras:
-                            lines.append(f"  • {', '.join(extras[:4])}")
+                            lines.append(f"  • {', '.join(extras)}")
                     results.append(f"[{label}]\n" + "\n".join(lines))
                 elif is_generic or is_capability_query:
                     results.append(f"[{label}] — table is connected but returned no rows.")

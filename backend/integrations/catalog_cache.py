@@ -74,11 +74,13 @@ async def warmup_catalog(tenant_id: str, force: bool = False) -> Dict[str, Any]:
                 logger.warning("Catalog warmup %s failed for %s: %s", label, tenant_id, e)
 
         await _fetch("broad", None)
-        # Parallel probes with short timeouts — don't block call start
+        # Parallel probes for mapped categories — pre-warm low-latency memory
         await asyncio.gather(
-            _fetch("productions", "productions"),
-            _fetch("sets", "production sets"),
+            _fetch("services", "services"),
             _fetch("products", "products"),
+            _fetch("packages", "packages"),
+            _fetch("blog", "blog posts"),
+            _fetch("faqs", "faqs"),
         )
 
         text = "\n\n".join(chunks).strip()

@@ -306,6 +306,9 @@ class IntegrationService:
 
         hub_sync = await IntegrationService.sync_to_adapter_hub(tenant_id, existing)
         view = await IntegrationService.get_admin_view(tenant_id)
+        from backend.integrations.catalog_cache import invalidate_catalog
+        invalidate_catalog(tenant_id)
+
         if hub_sync:
             view["adapter_hub_sync"] = hub_sync
         return view

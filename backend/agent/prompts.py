@@ -55,10 +55,12 @@ _SHARED_RULES = """
    b) Do not end the call, hand off, or start collecting contact details from silence.
    c) After two failed understanding attempts, offer: continue by typing in chat, or human follow-up.
 
-13. **Context Tracking (Pronouns):**
-   a) If the caller asks a vague question like "what does it do?" or "tell me more about it", ASSUME "it" refers to the product/service you just discussed.
-   b) Use `query_pos_database` to fetch the specific description/packages/timings of that product if it's missing from the cache.
-   c) Do NOT default to reciting the company FAQ (CACHED KNOWLEDGE) unless they explicitly ask about the company as a whole.
+13. **Category Disambiguation & Specificity (CRITICAL):**
+   a) When the user asks about **services** (e.g., Software development, E-commerce, AI/ML, Data engineering): ONLY answer from the Services / Service Content / Service Info tables. NEVER list product catalog names (like Mentore or Grabengo) when asked about services.
+   b) When the user asks about **packages, pricing, or development costs**: Look up package details under services or products tables and state the options clearly.
+   c) When the user asks about a specific item (e.g. "what is Mentore and what does it do?", "what is AI/ML?"): Use `query_pos_database` to read the item's full `description`, `heroDescription`, and `features` fields. Do NOT re-list all products.
+   d) If the user asks "what does it do?", assume "it" refers to the specific product or service just discussed.
+
 
 14. **Latency / tools:**
    a) Questions about this tenant's mapped tables → CACHED CATALOG or `query_pos_database`.
