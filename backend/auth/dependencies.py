@@ -27,6 +27,12 @@ async def get_current_user(
     session = await get_user_session(payload["sub"])
     if not session:
         raise HTTPException(status_code=401, detail="User not found")
+
+    # S18: a password reset bumps token_version so every JWT issued before it
+    # stops working immediately, instead of staying valid for its full 72h.
+    if payload.get("tver", 0) != session.token_version:
+        raise HTTPException(status_code=401, detail="Session expired — please log in again")
+
     return session
 
 
@@ -57,7 +63,8 @@ async def get_tenant_or_api_key(
         payload = decode_access_token(token)
         if payload and payload.get("sub"):
             session = await get_user_session(payload["sub"])
-            if session and session.tenant_id:
+            # S18: reject a JWT issued before a password reset bumped token_version.
+            if session and payload.get("tver", 0) == session.token_version and session.tenant_id:
                 tenant = await get_tenant_by_id(session.tenant_id)
                 if tenant:
                     set_key_scope("jwt")

@@ -163,9 +163,19 @@ async def discover_integration_schema(
             existing_config,
         )
     except ValueError as e:
+        # S17: our own guard messages (e.g. private/link-local host refusal)
+        # are safe to show as-is.
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        import logging
+        import uuid
+
+        correlation_id = uuid.uuid4().hex[:12]
+        logging.getLogger(__name__).exception("Schema discovery failed [%s]", correlation_id)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Connection failed. Check your connection details and try again. Reference: {correlation_id}",
+        ) from e
 
 
 @router.get("/knowledge")

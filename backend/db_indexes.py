@@ -13,18 +13,35 @@ logger = logging.getLogger(__name__)
 
 
 async def ensure_all_indexes() -> None:
-    """Create all application indexes (safe to call on every startup)."""
-    await _ensure_tenant_indexes()
-    await _ensure_operational_indexes()
-    await _ensure_knowledge_indexes()
-    await _ensure_voice_indexes()
+    """
+    Create all application indexes (safe to call on every startup).
+
+    A17: each block runs independently — a DuplicateKeyError from one unique
+    index (e.g. a legacy doc missing the indexed field) must not prevent every
+    later index from ever being created.
+    """
+    for step in (
+        _ensure_tenant_indexes,
+        _ensure_operational_indexes,
+        _ensure_knowledge_indexes,
+        _ensure_voice_indexes,
+    ):
+        try:
+            await step()
+        except Exception:
+            logger.exception("Index step %s failed — continuing with the rest", step.__name__)
     logger.info("All MongoDB indexes ensured.")
 
 
 async def _ensure_tenant_indexes() -> None:
     db = get_db()
     await db.tenants.create_index("tenant_id", unique=True, name="tenants_tenant_id")
-    await db.tenants.create_index("api_key_hash", unique=True, name="tenants_api_key_hash")
+    # A17: unique without sparse means a second tenant doc missing api_key_hash
+    # (publishable-key-only, or mid-migration) raises DuplicateKeyError on two
+    # nulls and used to abort every index created after this one.
+    await db.tenants.create_index(
+        "api_key_hash", unique=True, sparse=True, name="tenants_api_key_hash"
+    )
     await db.tenants.create_index(
         "publishable_key",
         unique=True,
@@ -36,10 +53,25 @@ async def _ensure_tenant_indexes() -> None:
     await db.api_keys.create_index("key", name="api_keys_key")
     await db.api_keys.create_index("tenant_id", name="api_keys_tenant_id")
 
-    await db.users.create_index("email", unique=True, name="users_email")
-    await db.users.create_index("user_id", unique=True, name="users_user_id")
+    await db.users.create_index("email", unique=True, sparse=True, name="users_email")
+    await db.users.create_index("user_id", unique=True, sparse=True, name="users_user_id")
     await db.users.create_index([("tenant_id", 1)], name="users_tenant_id")
     await db.users.create_index("role", name="users_role")
+    # S22: every bogus reset-token/verification-token attempt full-scanned the
+    # users collection; combined with no rate limiting (see S13) that alone
+    # could pin the DB.
+    await db.users.create_index(
+        "reset_token_hash", unique=True, sparse=True, name="users_reset_token_hash"
+    )
+    await db.users.create_index(
+        "verify_token_hash", unique=True, sparse=True, name="users_verify_token_hash"
+    )
+    await db.tenants.create_index(
+        "stripe_customer_id", unique=True, sparse=True, name="tenants_stripe_customer_id"
+    )
+    await db.tenants.create_index(
+        "stripe_subscription_id", unique=True, sparse=True, name="tenants_stripe_subscription_id"
+    )
 
 
 async def _ensure_operational_indexes() -> None:
@@ -110,6 +142,8 @@ async def _ensure_operational_indexes() -> None:
     )
 
     # LangGraph checkpoint collections — scoped lookups by thread
+    # T09: thread_id reaches the checkpointer namespaced as "<tenant_id>::<thread_id>",
+    # so this index is tenant-partitioned by prefix.
     await db.checkpoints.create_index("thread_id", name="checkpoints_thread_id")
     await db.writes.create_index("thread_id", name="writes_thread_id")
 
@@ -162,8 +196,23 @@ async def _ensure_voice_indexes() -> None:
         [("tenant_id", 1), ("console_thread_id", 1)],
         name="voice_tenant_console_thread",
     )
+    # T14: kept globally unique so resolve_voice_thread can look a session up by
+    # console_thread_id alone (the Vapi webhook has no authenticated tenant).
+    # Cross-tenant hijack is blocked by the ownership checks in
+    # register_voice_session / link_voice_call. See T15 for the remaining
+    # pre-claim denial-of-service, which needs server-generated ids.
     await db.voice_call_sessions.create_index(
         "console_thread_id",
         unique=True,
         name="voice_session_console_thread",
+    )
+    await db.voice_call_sessions.create_index(
+        [("tenant_id", 1), ("console_thread_id", 1)],
+        name="voice_session_tenant_console_thread",
+    )
+    # S02: enforces the end-of-call-report idempotency check in the /webhook
+    # route — a retried or replayed report for the same call_id must not
+    # double-count billed minutes.
+    await db.voice_billing_events.create_index(
+        "call_id", unique=True, name="voice_billing_events_call_id"
     )

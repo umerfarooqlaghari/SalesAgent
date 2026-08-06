@@ -90,20 +90,31 @@ async def upsert_knowledge_chunk(
 ) -> str:
     from datetime import datetime, timezone
     import uuid
+    from pymongo import ReturnDocument
 
     db = get_db()
-    chunk_id = str(uuid.uuid4())
-    await db.tenant_knowledge.insert_one(
+    now = datetime.now(timezone.utc).isoformat()
+    # A02: this used to be a plain insert_one with a fresh uuid4 despite the
+    # name "upsert", so re-seeding (baseline FAQ, admin re-save) duplicated
+    # rows without bound. Key on (tenant_id, source, title); $setOnInsert only
+    # takes effect when the filter finds nothing, so an existing row keeps its
+    # original chunk_id/created_at.
+    doc = await db.tenant_knowledge.find_one_and_update(
+        {"tenant_id": tenant_id, "source": source, "title": title},
         {
-            "chunk_id": chunk_id,
-            "tenant_id": tenant_id,
-            "title": title,
-            "text": text.strip(),
-            "source": source,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+            "$set": {
+                "tenant_id": tenant_id,
+                "title": title,
+                "text": text.strip(),
+                "source": source,
+                "updated_at": now,
+            },
+            "$setOnInsert": {"chunk_id": str(uuid.uuid4()), "created_at": now},
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
     )
-    return chunk_id
+    return doc["chunk_id"]
 
 
 async def list_knowledge(tenant_id: str, limit: int = 50) -> List[Dict[str, Any]]:

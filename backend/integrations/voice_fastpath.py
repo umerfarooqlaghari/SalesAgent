@@ -14,7 +14,9 @@ from typing import List, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from backend.agent.llm import get_chat_llm
-from backend.integrations.catalog_cache import get_cached_catalog
+from backend.integrations.catalog_cache import (get_cached_catalog,
+                                                 get_catalog_sections,
+                                                 select_catalog_section)
 from backend.integrations.knowledge_cache import get_cached_knowledge, warmup_knowledge
 from backend.integrations.tenant_inventory import (
     is_inventory_question_for_tenant,
@@ -184,6 +186,7 @@ async def _speak_catalog_naturally(
     tenant_id: str,
     user_text: str,
     catalog: str,
+    section: Optional[str] = None,
 ) -> Optional[str]:
     """LLM polish of catalog into phone-friendly speech; fallback to name list."""
     ctx = await get_tenant_by_id(tenant_id)
@@ -202,6 +205,21 @@ async def _speak_catalog_naturally(
         "If they asked about one item, talk only about that item.\n"
     )
 
+    # Name the category explicitly and name the others as off-limits, so the model
+    # cannot answer a services question with product names.
+    section_rules = ""
+    if section:
+        others = [s for s in get_catalog_sections(tenant_id) if s not in (section, "all")]
+        section_rules = (
+            f"- The caller asked about **{section}**. Every item below is a {section}. "
+            f"Describe them as {section}.\n"
+        )
+        if others:
+            section_rules += (
+                f"- Do NOT mention anything from these other categories: {', '.join(others)}. "
+                "They are different offerings and naming them here would be wrong.\n"
+            )
+
     system = (
         f"You are the voice sales assistant for {org} on a phone call.\n"
         "The caller may have interrupted you — answer their LATEST question only.\n"
@@ -212,6 +230,7 @@ async def _speak_catalog_naturally(
         "- NEVER say 'equals', 'name is', 'from live data', or read key=value pairs.\n"
         "- NEVER spell words letter-by-letter.\n"
         f"{focus_rules}"
+        f"{section_rules}"
         "- Do not continue a previous list if they changed the subject.\n"
         f"Known item names: {names_hint or '(see catalog)'}\n\n"
         f"--- CATALOG ---\n{focus_block}"
@@ -294,9 +313,18 @@ async def try_voice_faq_answer(tenant_id: str, user_text: str) -> Optional[str]:
     )
 
     if inventory_intent or (has_sql and vague_offer):
-        catalog = get_cached_catalog(tenant_id)
+        # Answer from the section that matches the question. Asking about
+        # services used to hand the model the whole catalog — broad probe first —
+        # so it answered with products.
+        section = select_catalog_section(tenant_id, user_text)
+        catalog = get_cached_catalog(tenant_id, section=section) if section else None
+        if not catalog:
+            catalog = get_cached_catalog(tenant_id)
+            section = None
         if catalog:
-            spoken = await _speak_catalog_naturally(tenant_id, user_text, catalog)
+            spoken = await _speak_catalog_naturally(
+                tenant_id, user_text, catalog, section=section
+            )
             if spoken:
                 return spoken
         return None

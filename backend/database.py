@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 import sqlite3
 
 from typing import Dict, Any, List, Optional
@@ -9,7 +10,7 @@ from .config import get_mongodb_connection_uri, settings
 logger = logging.getLogger(__name__)
 
 # Path to SQLite POS Database
-DB_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_DIR = os.environ.get("SQLITE_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
 SQLITE_DB_PATH = os.path.join(DB_DIR, "pos_database.db")
 
 class Database:
@@ -158,9 +159,16 @@ async def get_conversation(tenant_id: str, thread_id: str) -> Optional[Dict[str,
         doc["_id"] = str(doc["_id"])
     return doc
 
-async def list_conversations(tenant_id: str) -> List[Dict[str, Any]]:
+async def list_conversations(tenant_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+    # S20: no cap + full 'messages' arrays let one tenant with a long history
+    # OOM the worker for everyone. The list view only needs thread metadata —
+    # full transcripts are fetched per-thread via get_conversation.
     db = get_db()
-    cursor = db.conversations.find({"tenant_id": tenant_id})
+    cursor = (
+        db.conversations.find({"tenant_id": tenant_id}, {"messages": 0})
+        .sort([("_id", -1)])
+        .limit(min(limit, 500))
+    )
     convs = []
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
@@ -176,11 +184,20 @@ async def rename_conversation(tenant_id: str, thread_id: str, title: str):
     )
 
 async def delete_conversation(tenant_id: str, thread_id: str):
+    """
+    T10: the checkpoint deletes used to filter on thread_id alone, so
+    `DELETE /api/conversations/<any thread id>` destroyed another tenant's live
+    agent state. Checkpoints are stored under the namespaced key (see T09).
+    """
+    from backend.tenant.thread_scope import scoped_thread_id
+
     db = get_db()
     await db.conversations.delete_many({"tenant_id": tenant_id, "thread_id": thread_id})
     await db.leads.delete_many({"tenant_id": tenant_id, "thread_id": thread_id})
-    await db.checkpoints.delete_many({"thread_id": thread_id})
-    await db.writes.delete_many({"thread_id": thread_id})
+
+    ckpt_key = scoped_thread_id(tenant_id, thread_id)
+    await db.checkpoints.delete_many({"thread_id": ckpt_key})
+    await db.writes.delete_many({"thread_id": ckpt_key})
 
 # ---------------------------------------------------------------------------
 # Appointment booking helpers
@@ -226,10 +243,10 @@ async def create_appointment(
     doc["_id"] = str(result.inserted_id)
     return doc
 
-async def list_appointments(tenant_id: str) -> List[Dict[str, Any]]:
-    """Returns all appointments for a tenant ordered by date/time."""
+async def list_appointments(tenant_id: str, limit: int = 500) -> List[Dict[str, Any]]:
+    """Returns appointments for a tenant ordered by date/time (capped — S20)."""
     db = get_db()
-    cursor = db.appointments.find({"tenant_id": tenant_id}).sort([("date", 1), ("time", 1)])
+    cursor = db.appointments.find({"tenant_id": tenant_id}).sort([("date", 1), ("time", 1)]).limit(min(limit, 500))
     appts = []
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
@@ -347,10 +364,10 @@ async def create_order(
     doc["_id"] = str(result.inserted_id)
     return doc
 
-async def list_orders(tenant_id: str) -> List[Dict[str, Any]]:
-    """Returns all customer orders for a tenant, newest first."""
+async def list_orders(tenant_id: str, limit: int = 500) -> List[Dict[str, Any]]:
+    """Returns customer orders for a tenant, newest first (capped — S20)."""
     db = get_db()
-    cursor = db.orders.find({"tenant_id": tenant_id}).sort([("created_at", -1)])
+    cursor = db.orders.find({"tenant_id": tenant_id}).sort([("created_at", -1)]).limit(min(limit, 500))
     orders = []
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
@@ -361,23 +378,46 @@ async def list_orders(tenant_id: str) -> List[Dict[str, Any]]:
 # Voice call ↔ console chat linking (typed details during calls)
 # ---------------------------------------------------------------------------
 
-async def link_voice_call(tenant_id: str, call_id: str, console_thread_id: str) -> None:
-    """Link a Vapi call to the console chat thread so typed messages are visible to the voice agent."""
+async def link_voice_call(tenant_id: str, call_id: str, console_thread_id: str) -> Dict[str, Any]:
+    """Link a Vapi call to the console chat thread so typed messages are visible to the voice agent.
+
+    Returns the linked document so callers (resolve_voice_thread) don't need a
+    second find_one for the row we just wrote (see P09).
+    """
     from datetime import datetime, timezone
 
     db = get_db()
+    # T11: the filter used to be {call_id} alone, and call_id was globally unique,
+    # so any tenant could POST a victim's live call id and rewrite the row's
+    # tenant_id — redirecting that customer's conversation into their own
+    # transcript and billing the minutes wherever they chose.
+    existing = await db.voice_call_links.find_one({"call_id": call_id}, {"tenant_id": 1})
+    if existing and existing.get("tenant_id") not in (None, tenant_id):
+        logger.warning(
+            "Refusing cross-tenant voice link: call_id=%s owned by %s, requested by %s",
+            call_id, existing.get("tenant_id"), tenant_id,
+        )
+        raise PermissionError("This call is linked to a different tenant.")
+
+    linked_at = datetime.now(timezone.utc).isoformat()
     await db.voice_call_links.update_one(
-        {"call_id": call_id},
+        {"call_id": call_id, "tenant_id": tenant_id},
         {
             "$set": {
                 "tenant_id": tenant_id,
                 "call_id": call_id,
                 "console_thread_id": console_thread_id,
-                "linked_at": datetime.now(timezone.utc).isoformat(),
+                "linked_at": linked_at,
             }
         },
         upsert=True,
     )
+    return {
+        "tenant_id": tenant_id,
+        "call_id": call_id,
+        "console_thread_id": console_thread_id,
+        "linked_at": linked_at,
+    }
 
 
 async def register_voice_session(tenant_id: str, console_thread_id: str) -> None:
@@ -386,8 +426,21 @@ async def register_voice_session(tenant_id: str, console_thread_id: str) -> None
 
     db = get_db()
     now = datetime.now(timezone.utc).isoformat()
+    # T12: keyed on console_thread_id alone, an attacker could register a victim's
+    # (guessable) embed thread id and have resolve_voice_thread serve the victim's
+    # caller the ATTACKER's system prompt and knowledge base.
+    existing = await db.voice_call_sessions.find_one(
+        {"console_thread_id": console_thread_id}, {"tenant_id": 1}
+    )
+    if existing and existing.get("tenant_id") not in (None, tenant_id):
+        logger.warning(
+            "Refusing cross-tenant voice session: console_thread_id=%s owned by %s, requested by %s",
+            console_thread_id, existing.get("tenant_id"), tenant_id,
+        )
+        raise PermissionError("This session belongs to a different tenant.")
+
     await db.voice_call_sessions.update_one(
-        {"console_thread_id": console_thread_id},
+        {"console_thread_id": console_thread_id, "tenant_id": tenant_id},
         {
             "$set": {
                 "tenant_id": tenant_id,
@@ -419,10 +472,14 @@ def _extract_voice_metadata(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]
 async def resolve_voice_thread(
     call_data: Optional[Dict[str, Any]],
     payload: Optional[Dict[str, Any]] = None,
-) -> tuple[str, Optional[str], str]:
+) -> tuple[str, Optional[str], str, Optional[Dict[str, Any]]]:
     """
     Resolve which thread the voice agent should use and the tenant scope.
     Prefers explicit link, then call metadata from Vapi start(), else isolated vapi_{call_id} thread.
+
+    Returns (agent_thread_id, console_thread_id, tenant_id, link_doc). The 4th
+    element is the voice_call_links document already fetched/written in here —
+    callers must reuse it instead of re-querying (see P09).
     """
     call_data = call_data or {}
     call_id = call_data.get("id") or "vapi_default_session"
@@ -442,27 +499,39 @@ async def resolve_voice_thread(
         tenant_id = link_doc.get("tenant_id") or tenant_id
         linked_thread = link_doc.get("console_thread_id")
         if linked_thread:
-            return linked_thread, linked_thread, tenant_id or settings.DEFAULT_TENANT_ID
+            return linked_thread, linked_thread, tenant_id or settings.DEFAULT_TENANT_ID, link_doc
 
     if console_from_meta:
         if not tenant_id:
             session = await db.voice_call_sessions.find_one({"console_thread_id": console_from_meta})
             tenant_id = (session or {}).get("tenant_id")
         tenant_id = tenant_id or settings.DEFAULT_TENANT_ID
-        await link_voice_call(tenant_id, call_id, console_from_meta)
-        return console_from_meta, console_from_meta, tenant_id
+        try:
+            new_link = await link_voice_call(tenant_id, call_id, console_from_meta)
+        except PermissionError:
+            # T11 now rejects a cross-tenant claim. On this path that must degrade
+            # to an isolated thread rather than raising — a raised exception here
+            # would 500 the whole spoken turn.
+            logger.warning(
+                "Voice link contested for call %s (tenant %s) — using an isolated thread",
+                call_id, tenant_id,
+            )
+            return f"vapi_{call_id}", None, tenant_id, None
+        return console_from_meta, console_from_meta, tenant_id, new_link
 
     isolated = f"vapi_{call_id}"
-    return isolated, None, tenant_id or settings.DEFAULT_TENANT_ID
+    return isolated, None, tenant_id or settings.DEFAULT_TENANT_ID, None
 
 async def get_linked_console_thread(call_id: str) -> Optional[str]:
     db = get_db()
     doc = await db.voice_call_links.find_one({"call_id": call_id})
     return doc.get("console_thread_id") if doc else None
 
-async def unlink_voice_call(call_id: str) -> None:
+async def unlink_voice_call(tenant_id: str, call_id: str) -> bool:
+    """T13: scoped to the caller's tenant; returns whether anything was removed."""
     db = get_db()
-    await db.voice_call_links.delete_one({"call_id": call_id})
+    result = await db.voice_call_links.delete_one({"call_id": call_id, "tenant_id": tenant_id})
+    return result.deleted_count > 0
 
 async def get_recent_typed_chat_messages(
     tenant_id: str,
@@ -529,7 +598,9 @@ async def find_active_appointments(
 
     identity_clauses: List[Dict[str, Any]] = []
     if email and email.strip():
-        identity_clauses.append({"email": {"$regex": f"^{email.strip()}$", "$options": "i"}})
+        # A33: caller-supplied text must be escaped before it reaches a Mongo
+        # $regex, or "." matches every record and "(a+)+$" is a ReDoS.
+        identity_clauses.append({"email": {"$regex": f"^{re.escape(email.strip())}$", "$options": "i"}})
     if phone and phone.strip():
         normalized = _normalize_phone(phone)
         if normalized:
@@ -599,7 +670,10 @@ async def find_active_orders(
 
     identity_clauses: List[Dict[str, Any]] = []
     if email and email.strip():
-        identity_clauses.append({"customer_email": {"$regex": f"^{email.strip()}$", "$options": "i"}})
+        # A33: see find_active_appointments — escape before building the pattern.
+        identity_clauses.append(
+            {"customer_email": {"$regex": f"^{re.escape(email.strip())}$", "$options": "i"}}
+        )
     if phone and phone.strip():
         normalized = _normalize_phone(phone)
         if normalized:
@@ -616,8 +690,27 @@ async def find_active_orders(
         results.append(doc)
     return results
 
+async def next_order_id(tenant_id: str) -> int:
+    """
+    Allocate a per-tenant order number atomically.
+
+    T07: order ids used to come from the shared SQLite AUTOINCREMENT sequence,
+    which is global across every tenant on the instance.
+    """
+    db = get_db()
+    from pymongo import ReturnDocument
+
+    doc = await db.counters.find_one_and_update(
+        {"_id": f"order_id:{tenant_id}"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int((doc or {}).get("seq", 1))
+
+
 def _cancel_sqlite_order(order_id: int) -> bool:
-    """Mark a SQLite POS order as cancelled."""
+    """Mark a SQLite POS order as cancelled (demo tenant only — see T08)."""
     conn = sqlite3.connect(SQLITE_DB_PATH)
     cursor = conn.cursor()
     try:
@@ -631,12 +724,27 @@ def _cancel_sqlite_order(order_id: int) -> bool:
         conn.close()
 
 async def cancel_order_record(tenant_id: str, order_id: int) -> bool:
-    """Mark an order as cancelled in MongoDB and SQLite."""
+    """
+    Mark an order as cancelled. MongoDB is authoritative and tenant-scoped.
+
+    T08: this used to call _cancel_sqlite_order(order_id) unconditionally. The
+    SQLite orders table has no tenant column and a shared id sequence, so tenant
+    A cancelling their order #1042 could cancel tenant B's row — and returning
+    True on the strength of that SQLite update alone reported success for an
+    order the caller did not own.
+    """
+    from backend.config import settings
+
     db = get_db()
     result = await db.orders.update_one(
         {"tenant_id": tenant_id, "order_id": order_id, "status": {"$ne": "cancelled"}},
         {"$set": {"status": "cancelled"}},
     )
-    sqlite_updated = _cancel_sqlite_order(order_id)
-    return result.modified_count > 0 or sqlite_updated
+    cancelled = result.modified_count > 0
+
+    if tenant_id == settings.DEFAULT_TENANT_ID:
+        # Keep the demo POS in step, but never let it decide the outcome.
+        _cancel_sqlite_order(order_id)
+
+    return cancelled
 

@@ -5,6 +5,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from backend.config import settings
+from backend.tenant.registry import invalidate_tenant
 from backend.tenant.context import TenantContext
 from backend.auth.dependencies import require_secret_tenant as get_tenant_or_api_key
 from backend.database import get_db
@@ -46,8 +47,15 @@ async def create_checkout_session(
 
     plan = PLANS[price_id]
 
-    # MOCK MODE: Upgrade directly in DB if Stripe credentials are empty
+    # MOCK MODE: Upgrade directly in DB if Stripe credentials are empty.
+    # S07: without a gate, any authenticated tenant could repeatedly self-grant
+    # the Enterprise plan simply by never configuring Stripe.
     if not settings.STRIPE_API_KEY:
+        if settings.is_production or not settings.ALLOW_MOCK_BILLING:
+            raise HTTPException(
+                status_code=503,
+                detail="Billing is not configured. Contact support to upgrade your plan.",
+            )
         logger.warning("Stripe key is missing. Simulating sandbox upgrade for tenant %s", tenant.tenant_id)
         db = get_db()
         await db.tenants.update_one(
@@ -59,6 +67,7 @@ async def create_checkout_session(
                 "settings.rate_limit_per_minute": 300 if price_id == "price_enterprise" else 150
             }}
         )
+        invalidate_tenant(tenant.tenant_id)
         return {
             "checkout_url": f"{settings.DASHBOARD_URL}/dashboard?billing_success=true&tier={plan['name'].lower()}",
             "simulated": True
@@ -85,8 +94,14 @@ async def create_checkout_session(
         )
         return {"checkout_url": session.url, "simulated": False}
     except Exception as e:
-        logger.error("Stripe checkout creation failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Checkout creation failed: {e}")
+        import uuid
+
+        correlation_id = uuid.uuid4().hex[:12]
+        logger.error("Stripe checkout creation failed [%s]: %s", correlation_id, e, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Checkout could not be started. Reference: {correlation_id}",
+        )
 
 @router.post("/portal")
 async def create_customer_portal(
@@ -108,8 +123,14 @@ async def create_customer_portal(
         )
         return {"portal_url": portal_session.url}
     except Exception as e:
-        logger.error("Stripe portal session creation failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Customer portal redirect failed: {e}")
+        import uuid
+
+        correlation_id = uuid.uuid4().hex[:12]
+        logger.error("Stripe portal session creation failed [%s]: %s", correlation_id, e, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Billing portal is unavailable right now. Reference: {correlation_id}",
+        )
 
 @router.post("/webhook")
 async def stripe_webhook(request: Request):
@@ -160,6 +181,7 @@ async def stripe_webhook(request: Request):
                     "status": "active"
                 }}
             )
+            invalidate_tenant(tenant_id)
             logger.info("Successfully updated tenant %s to tier %s via webhook checkout", tenant_id, plan["name"])
 
     elif event_type == "customer.subscription.deleted":
@@ -177,6 +199,7 @@ async def stripe_webhook(request: Request):
                     "status": "trial_expired"
                 }}
             )
+            invalidate_tenant(tenant_doc["tenant_id"])
             logger.info("Tenant %s subscription expired/cancelled. Reverted to free tier.", tenant_doc["tenant_id"])
 
     return {"status": "success"}

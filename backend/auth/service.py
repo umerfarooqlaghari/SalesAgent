@@ -19,6 +19,10 @@ from backend.tenant.secrets import hash_api_key
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# S19: a fixed hash to verify against on a lookup miss, so an unknown email
+# still pays the bcrypt cost instead of returning near-instantly.
+_DUMMY_PASSWORD_HASH = hash_password("no-such-user-timing-safety-placeholder")
+
 
 @dataclass
 class UserSession:
@@ -28,6 +32,7 @@ class UserSession:
     role: str
     tenant_id: Optional[str]
     org_name: Optional[str]
+    token_version: int = 0
 
 
 def _slugify_org(name: str) -> str:
@@ -88,6 +93,14 @@ async def register_client(
     tenant_id, api_key, publishable_key = await create_tenant(org_name, email)
     user_id = str(uuid.uuid4())
 
+    # S24: track verification status. The initial session/API key are still
+    # issued immediately (existing registration contract — see auth/routes.py
+    # and test_e2e_local.py::test_auth_flow), but a SUBSEQUENT login requires
+    # a verified email, and a verification email is sent now.
+    import secrets as _secrets
+    import hashlib as _hashlib
+
+    verify_token = _secrets.token_urlsafe(32)
     await db.users.insert_one(
         {
             "user_id": user_id,
@@ -97,9 +110,18 @@ async def register_client(
             "role": "tenant_admin",
             "tenant_id": tenant_id,
             "status": "active",
+            "email_verified": False,
+            "verify_token_hash": _hashlib.sha256(verify_token.encode()).hexdigest(),
+            "token_version": 0,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
     )
+
+    try:
+        from backend.auth.email import send_verification_email
+        await send_verification_email(email, verify_token)
+    except Exception:
+        pass  # verification email is best-effort; it never blocks registration
 
     token = create_access_token(
         {
@@ -107,6 +129,7 @@ async def register_client(
             "email": email,
             "role": "tenant_admin",
             "tenant_id": tenant_id,
+            "tver": 0,
         }
     )
 
@@ -134,8 +157,20 @@ async def login_user(email: str, password: str) -> Dict[str, Any]:
     db = get_db()
     email = email.lower().strip()
     user = await db.users.find_one({"email": email, "status": "active"})
-    if not user or not verify_password(password, user.get("password_hash", "")):
+    # S19: 'user is None' short-circuited the 'or', skipping bcrypt entirely for
+    # unknown emails — the timing gap between a known vs unknown email is
+    # enough to enumerate accounts. Always run verify_password against SOME
+    # hash so the two cases take comparable time.
+    password_hash = user.get("password_hash", "") if user else _DUMMY_PASSWORD_HASH
+    password_ok = verify_password(password, password_hash)
+    if not user or not password_ok:
         raise ValueError("Invalid email or password")
+
+    # S24: block login for accounts that never verified their email. The
+    # initial post-registration session (see register_client) is unaffected —
+    # this only gates re-authenticating after that session expires.
+    if not user.get("email_verified", True):
+        raise ValueError("Please verify your email before logging in. Check your inbox for the verification link.")
 
     org_name = None
     if user.get("tenant_id"):
@@ -148,6 +183,7 @@ async def login_user(email: str, password: str) -> Dict[str, Any]:
             "email": user["email"],
             "role": user.get("role", "tenant_admin"),
             "tenant_id": user.get("tenant_id"),
+            "tver": user.get("token_version", 0),
         }
     )
 
@@ -181,7 +217,21 @@ async def get_user_session(user_id: str) -> Optional[UserSession]:
         role=user.get("role", "tenant_admin"),
         tenant_id=user.get("tenant_id"),
         org_name=org_name,
+        token_version=user.get("token_version", 0),
     )
+
+
+async def verify_email(token: str) -> bool:
+    """S24: activate the account's email_verified flag from a single-use token."""
+    import hashlib
+
+    db = get_db()
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    result = await db.users.update_one(
+        {"verify_token_hash": token_hash},
+        {"$set": {"email_verified": True}, "$unset": {"verify_token_hash": ""}},
+    )
+    return result.modified_count > 0
 
 
 async def regenerate_api_key(user_id: str) -> str:
@@ -243,7 +293,24 @@ async def regenerate_publishable_key(user_id: str) -> str:
 
 async def seed_super_admin() -> None:
     db = get_db()
-    from backend.config import settings
+    from backend.config import (
+        DEFAULT_SUPER_ADMIN_EMAIL,
+        DEFAULT_SUPER_ADMIN_PASSWORD,
+        settings,
+    )
+
+    # S04: validate_production_secrets() already refuses to boot with these
+    # placeholders in production; this is defense-in-depth in case seeding is
+    # ever triggered from a path that skips that startup check.
+    if settings.is_production and (
+        settings.SUPER_ADMIN_EMAIL == DEFAULT_SUPER_ADMIN_EMAIL
+        or settings.SUPER_ADMIN_PASSWORD == DEFAULT_SUPER_ADMIN_PASSWORD
+    ):
+        import logging
+        logging.getLogger(__name__).error(
+            "Refusing to seed a placeholder super-admin in production."
+        )
+        return
 
     email = settings.SUPER_ADMIN_EMAIL.lower().strip()
     existing = await db.users.find_one({"email": email})
@@ -260,6 +327,8 @@ async def seed_super_admin() -> None:
             "role": "super_admin",
             "tenant_id": None,
             "status": "active",
+            "email_verified": True,
+            "token_version": 0,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
     )

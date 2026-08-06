@@ -20,9 +20,10 @@ class LeadRepository(TenantScopedRepository):
         doc = await db.leads.find_one(self._tenant_filter({"thread_id": thread_id}))
         return self._stringify_id(doc) if doc else None
 
-    async def list_all(self) -> List[Dict[str, Any]]:
+    async def list_all(self, limit: int = 500) -> List[Dict[str, Any]]:
+        # S20: unbounded find() let one tenant's lead volume OOM the worker.
         db = get_db()
-        cursor = db.leads.find(self._tenant_filter())
+        cursor = db.leads.find(self._tenant_filter()).limit(min(limit, 500))
         return [self._stringify_id(doc) async for doc in cursor]
 
     async def delete_by_thread(self, thread_id: str) -> int:

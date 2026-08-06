@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from typing import Any, Dict, Optional
 
@@ -7,18 +8,16 @@ from backend.integrations.providers import get_provider
 
 MASK = "••••••••"
 
+# T01: a tenant with no configured inventory must get NOTHING, not the shared
+# demo catalog. The old default enabled a "stub" source for every unconfigured
+# tenant, which routes to StubPOSAdapter -> the process-wide SQLite
+# products/orders tables. Those tables have no tenant_id column, so one tenant's
+# agent would recite another's demo SKUs and write its customers' PII there.
+# AdapterFactory falls back to StubPOSAdapter only for DEFAULT_TENANT_ID.
 DEFAULT_INTEGRATIONS: Dict[str, Any] = {
     "inventory": {
         "enabled": True,
-        "sources": [
-            {
-                "id": "default_stub",
-                "enabled": True,
-                "provider": "stub",
-                "priority": 0,
-                "config": {"read_only": True},
-            }
-        ],
+        "sources": [],
     },
     "crm": {"enabled": True, "provider": "internal", "config": {}},
     "calendar": {"enabled": True, "provider": "internal", "config": {}},
@@ -93,11 +92,20 @@ def normalize_integrations(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
+_SECRET_KEY_PATTERN = re.compile(r"(password|token|secret|key|json)", re.IGNORECASE)
+
+
 def mask_config(category: str, provider_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
     provider = get_provider(category, provider_id)
-    if not provider:
-        return config
     masked = deepcopy(config)
+    if not provider:
+        # S26: an unknown/legacy provider id used to return the raw config
+        # unmasked. Fail closed — mask anything that looks like a secret key
+        # rather than trusting the (missing) provider's declared field list.
+        for key, value in list(masked.items()):
+            if value and _SECRET_KEY_PATTERN.search(key):
+                masked[key] = MASK
+        return masked
     for key in provider.secret_fields:
         if key in masked and masked[key]:
             masked[key] = MASK

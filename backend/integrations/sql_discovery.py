@@ -89,7 +89,14 @@ def _pick_column(columns: List[str], logical: str) -> Optional[str]:
             hn = _norm(hint)
             if hn in cn or cn in hn:
                 return c
-    optional = {"fit", "items", "description", "time"}
+    # A24: price/stock/status/email/phone used to fall through to columns[0]
+    # (the same fallback as truly optional fields) when nothing matched — so an
+    # absent email column silently mapped to the primary key, and ownership
+    # verification then compared a caller's email string to an integer id.
+    # Leave these unmapped instead; suggest_table_map/suggest_mapped_tables
+    # already omit any logical key whose physical column came back None, so
+    # the admin UI correctly shows it as needing a manual pick.
+    optional = {"fit", "items", "description", "time", "price", "stock", "status", "email", "phone"}
     if logical in optional:
         return None
     return columns[0] if columns else None

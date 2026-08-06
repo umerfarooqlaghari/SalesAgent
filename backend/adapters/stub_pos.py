@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 from typing import Any, Dict, Optional
 
@@ -54,6 +55,12 @@ class StubPOSAdapter:
         self.tenant = tenant
 
     async def list_products(self, query: Optional[str] = None) -> str:
+        # P13: sqlite3 is synchronous and holds the GIL for the duration of the
+        # call, serializing every concurrent voice call on this worker. Push it
+        # to a thread so other coroutines keep running while the disk I/O happens.
+        return await asyncio.to_thread(self._list_products_sync, query)
+
+    def _list_products_sync(self, query: Optional[str]) -> str:
         conn = sqlite3.connect(SQLITE_DB_PATH)
         cursor = conn.cursor()
         try:
@@ -88,6 +95,16 @@ class StubPOSAdapter:
         if not customer_email and not customer_phone:
             return "Error: You must provide the customer's email or phone number to verify ownership."
 
+        return await asyncio.to_thread(
+            self._get_order_status_sync, order_id, customer_email, customer_phone
+        )
+
+    def _get_order_status_sync(
+        self,
+        order_id: int,
+        customer_email: Optional[str],
+        customer_phone: Optional[str],
+    ) -> str:
         conn = sqlite3.connect(SQLITE_DB_PATH)
         cursor = conn.cursor()
         try:
@@ -116,10 +133,12 @@ class StubPOSAdapter:
         customer_phone: str,
         total_price: str,
     ) -> int:
-        return _create_sqlite_order(customer_email, customer_phone, product_name, total_price)
+        return await asyncio.to_thread(
+            _create_sqlite_order, customer_email, customer_phone, product_name, total_price
+        )
 
     async def cancel_order(self, order_id: int) -> bool:
-        return _cancel_sqlite_order(order_id)
+        return await asyncio.to_thread(_cancel_sqlite_order, order_id)
 
     async def lookup_product(self, product_name: str) -> Optional[Dict[str, Any]]:
-        return _lookup_product(product_name)
+        return await asyncio.to_thread(_lookup_product, product_name)

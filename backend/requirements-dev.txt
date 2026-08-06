@@ -1,0 +1,5 @@
+# Test-only dependencies for the audit regression suite (backend/tests/audit).
+# The suite runs with no MongoDB, no Gemini key and no network.
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+mongomock-motor>=0.0.21

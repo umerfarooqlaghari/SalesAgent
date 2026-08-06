@@ -1,4 +1,7 @@
 import contextvars
+import hmac
+import re
+
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -7,6 +10,8 @@ from adapter_hub.config import settings
 # Thread-safe context variables to keep track of tenant/agent scopes
 current_tenant_id = contextvars.ContextVar("current_tenant_id", default="")
 current_agent_id = contextvars.ContextVar("current_agent_id", default="")
+
+_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 class TenantIsolationMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -26,7 +31,9 @@ class TenantIsolationMiddleware(BaseHTTPMiddleware):
             
         # For simplicity, validate against master key.
         # This can be extended to check database tenant table hashed api keys.
-        if api_key != settings.MASTER_API_KEY:
+        # S10: a plain `!=` leaks timing information proportional to the
+        # matching prefix length; compare_digest runs in constant time.
+        if not hmac.compare_digest(api_key, settings.MASTER_API_KEY):
             return JSONResponse(
                 status_code=401,
                 content={"ok": False, "error": "Invalid API Key", "code": "UNAUTHORIZED"}
@@ -37,11 +44,29 @@ class TenantIsolationMiddleware(BaseHTTPMiddleware):
                 status_code=400,
                 content={"ok": False, "error": "Tenant ID is missing in X-Tenant-ID header", "code": "BAD_REQUEST"}
             )
-            
+
+        # S10: the shared master key only proves "some caller with the key";
+        # tenant/agent scope is whatever the client claims in these headers.
+        # A well-formed-id check is a narrow, low-risk guard against injection
+        # into downstream namespace/collection keys — it does NOT fix the
+        # deeper issue (no per-tenant key -> tenant binding), which needs a
+        # per-tenant credential store and is tracked separately.
+        if not _ID_RE.match(tenant_id):
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "Invalid X-Tenant-ID format", "code": "BAD_REQUEST"}
+            )
+
         if not agent_id:
             return JSONResponse(
                 status_code=400,
                 content={"ok": False, "error": "Agent ID is missing in X-Agent-ID header", "code": "BAD_REQUEST"}
+            )
+
+        if not _ID_RE.match(agent_id):
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "Invalid X-Agent-ID format", "code": "BAD_REQUEST"}
             )
             
         # Set thread-safe context variables

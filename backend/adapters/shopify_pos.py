@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -43,14 +43,55 @@ class ShopifyPOSAdapter:
             resp.raise_for_status()
             return resp.json()
 
+    async def _get_paginated(
+        self, path: str, params: Dict[str, Any], max_pages: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        A21: follow Shopify's Link-header cursor instead of only ever reading
+        page 1 — a 500-product store used to report "no products found" for
+        anything past the first 50. Bounded by max_pages as a safety cap.
+        """
+        items: List[Dict[str, Any]] = []
+        next_params: Optional[Dict[str, Any]] = dict(params)
+        async with httpx.AsyncClient(timeout=20) as client:
+            for _ in range(max_pages):
+                resp = await client.get(
+                    f"{self._base_url()}{path}", headers=self._headers(), params=next_params
+                )
+                resp.raise_for_status()
+                items.extend(resp.json().get("products") or [])
+
+                link = resp.headers.get("Link") or resp.headers.get("link") or ""
+                next_page_info = None
+                for part in link.split(","):
+                    if 'rel="next"' not in part:
+                        continue
+                    url_part = part[part.find("<") + 1 : part.find(">")]
+                    if "page_info=" in url_part:
+                        next_page_info = url_part.split("page_info=")[1].split("&")[0]
+                    break
+                if not next_page_info:
+                    break
+                # Shopify rejects other filters alongside page_info.
+                next_params = {"limit": params.get("limit", 50), "page_info": next_page_info}
+        return items
+
     async def test_connection(self) -> None:
         await self._get("/shop.json")
 
     async def list_products(self, query: Optional[str] = None) -> str:
-        data = await self._get("/products.json", {"limit": 50})
-        products = data.get("products") or []
-        if query and query.strip().lower() not in {"product", "products", "all", "list", ""}:
-            q = query.strip().lower()
+        q_clean = (query or "").strip()
+        is_generic = not q_clean or q_clean.lower() in {"product", "products", "all", "list", ""}
+
+        params: Dict[str, Any] = {"limit": 50}
+        if not is_generic:
+            params["title"] = q_clean
+        products = await self._get_paginated("/products.json", params, max_pages=10 if is_generic else 3)
+
+        if not is_generic:
+            # Shopify's title filter isn't a strict substring match — keep the
+            # client-side check as a safety net.
+            q = q_clean.lower()
             products = [p for p in products if q in (p.get("title") or "").lower()]
 
         if not products:
@@ -65,9 +106,9 @@ class ShopifyPOSAdapter:
         return "Product Catalog (Shopify):\n" + "\n".join(lines)
 
     async def lookup_product(self, product_name: str) -> Optional[Dict[str, Any]]:
-        data = await self._get("/products.json", {"limit": 50})
         q = product_name.strip().lower()
-        for p in data.get("products") or []:
+        products = await self._get_paginated("/products.json", {"limit": 50, "title": product_name.strip()}, max_pages=3)
+        for p in products:
             if q in (p.get("title") or "").lower():
                 variant = (p.get("variants") or [{}])[0]
                 return {

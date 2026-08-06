@@ -6,8 +6,12 @@ from typing import Literal
 
 KeyScope = Literal["secret", "publishable", "jwt"]
 
+# S23: every current resolution path (resolve_tenant_by_api_key, JWT auth)
+# explicitly calls set_key_scope, so this default only matters for a FUTURE
+# path that forgets to. Default to least privilege so that mistake fails
+# closed instead of silently granting a browser-embedded key full admin scope.
 current_key_scope: contextvars.ContextVar[KeyScope] = contextvars.ContextVar(
-    "current_key_scope", default="secret"
+    "current_key_scope", default="publishable"
 )
 
 

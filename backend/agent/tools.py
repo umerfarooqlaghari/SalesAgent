@@ -19,6 +19,7 @@ from backend.database import (
     reschedule_appointment_record,
     find_active_orders,
     cancel_order_record,
+    next_order_id,
     link_voice_call,
     get_linked_console_thread,
     unlink_voice_call,
@@ -26,6 +27,7 @@ from backend.database import (
 )
 from backend.adapters.factory import AdapterFactory
 from backend.config import settings
+from backend.tenant.thread_scope import logical_thread_id
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +149,7 @@ async def update_lead_status(
     Update the lead status and firmographics in the CRM.
     Used to qualify or disqualify leads based on B2B fit.
     """
-    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    thread_id = logical_thread_id(config)
     lead_data = {
         "company": company,
         "job_title": job_title,
@@ -168,7 +170,7 @@ async def schedule_demo(
     Schedules a demo or discovery call with the lead.
     Pass in the requested meeting_time and the company name.
     """
-    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
     from backend.database import get_db
     db = get_db()
@@ -249,7 +251,7 @@ async def handoff_to_human(
     2. You genuinely don't know the answer and they want further help.
     Do NOT use this to reject or disqualify anyone.
     """
-    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
 
     await save_lead(tenant_id, thread_id, {
@@ -284,7 +286,7 @@ async def book_appointment(
     and preferred time (e.g. '2:00 PM'). Checks if the slot is available and confirms booking.
     Always collect ALL fields before calling this tool.
     """
-    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
     
     # Validate required fields
@@ -337,7 +339,7 @@ async def place_order(
     Collect customer_name, customer_email, and customer_phone before calling if not already known.
     product_name should match what they agreed to (e.g. 'SaaS Professional', 'Starter package').
     """
-    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
 
     missing = []
@@ -356,25 +358,37 @@ async def place_order(
             "Could you share those with me?"
         )
 
-    product = await AdapterFactory.pos(await _load_tenant_context(config)).lookup_product(product_name.strip())
-    if not product:
+    tenant_ctx = await _load_tenant_context(config)
+    is_demo_tenant = tenant_id == settings.DEFAULT_TENANT_ID
+
+    product = await AdapterFactory.pos(tenant_ctx).lookup_product(product_name.strip())
+    # T05: the SQLite fallback is the shared demo catalog with no tenant column.
+    # Only the demo tenant may fall back to it.
+    if not product and is_demo_tenant:
         product = _lookup_product(product_name.strip())
     if not product:
+        # T06: this used to recite Alpha's SaaS price list to every tenant's caller.
         return (
-            f"I couldn't find a product matching '{product_name}'. "
-            "We offer SaaS Starter ($49/mo), SaaS Professional ($199/mo), and SaaS Enterprise ($999/mo). "
-            "Which one would you like to order?"
+            f"I couldn't find anything matching '{product_name}' in our catalogue. "
+            "Could you tell me the exact name, or describe what you're after?"
         )
 
     if product["stock_quantity"] <= 0:
         return f"Sorry, {product['name']} is currently out of stock. Would you like to hear about our other packages?"
 
-    sqlite_order_id = _create_sqlite_order(
-        customer_email=customer_email.strip(),
-        customer_phone=customer_phone.strip(),
-        product_name=product["name"],
-        total_price=product["price"],
-    )
+    # T07: the SQLite orders table has no tenant_id column and a globally shared
+    # INTEGER PRIMARY KEY sequence, so writing every tenant's customer email and
+    # phone there both leaks PII and lets order ids collide across tenants.
+    # MongoDB is the authoritative, tenant-scoped store; SQLite stays demo-only.
+    if is_demo_tenant:
+        order_id = _create_sqlite_order(
+            customer_email=customer_email.strip(),
+            customer_phone=customer_phone.strip(),
+            product_name=product["name"],
+            total_price=product["price"],
+        )
+    else:
+        order_id = await next_order_id(tenant_id)
 
     await create_order(
         tenant_id=tenant_id,
@@ -384,7 +398,7 @@ async def place_order(
         customer_phone=customer_phone.strip(),
         product_name=product["name"],
         total_price=product["price"],
-        sqlite_order_id=sqlite_order_id,
+        sqlite_order_id=order_id,
     )
 
     await save_lead(tenant_id, thread_id, {
@@ -396,7 +410,7 @@ async def place_order(
 
     return (
         f"Perfect! I've taken your order for the {product['name']} at {product['price']}. "
-        f"Your order number is {sqlite_order_id}. "
+        f"Your order number is {order_id}. "
         "A sales agent will contact you shortly to finalize the details and next steps. "
         "Is there anything else I can help you with today?"
     )
@@ -413,7 +427,7 @@ async def lookup_appointments(
     Use when they ask about their booking, meeting time, or before cancelling/rescheduling.
     Requires email or phone to verify identity.
     """
-    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
 
     if (not email or "@" not in email) and (not phone or phone.strip() == ""):
@@ -449,7 +463,7 @@ async def cancel_appointment(
     Use when the caller wants to cancel their booking.
     Collect email or phone to verify identity. If they have multiple bookings, also ask for date and time.
     """
-    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
 
     if (not email or "@" not in email) and (not phone or phone.strip() == ""):
@@ -501,7 +515,7 @@ async def reschedule_appointment(
     Collect email or phone for verification. If multiple bookings exist, ask which one (current_date/current_time).
     Then collect the new preferred date and time before calling this tool.
     """
-    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
 
     missing = []
@@ -620,7 +634,7 @@ async def get_typed_chat_details(config: RunnableConfig) -> str:
     Use AFTER asking the caller to type information in the chat for accuracy — especially email and phone.
     Prefer typed chat values over spoken dictation when both exist.
     """
-    thread_id = config.get("configurable", {}).get("thread_id", "default_thread")
+    thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
     typed = await get_recent_typed_chat_messages(tenant_id, thread_id, limit=8)
 

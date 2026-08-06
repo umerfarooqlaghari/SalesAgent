@@ -25,7 +25,7 @@ from backend.agent.tools import (
     get_typed_chat_details,
 )
 from backend.agent.checkpointer import get_checkpointer
-from backend.agent.prompts import SYSTEM_PROMPT
+from backend.agent.prompts import SYSTEM_PROMPT, build_tenant_system_prompt
 from backend.agent.llm import get_chat_llm
 from backend.agent.rag import retrieve_context
 from backend.agent.parallel_tools import build_parallel_tool_node
@@ -223,7 +223,21 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         fit = str(lead_profile.fit) if lead_profile.fit is not None else "Unknown"
 
     ctx = await get_tenant_by_id(tenant_id)
-    prompt_template = await get_tenant_system_prompt(tenant_id, SYSTEM_PROMPT)
+
+    # T04: only the demo tenant may fall back to the Alpha demo prompt. Everyone
+    # else gets a neutral, org-specific template with no invented catalogue.
+    if tenant_id == settings.DEFAULT_TENANT_ID:
+        fallback_prompt = SYSTEM_PROMPT
+    else:
+        # ctx may be None (tenant row missing/inactive) or a partially populated
+        # context, so every hop is guarded — this runs on the voice hot path and
+        # an AttributeError here would surface as "Sorry, I hit a small snag".
+        _settings = getattr(ctx, "settings", None)
+        fallback_prompt = build_tenant_system_prompt(
+            getattr(ctx, "org_name", None) or tenant_id,
+            getattr(_settings, "company_description", None) or "",
+        )
+    prompt_template = await get_tenant_system_prompt(tenant_id, fallback_prompt)
     system_prompt = safe_format_prompt(
         prompt_template,
         thread_id=thread_id,
@@ -242,7 +256,10 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
             + system_prompt
         )
 
-    from backend.integrations.catalog_cache import get_cached_catalog, schedule_warmup
+    from backend.integrations.catalog_cache import (get_cached_catalog,
+                                                    get_catalog_sections,
+                                                    schedule_warmup,
+                                                    select_catalog_section)
     from backend.integrations.knowledge_cache import get_cached_knowledge, warmup_knowledge
     from backend.integrations.tenant_inventory import (
         format_mapped_entities_for_prompt,
@@ -250,8 +267,11 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         load_inventory_mappings,
     )
 
-    inventory_intent = await is_inventory_question_for_tenant(tenant_id, user_text)
-    mapped = await load_inventory_mappings(tenant_id)
+    # P08: these two are independent and were awaited back to back.
+    inventory_intent, mapped = await asyncio.gather(
+        is_inventory_question_for_tenant(tenant_id, user_text),
+        load_inventory_mappings(tenant_id),
+    )
     mapped_hint = format_mapped_entities_for_prompt(mapped)
     if mapped_hint:
         system_prompt += f"\n\n--- TENANT DATA MODEL ---\n{mapped_hint}"
@@ -270,12 +290,35 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
             + knowledge
         )
 
-    catalog = get_cached_catalog(tenant_id)
+    # Inject the matching section only. Handing the model every category at once
+    # is why a services question came back with product names.
+    catalog_section = select_catalog_section(tenant_id, user_text)
+    catalog = get_cached_catalog(tenant_id, section=catalog_section) if catalog_section else None
+    if not catalog:
+        catalog = get_cached_catalog(tenant_id)
+        catalog_section = None
+
     if catalog:
-        system_prompt += (
-            "\n\n--- CACHED CATALOG (this tenant's approved SQL tables — prefer over tools) ---\n"
-            + catalog
-        )
+        if catalog_section:
+            others = [s for s in get_catalog_sections(tenant_id)
+                      if s not in (catalog_section, "all")]
+            header = (
+                f"\n\n--- CACHED CATALOG · {catalog_section.upper()} "
+                "(this tenant's approved SQL tables — prefer over tools) ---\n"
+            )
+            system_prompt += header + catalog
+            if others:
+                system_prompt += (
+                    f"\n\nEvery row above is a {catalog_section}. This tenant also has separate "
+                    f"{', '.join(others)} — those are DIFFERENT offerings. Never answer a "
+                    f"{catalog_section} question with items from them; call query_pos_database "
+                    "if the caller asks about another category."
+                )
+        else:
+            system_prompt += (
+                "\n\n--- CACHED CATALOG (this tenant's approved SQL tables — prefer over tools) ---\n"
+                + catalog
+            )
     elif not is_voice:
         schedule_warmup(tenant_id)
 

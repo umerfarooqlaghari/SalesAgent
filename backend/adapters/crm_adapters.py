@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 
 import httpx
 
-from backend.adapters.sql_pos import SqlConnection, _quote_ident, _table_map
+from backend.adapters.sql_pos import SqlConnection, _escape_like, _quote_ident, _table_map
 from backend.integrations.table_map_util import get_mapped_tables
 from backend.tenant.context import TenantContext
 
@@ -17,6 +18,9 @@ class SqlCRMAdapter:
         self.sql = SqlConnection(provider, config)
         self.table_map = _table_map(config)
         self.mapped_tables = get_mapped_tables(self.table_map, "crm")
+        # A31: accepted but never stored, so this adapter had no tenant identity
+        # available for logging/scoping.
+        self.tenant = tenant
 
     async def _search_one_table(self, mapping: Dict[str, Any], query: str) -> Optional[str]:
         table = mapping.get("table")
@@ -51,7 +55,7 @@ class SqlCRMAdapter:
         like_op = "ILIKE" if self.sql.dialect == "postgres" else "LIKE"
         for sc in search_cols:
             if sc:
-                where_parts.append(f"{_quote_ident(str(sc), self.sql.dialect)} {like_op} :q")
+                where_parts.append(f"{_quote_ident(str(sc), self.sql.dialect)} {like_op} :q ESCAPE '\\'")
         if not where_parts:
             return None
 
@@ -63,7 +67,7 @@ class SqlCRMAdapter:
         else:
             sql += " LIMIT 5"
 
-        rows = await self.sql.fetch_all(sql, {"q": f"%{query}%"})
+        rows = await self.sql.fetch_all(sql, {"q": f"%{_escape_like(query)}%"})
         if not rows:
             return None
 
@@ -114,7 +118,12 @@ class RestCRMAdapter:
 
     async def search_company(self, company: str) -> str:
         base = (self.config.get("base_url") or "").rstrip("/")
-        path = (self.config.get("search_path") or "/search").replace("{company}", company)
+        # A19: company comes verbatim from caller speech/typed text. Unencoded,
+        # '../../admin/users' path-traverses and '&role=admin' injects extra
+        # query parameters into an authenticated internal API.
+        path = (self.config.get("search_path") or "/search").replace(
+            "{company}", quote(company, safe="")
+        )
         url = f"{base}{path}"
         headers = {}
         auth_header = self.config.get("auth_header")

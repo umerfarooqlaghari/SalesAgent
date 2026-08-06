@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import hashlib
+import ipaddress
 import logging
 import re
+import socket
+import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.tenant.context import TenantContext
@@ -28,28 +32,130 @@ def _quote_ident(name: str, dialect: str) -> str:
     return f'"{safe}"'
 
 
+def _escape_like(value: str) -> str:
+    """
+    A20: '%' and '_' are LIKE metacharacters, not literals. Caller-supplied text
+    ("50% off") reaching a LIKE pattern unescaped silently becomes a wildcard —
+    not an injection (params stay bound) but a correctness/latency bug (an
+    unintended full scan). Pair with ESCAPE '\\' at every call site.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+_BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",  # link-local, includes the cloud metadata endpoint
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    )
+)
+
+
+def _assert_public_host(host: str) -> None:
+    """
+    S17: resolve a tenant-supplied DB host and reject private/link-local
+    ranges before ever attempting a connection. Without this, "test
+    connection" / "discover schema" is a scanning oracle against the backend's
+    own internal network (including 169.254.169.254 cloud metadata) for
+    anyone holding a tenant API key — a real tenant's external database is
+    never legitimately on one of these ranges from this server's perspective.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return  # let the real connection attempt surface a normal DNS error
+    for info in infos:
+        raw_ip = info[4][0]
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            continue
+        if any(ip in net for net in _BLOCKED_NETWORKS):
+            raise ValueError("Refusing to connect to a private or link-local database host.")
+
+
 def _table_map(config: Dict[str, Any]) -> Dict[str, Any]:
-    tm = config.get("table_map") or {}
-    if isinstance(tm, str):
-        tm = json.loads(tm)
-    return tm
+    # A25: delegate to the guarded parser — this used to call json.loads directly
+    # with no try/except, so one malformed table_map (unbalanced admin JSON edit)
+    # raised out of the constructor and 500'd every route touching that source.
+    from backend.integrations.table_map_util import parse_table_map_raw
+
+    return parse_table_map_raw(config)
 
 
-_ENGINES = {}
+_ENGINES: "OrderedDict[str, tuple[Any, float]]" = OrderedDict()  # url_hash -> (engine, expires_at)
 _ENGINES_LOCK = asyncio.Lock()
+_ENGINE_TTL_S = 1800  # matches pool_recycle
+_ENGINES_MAX = 200
+
+# P05: an unresponsive tenant DB (bad host, firewalled port, overloaded server)
+# used to pin an async worker indefinitely — no connect timeout was ever passed
+# to the driver. These are driver-specific: asyncpg takes seconds, pymssql takes
+# timeout/login_timeout, aiomysql takes connect_timeout.
+_CONNECT_TIMEOUT_S = 5
+_QUERY_TIMEOUT_S = 5
+
+
+def _connect_args_for(connection_url: str) -> Dict[str, Any]:
+    if connection_url.startswith("postgresql+asyncpg"):
+        return {"timeout": _CONNECT_TIMEOUT_S, "command_timeout": _QUERY_TIMEOUT_S}
+    if connection_url.startswith("mssql+pymssql"):
+        return {"timeout": _QUERY_TIMEOUT_S, "login_timeout": _CONNECT_TIMEOUT_S}
+    if connection_url.startswith("mysql+aiomysql"):
+        return {"connect_timeout": _CONNECT_TIMEOUT_S}
+    return {}
+
+
+async def _dispose_engine(engine: Any) -> None:
+    try:
+        await engine.dispose()
+    except Exception:
+        logger.debug("Engine dispose failed (ignored)", exc_info=True)
+
 
 async def get_engine(connection_url: str):
+    """
+    A04: the old cache was unbounded, never disposed, and keyed by the raw
+    connection URL (which embeds the plaintext password) forever. A credential
+    rotation therefore leaked up to pool_size+max_overflow sockets under the
+    stale key and kept the old password resident in memory indefinitely.
+
+    Now keyed by a hash of the URL, bounded, and TTL'd with a real dispose()
+    on both expiry and LRU eviction.
+    """
+    key = hashlib.sha256(connection_url.encode()).hexdigest()
     async with _ENGINES_LOCK:
-        if connection_url not in _ENGINES:
-            from sqlalchemy.ext.asyncio import create_async_engine
-            _ENGINES[connection_url] = create_async_engine(
-                connection_url,
-                pool_pre_ping=True,
-                pool_size=5,
-                max_overflow=10,
-                pool_recycle=1800
-            )
-        return _ENGINES[connection_url]
+        now = time.monotonic()
+        hit = _ENGINES.get(key)
+        if hit is not None:
+            engine, expires_at = hit
+            if now <= expires_at:
+                _ENGINES.move_to_end(key)
+                return engine
+            _ENGINES.pop(key, None)
+            await _dispose_engine(engine)
+
+        from sqlalchemy.ext.asyncio import create_async_engine
+        engine = create_async_engine(
+            connection_url,
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=10,
+            pool_recycle=1800,
+            connect_args=_connect_args_for(connection_url),
+        )
+        _ENGINES[key] = (engine, now + _ENGINE_TTL_S)
+        _ENGINES.move_to_end(key)
+        while len(_ENGINES) > _ENGINES_MAX:
+            _, (old_engine, _old_expiry) = _ENGINES.popitem(last=False)
+            await _dispose_engine(old_engine)
+        return engine
 
 class SqlConnection:
     """Async SQL access for Postgres, SQL Server, and MySQL."""
@@ -84,6 +190,7 @@ class SqlConnection:
         raise ValueError(f"Unsupported SQL provider: {self.provider}")
 
     async def _engine(self):
+        _assert_public_host(self.config.get("host", "localhost"))
         return await get_engine(self._connection_url())
 
     async def test(self) -> None:
@@ -94,113 +201,70 @@ class SqlConnection:
             await conn.execute(text("SELECT 1"))
 
     async def list_tables_with_columns(self) -> List[Dict[str, Any]]:
-        """Introspect schema for admin UI table picker."""
+        """
+        Introspect schema for admin UI table picker.
+
+        A08/A29: one grouped information_schema query per dialect instead of a
+        table-list query plus one extra round trip per table (a 600-table
+        warehouse was 601 sequential queries); the dead try/finally: pass this
+        replaced was leftover from a removed engine.dispose() — A04 restores
+        real disposal at the engine-cache layer instead.
+        """
         from sqlalchemy import text
 
         engine = await self._engine()
-        tables: List[Dict[str, Any]] = []
-        try:
-            async with engine.connect() as conn:
-                if self.dialect == "postgres":
-                    trows = await conn.execute(
-                        text(
-                            """
-                            SELECT table_name
-                            FROM information_schema.tables
-                            WHERE table_schema = :schema
-                              AND table_type = 'BASE TABLE'
-                            ORDER BY table_name
-                            """
-                        ),
-                        {"schema": self.schema},
-                    )
-                    table_names = [r[0] for r in trows.fetchall()]
-                    for tname in table_names:
-                        crows = await conn.execute(
-                            text(
-                                """
-                                SELECT column_name, data_type
-                                FROM information_schema.columns
-                                WHERE table_schema = :schema AND table_name = :table
-                                ORDER BY ordinal_position
-                                """
-                            ),
-                            {"schema": self.schema, "table": tname},
-                        )
-                        tables.append(
-                            {
-                                "name": tname,
-                                "columns": [{"name": r[0], "type": r[1]} for r in crows.fetchall()],
-                            }
-                        )
-                elif self.dialect == "mysql":
-                    db = self.config.get("database", "")
-                    trows = await conn.execute(
-                        text(
-                            """
-                            SELECT table_name
-                            FROM information_schema.tables
-                            WHERE table_schema = :db AND table_type = 'BASE TABLE'
-                            ORDER BY table_name
-                            """
-                        ),
-                        {"db": db},
-                    )
-                    table_names = [r[0] for r in trows.fetchall()]
-                    for tname in table_names:
-                        crows = await conn.execute(
-                            text(
-                                """
-                                SELECT column_name, data_type
-                                FROM information_schema.columns
-                                WHERE table_schema = :db AND table_name = :table
-                                ORDER BY ordinal_position
-                                """
-                            ),
-                            {"db": db, "table": tname},
-                        )
-                        tables.append(
-                            {
-                                "name": tname,
-                                "columns": [{"name": r[0], "type": r[1]} for r in crows.fetchall()],
-                            }
-                        )
-                elif self.dialect == "sqlserver":
-                    trows = await conn.execute(
-                        text(
-                            """
-                            SELECT TABLE_NAME
-                            FROM INFORMATION_SCHEMA.TABLES
-                            WHERE TABLE_SCHEMA = :schema AND TABLE_TYPE = 'BASE TABLE'
-                            ORDER BY TABLE_NAME
-                            """
-                        ),
-                        {"schema": self.schema},
-                    )
-                    table_names = [r[0] for r in trows.fetchall()]
-                    for tname in table_names:
-                        crows = await conn.execute(
-                            text(
-                                """
-                                SELECT COLUMN_NAME, DATA_TYPE
-                                FROM INFORMATION_SCHEMA.COLUMNS
-                                WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :table
-                                ORDER BY ORDINAL_POSITION
-                                """
-                            ),
-                            {"schema": self.schema, "table": tname},
-                        )
-                        tables.append(
-                            {
-                                "name": tname,
-                                "columns": [{"name": r[0], "type": r[1]} for r in crows.fetchall()],
-                            }
-                        )
-                else:
-                    raise ValueError(f"Schema discovery not supported for {self.dialect}")
-        finally:
-            pass
-        return tables
+        grouped: "OrderedDict[str, List[Dict[str, str]]]" = OrderedDict()
+        async with engine.connect() as conn:
+            if self.dialect == "postgres":
+                rows = await conn.execute(
+                    text(
+                        """
+                        SELECT c.table_name, c.column_name, c.data_type
+                        FROM information_schema.columns c
+                        JOIN information_schema.tables t
+                          ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+                        WHERE c.table_schema = :schema AND t.table_type = 'BASE TABLE'
+                        ORDER BY c.table_name, c.ordinal_position
+                        """
+                    ),
+                    {"schema": self.schema},
+                )
+            elif self.dialect == "mysql":
+                db = self.config.get("database", "")
+                rows = await conn.execute(
+                    text(
+                        """
+                        SELECT c.table_name, c.column_name, c.data_type
+                        FROM information_schema.columns c
+                        JOIN information_schema.tables t
+                          ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+                        WHERE c.table_schema = :db AND t.table_type = 'BASE TABLE'
+                        ORDER BY c.table_name, c.ordinal_position
+                        """
+                    ),
+                    {"db": db},
+                )
+            elif self.dialect == "sqlserver":
+                rows = await conn.execute(
+                    text(
+                        """
+                        SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE
+                        FROM INFORMATION_SCHEMA.COLUMNS c
+                        JOIN INFORMATION_SCHEMA.TABLES t
+                          ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME
+                        WHERE c.TABLE_SCHEMA = :schema AND t.TABLE_TYPE = 'BASE TABLE'
+                        ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
+                        """
+                    ),
+                    {"schema": self.schema},
+                )
+            else:
+                raise ValueError(f"Schema discovery not supported for {self.dialect}")
+
+            for table_name, column_name, data_type in rows.fetchall():
+                grouped.setdefault(table_name, []).append({"name": column_name, "type": data_type})
+
+        return [{"name": name, "columns": cols} for name, cols in grouped.items()]
 
     def _qualified(self, table: str) -> str:
         t = _quote_ident(table, self.dialect)
@@ -216,19 +280,28 @@ class SqlConnection:
         if self.read_only and not sql.strip().upper().startswith("SELECT"):
             raise PermissionError("Integration is read-only — SELECT only.")
 
-        engine = await self._engine()
-        async with engine.connect() as conn:
-            result = await conn.execute(text(sql), params or {})
-            return list(result.fetchall())
+        async def _run():
+            engine = await self._engine()
+            async with engine.connect() as conn:
+                result = await conn.execute(text(sql), params or {})
+                return list(result.fetchall())
+
+        # P05: belt-and-suspenders on top of the driver connect_args — some
+        # drivers (pymssql) don't enforce a distinct per-query timeout, so a
+        # slow query past connect can still hang the worker without this.
+        return await asyncio.wait_for(_run(), timeout=_CONNECT_TIMEOUT_S + _QUERY_TIMEOUT_S)
 
     async def execute_write(self, sql: str, params: Optional[Dict[str, Any]] = None) -> None:
         if self.read_only:
             raise PermissionError("Integration is read-only — writes are disabled.")
         from sqlalchemy import text
 
-        engine = await self._engine()
-        async with engine.begin() as conn:
-            await conn.execute(text(sql), params or {})
+        async def _run():
+            engine = await self._engine()
+            async with engine.begin() as conn:
+                await conn.execute(text(sql), params or {})
+
+        await asyncio.wait_for(_run(), timeout=_CONNECT_TIMEOUT_S + _QUERY_TIMEOUT_S)
 
 
 class SqlPOSAdapter:
@@ -261,18 +334,22 @@ class SqlPOSAdapter:
             price_c = self._col("products", "price")
             stock_c = self._col("products", "stock")
             desc_c = self._col("products", "description")
+            # A11: the legacy path had no row limit at all — fetch_all would
+            # materialize the whole table. Match the dialect-aware cap used on
+            # the mapped path below.
+            limit_clause = "TOP 50 " if self.sql.dialect == "sqlserver" else ""
+            select_prefix = f"SELECT {limit_clause}{name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt}"
 
             if not is_generic:
-                if self.sql.dialect == "sqlserver":
-                    sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} LIKE :q"
-                elif self.sql.dialect == "mysql":
-                    sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} LIKE :q"
-                else:
-                    sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} ILIKE :q"
-                params = {"q": f"%{query.strip()}%"}
+                like_op = "ILIKE" if self.sql.dialect == "postgres" else "LIKE"
+                sql = f"{select_prefix} WHERE {name_c} {like_op} :q ESCAPE '\\'"
+                params = {"q": f"%{_escape_like(query.strip())}%"}
             else:
-                sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt}"
+                sql = select_prefix
                 params = None
+
+            if self.sql.dialect != "sqlserver":
+                sql += " LIMIT 50"
 
             try:
                 rows = await self.sql.fetch_all(sql, params)
@@ -367,7 +444,7 @@ class SqlPOSAdapter:
             where_parts = []
             for sc in search_cols:
                 if sc:
-                    where_parts.append(f"{_quote_ident(str(sc), self.sql.dialect)} {like_op} :q")
+                    where_parts.append(f"{_quote_ident(str(sc), self.sql.dialect)} {like_op} :q ESCAPE '\\'")
             if not where_parts and cols_map:
                 name_col = (
                     cols_map.get("name")
@@ -377,12 +454,12 @@ class SqlPOSAdapter:
                     or cols_map.get("description")
                     or list(cols_map.values())[0]
                 )
-                where_parts.append(f"{_quote_ident(str(name_col), self.sql.dialect)} {like_op} :q")
+                where_parts.append(f"{_quote_ident(str(name_col), self.sql.dialect)} {like_op} :q ESCAPE '\\'")
                 # Also search description-like columns when asking about experience
                 for key in ("description", "details", "notes", "summary", "type", "category"):
                     if key in cols_map and cols_map[key] != name_col:
                         where_parts.append(
-                            f"{_quote_ident(str(cols_map[key]), self.sql.dialect)} {like_op} :q"
+                            f"{_quote_ident(str(cols_map[key]), self.sql.dialect)} {like_op} :q ESCAPE '\\'"
                         )
 
             where_sql = " OR ".join(where_parts)
@@ -394,12 +471,12 @@ class SqlPOSAdapter:
                 if not is_generic and not table_matched and where_sql:
                     # Capability query with specific words — also filter when possible
                     sql = f"SELECT {', '.join(select_parts)} FROM {qt} WHERE ({where_sql})"
-                    params = {"q": f"%{query.strip()}%"}
+                    params = {"q": f"%{_escape_like(query.strip())}%"}
             else:
                 if not where_sql:
                     continue
                 sql = f"SELECT {', '.join(select_parts)} FROM {qt} WHERE ({where_sql})"
-                params = {"q": f"%{query.strip()}%"}
+                params = {"q": f"%{_escape_like(query.strip())}%"}
 
             if self.sql.dialect == "sqlserver":
                 sql = sql.replace("SELECT", "SELECT TOP 15", 1)
@@ -478,20 +555,62 @@ class SqlPOSAdapter:
 
         return f"Order #{db_id} Details: Status={db_status}, Items={db_items}, Total={db_total}."
 
+    _NOT_FOUND_MARKERS = (
+        "No products found",
+        "No matching records found",
+        "returned no rows",
+        "query error",
+        "Inventory query failed",
+    )
+    _MAPPED_BULLET_RE = re.compile(r"^\s*•\s*(.+)$")
+
     async def lookup_product(self, product_name: str) -> Optional[Dict[str, Any]]:
         catalog = await self.list_products(product_name)
-        if "No products found" in catalog:
+        if any(marker in catalog for marker in self._NOT_FOUND_MARKERS):
             return None
-        first_line = catalog.split("\n")[1] if "\n" in catalog else catalog
-        m = re.match(r"- (.+?): Price=(.+?), In Stock=(\d+)", first_line)
-        if not m:
-            return {"name": product_name, "price": "0", "stock_quantity": 1, "description": ""}
-        return {
-            "name": m.group(1),
-            "price": m.group(2),
-            "stock_quantity": int(m.group(3)),
-            "description": "",
-        }
+
+        lines = catalog.split("\n")
+        legacy_line = lines[1] if len(lines) > 1 else catalog
+        m = re.match(r"- (.+?): Price=(.+?), In Stock=(\d+)", legacy_line)
+        if m:
+            return {
+                "name": m.group(1),
+                "price": m.group(2),
+                "stock_quantity": int(m.group(3)),
+                "description": "",
+            }
+
+        # A10: the mapped path never matches the legacy "- Name: Price=..."
+        # shape (it's "[Label]\n  • Name (key: val, ...)"), so the regex above
+        # always misses for tenants using mapped tables. Returning a fabricated
+        # {price: "0", stock: 1} let the agent confirm an imaginary $0 item to a
+        # caller. Best-effort parse the mapped bullet; otherwise say not found.
+        for line in lines:
+            bullet = self._MAPPED_BULLET_RE.match(line)
+            if not bullet:
+                continue
+            name_part, _, extras_part = bullet.group(1).partition(" (")
+            extras: Dict[str, str] = {}
+            if extras_part.endswith(")"):
+                for pair in extras_part[:-1].split(", "):
+                    k, _, v = pair.partition(": ")
+                    if k:
+                        extras[k.strip().lower()] = v.strip()
+            price = extras.get("price") or extras.get("cost")
+            stock_raw = extras.get("stock") or extras.get("stock_quantity") or extras.get("quantity")
+            if price is None and stock_raw is None:
+                return None
+            try:
+                stock_val = int(re.sub(r"[^\d-]", "", stock_raw)) if stock_raw else 0
+            except ValueError:
+                stock_val = 0
+            return {
+                "name": name_part.strip() or product_name,
+                "price": price or "0",
+                "stock_quantity": stock_val,
+                "description": "",
+            }
+        return None
 
     async def create_order(
         self,

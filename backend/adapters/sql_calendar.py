@@ -23,7 +23,15 @@ class SqlCalendarAdapter:
         time_c = _quote_ident(cols.get("time", "time"), self.sql.dialect)
         status_c = _quote_ident(cols.get("status", "status"), self.sql.dialect)
 
-        sql = f"SELECT 1 FROM {qt} WHERE {date_c} = :d AND {time_c} = :t AND {status_c} != :cancelled LIMIT 1"
+        # A12: LIMIT is invalid T-SQL syntax — every availability check errored
+        # for sqlserver tenants.
+        if self.sql.dialect == "sqlserver":
+            sql = (
+                f"SELECT TOP 1 1 FROM {qt} WHERE {date_c} = :d AND {time_c} = :t "
+                f"AND {status_c} != :cancelled"
+            )
+        else:
+            sql = f"SELECT 1 FROM {qt} WHERE {date_c} = :d AND {time_c} = :t AND {status_c} != :cancelled LIMIT 1"
         rows = await self.sql.fetch_all(sql, {"d": date_str, "t": time_str, "cancelled": "cancelled"})
         return len(rows) == 0
 

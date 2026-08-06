@@ -17,11 +17,14 @@ class GoogleCalendarAdapter:
         self.read_only = bool(config.get("read_only", False))
 
     async def check_availability(self, date_str: str, time_str: str) -> bool:
-        # Full OAuth implementation deferred — test confirms config present
-        if not self.config.get("access_token") and not self.config.get("service_account_json"):
-            raise ValueError("Google Calendar requires access_token or service_account_json.")
-        logger.info("Google Calendar availability check for %s %s (tenant=%s)", date_str, time_str, self.tenant.tenant_id)
-        return True
+        # A14: booking (below) already raises NotImplementedError, but this
+        # unconditionally returned True — so test_connection showed a green
+        # check and the agent would confirm ANY slot as open, then fail only
+        # when it tried to actually book it. Fail closed instead.
+        raise NotImplementedError(
+            "Google Calendar availability checking is not implemented yet — "
+            "use the internal or SQL calendar until OAuth wiring lands."
+        )
 
     async def book_slot(
         self,

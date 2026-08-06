@@ -1,8 +1,9 @@
 from typing import Any, Dict
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
 from backend.auth.dependencies import get_current_user, require_super_admin
+from backend.auth.rate_limit import check_rate_limit
 from backend.auth.service import (
     UserSession,
     get_or_create_publishable_key,
@@ -11,15 +12,27 @@ from backend.auth.service import (
     regenerate_api_key,
     regenerate_publishable_key,
     register_client,
+    verify_email,
 )
 from backend.tenant.registry import resolve_tenant_by_api_key
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _enforce_rate_limit(request: Request, bucket: str, limit: int, window_seconds: float) -> None:
+    """S13: no limiter, no lockout, no CAPTCHA existed on any of these routes."""
+    if not check_rate_limit(bucket, _client_ip(request), limit=limit, window_seconds=window_seconds):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please try again later.")
+
+
 @router.post("/register")
-async def register(payload: Dict[str, Any] = Body(...)):
+async def register(request: Request, payload: Dict[str, Any] = Body(...)):
     """Client self-registration — creates tenant + user, returns API key once."""
+    _enforce_rate_limit(request, "register", limit=3, window_seconds=3600)
     try:
         return await register_client(
             org_name=payload.get("org_name") or "",
@@ -31,9 +44,22 @@ async def register(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+@router.post("/verify-email")
+async def verify_email_route(payload: Dict[str, Any] = Body(...)):
+    """S24: activate the account from the single-use link sent at registration."""
+    token = (payload.get("token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+    ok = await verify_email(token)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Invalid or already-used verification token")
+    return {"message": "Email verified. You can now log in."}
+
+
 @router.post("/login")
-async def login(payload: Dict[str, Any] = Body(...)):
+async def login(request: Request, payload: Dict[str, Any] = Body(...)):
     """Email + password login → JWT session."""
+    _enforce_rate_limit(request, "login", limit=5, window_seconds=60)
     email = payload.get("email")
     password = payload.get("password")
     api_key = (payload.get("api_key") or "").strip()
@@ -113,8 +139,9 @@ async def regenerate_pk(user: UserSession = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 @router.post("/forgot-password")
-async def forgot_password(payload: Dict[str, Any] = Body(...)):
+async def forgot_password(request: Request, payload: Dict[str, Any] = Body(...)):
     """Request a password reset link. Sends via AWS SES email."""
+    _enforce_rate_limit(request, "forgot-password", limit=3, window_seconds=3600)
     import secrets
     import hashlib
     from datetime import datetime, timezone, timedelta
@@ -177,13 +204,19 @@ async def reset_password(payload: Dict[str, Any] = Body(...)):
     if exp_time < datetime.now(timezone.utc):
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
         
-    # Valid token, update password and clear token
+    # Valid token, update password and clear token. S18: bump token_version so
+    # every JWT issued before this reset stops working immediately instead of
+    # remaining valid for its full 72h lifetime.
     await db.users.update_one(
         {"user_id": user["user_id"]},
         {
             "$set": {"password_hash": hash_password(password)},
-            "$unset": {"reset_token_hash": "", "reset_token_exp": ""}
+            "$unset": {"reset_token_hash": "", "reset_token_exp": ""},
+            "$inc": {"token_version": 1},
         }
     )
-    
-    return {"message": "Password reset successfully. You can now log in with your new password."}
+
+    return {
+        "message": "Password reset successfully. You can now log in with your new password. "
+        "For extra safety, consider rotating your API key from the dashboard."
+    }

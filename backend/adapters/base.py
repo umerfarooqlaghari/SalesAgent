@@ -1,6 +1,23 @@
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 
+# A30: composite/routing code used to test raw adapter prose ("No order found"
+# not in result) to decide what happened. Centralizing the sentinel here means
+# a wording change in one adapter can't silently flip control flow elsewhere —
+# still string-based (a full result dataclass would touch every adapter's
+# public contract), but now there's exactly one definition to keep in sync.
+NOT_FOUND_MARKER = "No order found"
+ERROR_PREFIX = "Error:"
+
+
+def is_not_found(result: str) -> bool:
+    return NOT_FOUND_MARKER in (result or "")
+
+
+def is_error(result: str) -> bool:
+    return ERROR_PREFIX in (result or "")[:20]
+
+
 @runtime_checkable
 class CRMAdapter(Protocol):
     async def search_company(self, company: str) -> str: ...

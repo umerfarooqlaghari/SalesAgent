@@ -1,7 +1,6 @@
 """Normalize table_map — legacy single-table + multi-table mapped_tables."""
 from __future__ import annotations
 
-import uuid
 from typing import Any, Dict, List, Optional
 
 
@@ -21,7 +20,11 @@ def get_mapped_tables(table_map: Dict[str, Any], category: str) -> List[Dict[str
     """Return enabled mapped table configs, migrating legacy shapes if needed."""
     raw = table_map.get("mapped_tables")
     if isinstance(raw, list) and raw:
-        return [t for t in raw if t.get("enabled", True) and t.get("table")]
+        # A31: admin-authored JSON isn't guaranteed to be a list of dicts.
+        return [
+            t for t in raw
+            if isinstance(t, dict) and t.get("enabled", True) and t.get("table")
+        ]
 
     migrated: List[Dict[str, Any]] = []
     if category == "crm":

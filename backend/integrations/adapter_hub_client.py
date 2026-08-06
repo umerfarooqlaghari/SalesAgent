@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -11,6 +12,26 @@ from backend.config import settings
 logger = logging.getLogger(__name__)
 
 AGENT_ID = "sales_agent"
+
+
+def _assert_safe_transport(base: str) -> None:
+    """
+    A23: a tenant's plaintext DB password is about to cross the network in
+    sync_tenant_inventory. Refuse unless the hub URL is HTTPS or loopback.
+    """
+    parsed = urlparse(base)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https" or host in ("localhost", "127.0.0.1", "::1"):
+        return
+    raise RuntimeError(
+        f"Refusing to sync tenant DB credentials to a non-HTTPS adapter-hub URL ({parsed.scheme or 'no scheme'})"
+    )
+
+
+def _scrub(text: str, secret: Optional[str]) -> str:
+    if secret:
+        text = text.replace(secret, "***")
+    return text
 
 
 def _headers(tenant_id: str) -> Dict[str, str]:
@@ -50,27 +71,33 @@ def mapped_tables_to_whitelist(mapped_tables: List[Dict[str, Any]]) -> Dict[str,
 
         # Also populate canonical slots when role matches
         if role == "products" and "products" not in whitelist:
+            # A22: "0"/"Pending"/"" are DATA defaults, not column names. Putting
+            # them where a physical column name belongs produced queries like
+            # SELECT "0" AS price against the tenant's own database. Omit the
+            # key entirely when no source column maps to it.
+            product_cols = {
+                "id": cols.get("id") or cols.get("sku") or next(iter(cols.values())),
+                "name": cols.get("name") or cols.get("title") or next(iter(cols.values())),
+                "price": cols.get("price"),
+                "stock_quantity": cols.get("stock") or cols.get("stock_quantity"),
+                "description": cols.get("description") or cols.get("details"),
+            }
             whitelist["products"] = {
                 "table": table,
-                "columns": {
-                    "id": cols.get("id") or cols.get("sku") or next(iter(cols.values())),
-                    "name": cols.get("name") or cols.get("title") or next(iter(cols.values())),
-                    "price": cols.get("price") or "0",
-                    "stock_quantity": cols.get("stock") or cols.get("stock_quantity") or "0",
-                    "description": cols.get("description") or cols.get("details"),
-                },
+                "columns": {k: v for k, v in product_cols.items() if v},
             }
         elif role in ("orders",) and "orders" not in whitelist:
+            order_cols = {
+                "id": cols.get("id") or next(iter(cols.values())),
+                "customer_email": cols.get("email") or cols.get("customer_email"),
+                "customer_phone": cols.get("phone"),
+                "status": cols.get("status"),
+                "total_price": cols.get("total") or cols.get("total_price"),
+                "items": cols.get("items") or cols.get("description") or cols.get("name"),
+            }
             whitelist["orders"] = {
                 "table": table,
-                "columns": {
-                    "id": cols.get("id") or next(iter(cols.values())),
-                    "customer_email": cols.get("email") or cols.get("customer_email") or "",
-                    "customer_phone": cols.get("phone"),
-                    "status": cols.get("status") or "Pending",
-                    "total_price": cols.get("total") or cols.get("total_price") or "0",
-                    "items": cols.get("items") or cols.get("description") or cols.get("name") or "",
-                },
+                "columns": {k: v for k, v in order_cols.items() if v},
             }
 
     return whitelist
@@ -126,7 +153,9 @@ async def retrieve(tenant_id: str, query: str, top_k: int = 5) -> List[Dict[str,
     if not base or not settings.ADAPTER_HUB_ENABLED:
         return []
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        # P04: this is an optional enrichment on the voice critical path. A 10s
+        # timeout here exceeded the entire turn budget on its own.
+        async with httpx.AsyncClient(timeout=1.5) as client:
             r = await client.post(
                 f"{base}/retrieve",
                 headers=_headers(tenant_id),
@@ -168,7 +197,15 @@ async def sync_tenant_inventory(
         "ssl": resolved_config.get("ssl", True),
     }
 
-    await register_connection(tenant_id, provider, hub_config)
-    await save_whitelist(tenant_id, whitelist)
-    sync_result = await trigger_sync(tenant_id)
-    return sync_result
+    # A23: assert https/loopback before the password ever leaves this process,
+    # and scrub it out of any exception text that bubbles up to logs.
+    password = hub_config.get("password")
+    _assert_safe_transport(_base())
+
+    try:
+        await register_connection(tenant_id, provider, hub_config)
+        await save_whitelist(tenant_id, whitelist)
+        sync_result = await trigger_sync(tenant_id)
+        return sync_result
+    except Exception as e:
+        raise RuntimeError(_scrub(str(e), password)) from None

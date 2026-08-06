@@ -63,12 +63,17 @@ class Harness:
                 inventory_intent=False, tool_overrides=None):
         self.llm = ScriptedLLM(script)
 
-        class Ctx:
-            org_name = org
-            tenant_id = "acme_1234"
+        from backend.tenant.context import IntegrationConfigs, TenantContext, TenantSettings
+
+        ctx = TenantContext(
+            tenant_id="acme_1234",
+            org_name=org,
+            settings=TenantSettings(company_description="A family dental practice."),
+            integrations=IntegrationConfigs(),
+        )
 
         async def _tenant(tid):
-            return Ctx()
+            return ctx
 
         async def _prompt(tid, fallback):
             return prompt
@@ -133,3 +138,53 @@ class Harness:
 @pytest.fixture
 def harness(monkeypatch):
     return Harness(monkeypatch)
+
+
+# ---------------------------------------------------------------- DB counting
+_COUNTED_OPS = {
+    "find_one", "count_documents", "update_one", "update_many", "insert_one",
+    "insert_many", "delete_one", "delete_many", "find_one_and_update",
+    "aggregate", "distinct",
+}
+
+
+class _CountingCollection:
+    def __init__(self, coll, counter):
+        self._coll = coll
+        self._counter = counter
+
+    def __getattr__(self, name):
+        attr = getattr(self._coll, name)
+        if name not in _COUNTED_OPS:
+            return attr
+
+        async def wrapped(*args, **kwargs):
+            self._counter[name] = self._counter.get(name, 0) + 1
+            self._counter["total"] = self._counter.get("total", 0) + 1
+            return await attr(*args, **kwargs)
+
+        return wrapped
+
+
+class CountingDB:
+    """
+    Wraps a Motor/mongomock database and counts operations.
+
+    mongomock returns a fresh collection object on each attribute access, so a
+    counter has to be installed at this level rather than by patching a method
+    on `db.some_collection`.
+    """
+
+    def __init__(self, db):
+        self._db = db
+        self.counter = {}
+
+    def __getattr__(self, name):
+        return _CountingCollection(getattr(self._db, name), self.counter)
+
+    @property
+    def total(self):
+        return self.counter.get("total", 0)
+
+    def reset(self):
+        self.counter.clear()

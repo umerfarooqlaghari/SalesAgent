@@ -1,4 +1,7 @@
+import asyncio
 import logging
+import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -62,8 +65,12 @@ async def seed_default_tenant() -> None:
     )
     logger.info("Seeded default tenant '%s' with test API key.", DEFAULT_TENANT_ID)
 
-    # Keep legacy api_keys doc for backward compatibility during transition
-    if not await db.api_keys.find_one({"key": DEFAULT_TEST_API_KEY}):
+    # S05: the legacy plaintext key is a convenience for local dev/demo only —
+    # in production this becomes a live, undocumented admin credential for the
+    # default tenant that anyone with the repo can use.
+    from backend.config import settings
+
+    if not settings.is_production and not await db.api_keys.find_one({"key": DEFAULT_TEST_API_KEY}):
         await db.api_keys.insert_one(
             {"key": DEFAULT_TEST_API_KEY, "owner": "Alpha Default", "active": True, "tenant_id": DEFAULT_TENANT_ID}
         )
@@ -120,7 +127,13 @@ async def resolve_tenant_by_api_key(api_key: str) -> Optional[TenantContext]:
         set_key_scope("secret")
         return TenantContext.from_document(doc)
 
-    # Legacy fallback: api_keys collection → default tenant
+    # S05: legacy plaintext fallback — dev/demo convenience only. Never honor
+    # it in production, where it would be an undocumented always-on admin key.
+    from backend.config import settings
+
+    if settings.is_production:
+        return None
+
     legacy = await db.api_keys.find_one({"key": api_key, "active": True})
     if legacy:
         tenant_id = legacy.get("tenant_id", DEFAULT_TENANT_ID)
@@ -156,12 +169,90 @@ async def ensure_publishable_keys() -> int:
     return created
 
 
-async def get_tenant_by_id(tenant_id: str) -> Optional[TenantContext]:
-    db = get_db()
-    doc = await db.tenants.find_one({"tenant_id": tenant_id, "status": "active"})
-    if not doc:
+# P01: this used to be an uncached find_one for the FULL tenant document — the
+# entire system prompt plus every integration config — and it is called 6+ times
+# per voice turn (voice greeting, sdr_node, get_tenant_system_prompt, once per
+# tool via _load_tenant_context, twice in the voice fast path). At Atlas latency
+# that alone accounted for several hundred ms of every spoken turn.
+_TENANT_CACHE: "OrderedDict[str, tuple[float, Optional[TenantContext]]]" = OrderedDict()
+_TENANT_CACHE_TTL = 60.0
+_TENANT_CACHE_MAX = 2000
+_TENANT_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def invalidate_tenant_cache(tenant_id: Optional[str] = None) -> None:
+    """Clear ONLY the tenant-document cache. Prefer invalidate_tenant()."""
+    if tenant_id is None:
+        _TENANT_CACHE.clear()
+    else:
+        _TENANT_CACHE.pop(tenant_id, None)
+
+
+def invalidate_tenant(tenant_id: Optional[str] = None) -> None:
+    """
+    Drop every per-tenant cache after a write to the tenant document.
+
+    Call this from ANY code path that mutates `tenants` — settings, integrations,
+    billing tier, prompt repair. Missing a call means an admin saves a change and
+    the agent keeps using the old config for up to a minute.
+    """
+    invalidate_tenant_cache(tenant_id)
+
+    try:
+        from backend.integrations.tenant_inventory import invalidate_inventory_mappings
+
+        invalidate_inventory_mappings(tenant_id)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("inventory mapping invalidation failed", exc_info=True)
+
+    if tenant_id:
+        try:
+            from backend.integrations.catalog_cache import invalidate_catalog
+
+            invalidate_catalog(tenant_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("catalog invalidation failed", exc_info=True)
+
+
+def _cached_tenant(tenant_id: str) -> Optional[TenantContext]:
+    hit = _TENANT_CACHE.get(tenant_id)
+    if not hit:
         return None
-    return TenantContext.from_document(doc)
+    expires_at, ctx = hit
+    if time.monotonic() > expires_at:
+        _TENANT_CACHE.pop(tenant_id, None)
+        return None
+    _TENANT_CACHE.move_to_end(tenant_id)
+    return ctx
+
+
+async def get_tenant_by_id(tenant_id: str) -> Optional[TenantContext]:
+    if not tenant_id:
+        return None
+
+    cached = _cached_tenant(tenant_id)
+    if cached is not None:
+        return cached
+
+    lock = _TENANT_LOCKS.setdefault(tenant_id, asyncio.Lock())
+    async with lock:
+        # Double-check: a concurrent turn may have populated it while we queued.
+        cached = _cached_tenant(tenant_id)
+        if cached is not None:
+            return cached
+
+        db = get_db()
+        doc = await db.tenants.find_one(
+            {"tenant_id": tenant_id, "status": "active"}, max_time_ms=2000
+        )
+        ctx = TenantContext.from_document(doc) if doc else None
+        if ctx is not None:
+            _TENANT_CACHE[tenant_id] = (time.monotonic() + _TENANT_CACHE_TTL, ctx)
+            _TENANT_CACHE.move_to_end(tenant_id)
+            while len(_TENANT_CACHE) > _TENANT_CACHE_MAX:
+                _TENANT_CACHE.popitem(last=False)
+        _TENANT_LOCKS.pop(tenant_id, None)
+        return ctx
 
 
 async def migrate_stale_tenant_prompts() -> None:
@@ -215,12 +306,11 @@ async def get_tenant_system_prompt(tenant_id: str, fallback: str) -> str:
         if is_alpha_default_prompt(prompt):
             desc = ctx.settings.company_description or ""
             prompt = build_tenant_system_prompt(ctx.org_name, desc)
-            db = get_db()
-            await db.tenants.update_one(
-                {"tenant_id": tenant_id},
-                {"$set": {"settings.system_prompt": prompt}},
-            )
-            logger.info("Auto-fixed stale Alpha prompt for tenant %s", tenant_id)
+            # P12: the repair used to be written back inline, putting a Mongo
+            # update on every spoken turn until it succeeded. The startup
+            # migration (migrate_stale_tenant_prompts) owns persistence; here we
+            # just use the corrected prompt for this turn.
+            logger.info("Using repaired prompt for tenant %s (persisted at startup)", tenant_id)
 
     return prompt
 

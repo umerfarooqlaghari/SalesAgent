@@ -4,19 +4,26 @@ Caches POS database lookups and tenant catalog data to minimize database latency
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Fallback in-memory cache when Redis is unavailable or unconfigured
+# Fallback in-memory cache when Redis is unavailable or unconfigured.
+# A05: bounded + evicted on every write, not just lazily on a read of an
+# expired key — every query gets memoized here too (even when Redis already
+# has it), so with no cap this mirrors the entire cross-tenant keyspace forever.
 # Structure: { f"{tenant_id}:{query_key}": {"value": str, "expires_at": float} }
-_IN_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
+_IN_MEMORY_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_IN_MEMORY_MAX = 5000
 
 _redis_client: Any = None
+_redis_lock = asyncio.Lock()
 _last_redis_check_time: float = 0
 _REDIS_RETRY_INTERVAL: float = 30.0  # Retry connecting every 30s if failed
 
@@ -42,31 +49,49 @@ def normalize_query_key(query: str) -> str:
 
 async def _get_redis_client() -> Any:
     global _redis_client, _last_redis_check_time
-    now = time.time()
-    
+
     if _redis_client is not None:
         return _redis_client
 
-    if now - _last_redis_check_time < _REDIS_RETRY_INTERVAL:
-        return None
+    # A06: without a lock, N concurrent callers each raced past the None check
+    # and built their own client/connection pool; only the last one assigned to
+    # the global was ever closed, the rest leaked.
+    async with _redis_lock:
+        if _redis_client is not None:
+            return _redis_client
 
-    _last_redis_check_time = now
-    url = (settings.REDIS_URL or "").strip()
-    if not url:
-        logger.info("REDIS_URL is empty — using in-memory query cache.")
-        return None
+        now = time.time()
+        if now - _last_redis_check_time < _REDIS_RETRY_INTERVAL:
+            return None
+        _last_redis_check_time = now
 
-    try:
-        import redis.asyncio as redis
-        client = redis.from_url(url, decode_responses=True, socket_connect_timeout=3.0)
-        await client.ping()
-        _redis_client = client
-        logger.info("Connected to Redis for query caching at %s", url)
-    except Exception as e:
-        logger.warning("Failed to connect to Redis (%s) — falling back to in-memory query cache.", e)
-        _redis_client = None
+        url = (settings.REDIS_URL or "").strip()
+        if not url:
+            logger.info("REDIS_URL is empty — using in-memory query cache.")
+            return None
 
-    return _redis_client
+        client = None
+        try:
+            import redis.asyncio as redis
+            client = redis.from_url(
+                url,
+                decode_responses=True,
+                socket_connect_timeout=3.0,
+                socket_timeout=2.0,
+            )
+            await client.ping()
+            _redis_client = client
+            logger.info("Connected to Redis for query caching at %s", url)
+        except Exception as e:
+            logger.warning("Failed to connect to Redis (%s) — falling back to in-memory query cache.", e)
+            _redis_client = None
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+
+        return _redis_client
 
 
 def _make_key(tenant_id: str, query_key: str) -> str:
@@ -94,6 +119,7 @@ async def get_query_cache(tenant_id: str, query_key: str) -> Optional[str]:
     if entry:
         if time.time() <= float(entry.get("expires_at", 0)):
             logger.debug("In-memory query cache HIT for key %s", full_key)
+            _IN_MEMORY_CACHE.move_to_end(full_key)
             return str(entry.get("value", ""))
         else:
             _IN_MEMORY_CACHE.pop(full_key, None)
@@ -119,6 +145,9 @@ async def set_query_cache(tenant_id: str, query_key: str, value: str, ttl: int =
         "value": value,
         "expires_at": time.time() + ttl
     }
+    _IN_MEMORY_CACHE.move_to_end(full_key)
+    while len(_IN_MEMORY_CACHE) > _IN_MEMORY_MAX:
+        _IN_MEMORY_CACHE.popitem(last=False)
 
 
 async def invalidate_tenant_query_cache(tenant_id: str, query_key: Optional[str] = None) -> None:
@@ -138,7 +167,10 @@ async def invalidate_tenant_query_cache(tenant_id: str, query_key: Optional[str]
                 full_key = _make_key(tenant_id, query_key)
                 await redis_cli.delete(full_key)
             else:
-                keys = await redis_cli.keys(f"{prefix}*")
+                # A07: KEYS blocks the single-threaded Redis server for every
+                # tenant until it has scanned the whole keyspace. scan_iter
+                # cursors through it in batches instead.
+                keys = [k async for k in redis_cli.scan_iter(match=f"{prefix}*", count=500)]
                 if keys:
                     await redis_cli.delete(*keys)
         except Exception as e:
