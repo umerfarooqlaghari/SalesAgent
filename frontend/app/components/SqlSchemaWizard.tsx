@@ -414,18 +414,35 @@ export default function SqlSchemaWizard({
         /* ignore quota */
       }
 
+      // F07: re-scanning used to unconditionally replace mapped_tables (and
+      // silently cap it at 12), discarding hours of column-level curation with
+      // no confirm and no undo. Keep every existing mapping untouched; only
+      // ADD suggestions for tables that aren't mapped yet.
+      const existingNames = new Set(mappedTables.map((m) => m.table));
       const suggested = (data.suggested_mapped_tables || []) as MappedTable[];
-      const fallback =
-        suggested.length > 0
-          ? suggested.filter((t) => t.enabled).slice(0, 12)
-          : migrateLegacyMapped(category, { ...tableMap, ...(data.suggested_table_map || {}) });
+      const newFromSuggestions = suggested.filter((t) => t.enabled && !existingNames.has(t.table));
+
+      const merged =
+        newFromSuggestions.length > 0
+          ? [...mappedTables, ...newFromSuggestions]
+          : mappedTables.length > 0
+            ? mappedTables
+            : migrateLegacyMapped(category, { ...tableMap, ...(data.suggested_table_map || {}) });
 
       onConfigChange({
         ...config,
-        table_map: { ...tableMap, ...(data.suggested_table_map || {}), mapped_tables: fallback },
+        table_map: { ...tableMap, mapped_tables: merged },
       });
-      if (fallback[0]) setExpandedId(fallback[0].id);
-      onMessage?.(data.message || `Found ${data.tables?.length || 0} tables in your database.`);
+
+      const addedCount = merged.length - mappedTables.length;
+      if (addedCount > 0) {
+        setExpandedId(merged[mappedTables.length].id);
+        onMessage?.(
+          `Found ${data.tables?.length || 0} tables — added ${addedCount} new table${addedCount === 1 ? "" : "s"}. Your existing mappings were kept as-is.`
+        );
+      } else {
+        onMessage?.(data.message || `Found ${data.tables?.length || 0} tables in your database.`);
+      }
     } catch (e: unknown) {
       onMessage?.(e instanceof Error ? e.message : "Scan failed");
     } finally {
@@ -515,7 +532,7 @@ export default function SqlSchemaWizard({
           </h4>
           <p className={`${ui.hint} mt-1 max-w-xl`}>
             {mappedTables.length > 0
-              ? "You have already mapped tables from this database. Scan again to refresh the tables and columns list."
+              ? "You have already mapped tables from this database. Scanning again only adds newly found tables — your existing mappings are kept."
               : "Enter connection details above, then scan. We'll list every table and column so you can choose what the agent can access."}
           </p>
           <button type="button" disabled={scanning} onClick={scanDatabase} className={`${ui.btnPrimary} mt-4`}>
