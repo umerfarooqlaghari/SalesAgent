@@ -12,6 +12,28 @@ from backend.integrations.normalize import DEFAULT_INTEGRATIONS, MASK, mask_conf
 from backend.integrations.providers import get_provider
 
 
+class SecretDecryptionError(RuntimeError):
+    """A stored credential exists but cannot be decrypted with the current key."""
+
+
+def _prompt_has_stale_catalog(prompt: Optional[str]) -> bool:
+    try:
+        from backend.agent.prompts import looks_like_hardcoded_catalog
+
+        return bool(prompt) and looks_like_hardcoded_catalog(prompt)
+    except Exception:
+        return False
+
+
+def _first_error_line(sample: str) -> str:
+    """Pull the most useful line out of an adapter's error text for the admin UI."""
+    for line in (sample or "").splitlines():
+        low = line.lower()
+        if "error" in low or "failed" in low or "incorrect" in low:
+            return line.strip()[:300]
+    return (sample or "Connection test returned no usable rows.").strip()[:300]
+
+
 def _invalidate(tenant_id: str) -> None:
     """Drop cached tenant state after a write (P01/P02 caches)."""
     from backend.tenant.registry import invalidate_tenant
@@ -150,8 +172,19 @@ class IntegrationService:
                 try:
                     resolved[key] = decrypt_secret(resolved[enc_key])
                 except Exception as e:
-                    logger.error("Failed to decrypt %s for %s/%s: %s", key, category, provider_id, e)
-                    resolved[key] = ""
+                    # This used to fall back to "". A key-management problem
+                    # (ENCRYPTION_KEY unset, rotated, or different between
+                    # environments) therefore reached the database as an EMPTY
+                    # password and came back as "your credentials are incorrect",
+                    # sending everyone hunting a credential bug that did not exist.
+                    logger.error(
+                        "Failed to decrypt %s for %s/%s: %s", key, category, provider_id, e
+                    )
+                    raise SecretDecryptionError(
+                        f"Stored {key} for {provider_id} could not be decrypted. "
+                        "ENCRYPTION_KEY has most likely changed since it was saved - "
+                        f"re-enter the {key} under Integrations and save again."
+                    ) from e
                 del resolved[enc_key]
         return resolved
 
@@ -202,6 +235,12 @@ class IntegrationService:
             "used_minutes": (doc or {}).get("used_minutes", 0.0),
             "allowed_minutes": (doc or {}).get("allowed_minutes", 30),
             "status": (doc or {}).get("status", "active"),
+            "prompt_warning": (
+                "This prompt lists specific products/prices. The live catalogue will "
+                "override it, but the stale list can still confuse the agent — click "
+                "\"Reset prompt for my company\" to regenerate it from your tables."
+                if _prompt_has_stale_catalog(ctx.settings.system_prompt) else None
+            ),
             "settings": {
                 "system_prompt": ctx.settings.system_prompt,
                 "company_description": ctx.settings.company_description,
@@ -244,14 +283,25 @@ class IntegrationService:
 
     @staticmethod
     async def reset_agent_prompt(tenant_id: str) -> Dict[str, Any]:   # noqa: D401
-        from backend.agent.prompts import build_tenant_system_prompt
+        """
+        Regenerate the tenant's system prompt from their connected data.
 
-        ctx = await get_tenant_by_id(tenant_id)
-        if not ctx:
-            raise ValueError("Tenant not found")
-        description = ctx.settings.company_description or ""
-        prompt = build_tenant_system_prompt(ctx.org_name or tenant_id, description)
-        return await IntegrationService.save_settings(tenant_id, {"system_prompt": prompt})
+        Previously this returned a fixed template that knew only the org name and
+        the free-text description — so tenants hand-wrote prompts that embedded a
+        snapshot of the catalogue, and the agent then answered from that snapshot
+        instead of the live tables.
+        """
+        from backend.agent.prompt_builder import generate_tenant_system_prompt
+
+        result = await generate_tenant_system_prompt(tenant_id)
+        saved = await IntegrationService.save_settings(
+            tenant_id, {"system_prompt": result["prompt"]}
+        )
+        if isinstance(saved, dict):
+            saved["prompt_generated"] = result.get("generated", False)
+            saved["prompt_source"] = result.get("reason", "")
+            saved["prompt_tables"] = result.get("tables", [])
+        return saved
 
     @staticmethod
     async def save_integrations(tenant_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -434,7 +484,10 @@ class IntegrationService:
         resolved = IntegrationService.prepare_config_for_storage(
             category, provider_id, config, existing_config or {}
         )
-        resolved = IntegrationService.resolve_secrets(category, provider_id, resolved)
+        try:
+            resolved = IntegrationService.resolve_secrets(category, provider_id, resolved)
+        except SecretDecryptionError as e:
+            return {"ok": False, "message": str(e), "preview": ""}
 
         ctx = await get_tenant_by_id(tenant_id)
         if not ctx:
@@ -445,6 +498,18 @@ class IntegrationService:
                 adapter = AdapterFactory.build_inventory_source(provider_id, resolved, ctx)
                 sample = await adapter.list_products("products")
                 preview = sample[:500] + ("..." if len(sample) > 500 else "")
+
+                # The adapters return failures as text instead of raising, so a
+                # connection that authenticates but cannot read a single table
+                # used to be reported as "Connection successful."
+                from backend.integrations.catalog_cache import _looks_like_error
+
+                if _looks_like_error(sample):
+                    return {
+                        "ok": False,
+                        "message": _first_error_line(sample),
+                        "preview": preview,
+                    }
                 return {"ok": True, "message": "Connection successful.", "preview": preview}
             if category == "crm":
                 adapter = AdapterFactory.crm_from_config(provider_id, resolved, ctx)

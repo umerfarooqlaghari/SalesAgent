@@ -71,7 +71,22 @@ SQL_CONNECTION_FIELDS: tuple[ProviderField, ...] = (
     ),
 )
 
-SQL_BASE_FIELDS: tuple[ProviderField, ...] = SQL_CONNECTION_FIELDS + (SQL_TABLE_MAP_FIELD,)
+SQL_CONNECTION_URL_FIELD = ProviderField(
+    key="connection_url",
+    label="Connection URL (optional - overrides the fields above)",
+    field_type="password",
+    required=False,
+    placeholder="postgres://user:password@host:5432/dbname?sslmode=require",
+    help_text=(
+        "Paste the full connection string from your provider. This avoids typos and "
+        "truncation in the individual fields. Prisma users: use the DIRECT database "
+        "URL (host db.prisma.io), not the Accelerate URL."
+    ),
+)
+
+SQL_BASE_FIELDS: tuple[ProviderField, ...] = (
+    SQL_CONNECTION_FIELDS + (SQL_CONNECTION_URL_FIELD, SQL_TABLE_MAP_FIELD)
+)
 
 CRM_TABLE_MAP_FIELD = ProviderField(
     key="table_map",

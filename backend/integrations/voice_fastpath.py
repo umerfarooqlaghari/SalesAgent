@@ -32,14 +32,48 @@ _STALL_PHRASES = re.compile(
     re.I,
 )
 
-_FAQ_KEYWORDS = (
+# "Who are you" is a question about the ASSISTANT, not about the company. It
+# used to fall into the company-FAQ path and get answered with the company
+# description, so the agent replied "Alpha Devs is a high-performance software
+# engineering firm…" when the caller just wanted to know who they were talking to.
+_IDENTITY_PATTERNS = (
     "who are you",
+    "who am i talking to",
+    "who am i speaking to",
+    "what are you",
+    "are you a bot",
+    "are you a robot",
+    "are you human",
+    "are you real",
+    "are you an ai",
+    "am i talking to a human",
+    "am i speaking to a real person",
+    "your name",
+    "what should i call you",
+)
+
+_FAQ_KEYWORDS = (
     "about your company",
     "about the company",
     "what do you do",
     "consultancy",
     "consulting",
 )
+
+
+def _is_identity_question(user_text: str) -> bool:
+    text = (user_text or "").lower()
+    return any(p in text for p in _IDENTITY_PATTERNS)
+
+
+async def _identity_answer(tenant_id: str) -> str:
+    ctx = await get_tenant_by_id(tenant_id)
+    org = (ctx.org_name if ctx else None) or "this company"
+    return (
+        f"I'm an AI assistant for {org}. I can answer questions about what we offer, "
+        "book appointments, take orders, or put you through to someone on the team. "
+        "What can I help you with?"
+    )
 
 _NAME_KEYS = (
     "name",
@@ -157,7 +191,7 @@ def _natural_catalog_fallback(catalog: str, user_text: str = "") -> str:
             return f"About {specific}: {', '.join(extras[:2])}."
         return f"Yes — {specific} is in our catalog. Want details or availability next?"
 
-    names = _extract_entity_names(catalog, limit=6)
+    names = _extract_entity_names(catalog, limit=20)
     sections = _section_labels(catalog)
     if not names:
         return ""
@@ -192,7 +226,7 @@ async def _speak_catalog_naturally(
     ctx = await get_tenant_by_id(tenant_id)
     org = (ctx.org_name if ctx else None) or "our company"
     sample = (catalog or "")[:3500]
-    names_hint = ", ".join(_extract_entity_names(sample, limit=10))
+    names_hint = ", ".join(_extract_entity_names(sample, limit=40))
     specific = _match_mentioned_entity(user_text, sample)
     focus_block = _snippet_for_entity(sample, specific) if specific else sample
 
@@ -201,8 +235,14 @@ async def _speak_catalog_naturally(
         "Answer ONLY about that item in 1–2 sentences. Do not restart a full catalog list.\n"
         if specific
         else
-        "- If they asked for a list/overview, mention 3–5 item names. "
-        "If they asked about one item, talk only about that item.\n"
+        # Was "mention 3–5 item names", which is why a caller asking about
+        # products only ever heard three of them.
+        "- If they asked for a list or an overview, name EVERY item in the data below, "
+        "not a sample. If there are more than about eight, group them by their category "
+        "and name the categories plus the items in each.\n"
+        "- If the rows carry a category/type value, use it to organise the answer "
+        "(\"we do X and Y under <category>, and A and B under <other category>\").\n"
+        "- If they asked about one item, talk only about that item.\n"
     )
 
     # Name the category explicitly and name the others as off-limits, so the model
@@ -225,8 +265,10 @@ async def _speak_catalog_naturally(
         "The caller may have interrupted you — answer their LATEST question only.\n"
         "Use ONLY the catalog data below.\n"
         "STRICT RULES:\n"
-        "- Speak naturally in 1–2 short sentences.\n"
-        "- NEVER say column names (name, status, id, price, etc.).\n"
+        "- Speak naturally. Keep it tight, but a complete list may take 2–4 sentences.\n"
+        "- NEVER say column names (name, status, id, price, category, etc.).\n"
+        "- The bracketed heading (for example [Product catalog]) is an internal table "
+        "label. NEVER read it out, and never call an item by it.\n"
         "- NEVER say 'equals', 'name is', 'from live data', or read key=value pairs.\n"
         "- NEVER spell words letter-by-letter.\n"
         f"{focus_rules}"
@@ -295,6 +337,10 @@ async def try_voice_faq_answer(tenant_id: str, user_text: str) -> Optional[str]:
     - Inventory / offer questions with warm catalog → natural speech (never raw SQL)
     - Pure company FAQ → knowledge blurb
     """
+    # Identity first: this is about the assistant, not the business.
+    if _is_identity_question(user_text):
+        return await _identity_answer(tenant_id)
+
     inventory_intent = await is_inventory_question_for_tenant(tenant_id, user_text)
     has_sql = await tenant_has_sql_inventory(tenant_id)
     vague_offer = any(

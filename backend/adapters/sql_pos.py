@@ -106,18 +106,68 @@ def _connect_args_for(connection_url: str) -> dict:
     """Driver-specific connect/statement timeouts."""
     url = (connection_url or "").lower()
     if url.startswith("postgresql+asyncpg"):
+        # `timeout` and `command_timeout` are asyncpg client-side options — they
+        # never reach the server, so they are safe against any endpoint.
+        #
+        # `server_settings` is NOT safe: asyncpg puts those keys in the Postgres
+        # startup packet, and managed proxies (Prisma Postgres / Accelerate on
+        # db.prisma.io, PgBouncer in transaction mode, Supabase's pooler) reject
+        # startup parameters they do not recognise. Prisma reports that as
+        # "Failed to identify your database: Your Postgres credentials are
+        # incorrect", which looks like an auth problem and is not one.
+        #
+        # A server-side statement_timeout is therefore applied per connection
+        # after connect (see _apply_statement_timeout), where a proxy that does
+        # not support it can fail harmlessly.
         return {
             "timeout": _CONNECT_TIMEOUT_S,
             "command_timeout": _STATEMENT_TIMEOUT_S,
-            # asyncpg applies this server-side, so a runaway query is cancelled
-            # by Postgres itself rather than merely abandoned by us.
-            "server_settings": {"statement_timeout": str(_STATEMENT_TIMEOUT_S * 1000)},
         }
     if url.startswith("mysql+aiomysql"):
         return {"connect_timeout": _CONNECT_TIMEOUT_S}
     if "pymssql" in url or "aioodbc" in url:
         return {"timeout": _CONNECT_TIMEOUT_S, "login_timeout": _CONNECT_TIMEOUT_S}
     return {}
+
+
+def _apply_statement_timeout(engine: Any, connection_url: str) -> None:
+    """
+    Ask Postgres to cancel runaway queries itself.
+
+    Issued as a normal statement on each new connection rather than as a startup
+    parameter, so an endpoint that does not allow it (Prisma Postgres, PgBouncer
+    in transaction mode) just logs a debug line instead of refusing the whole
+    connection.
+    """
+    if not connection_url.lower().startswith("postgresql+asyncpg"):
+        return
+
+    ms = _STATEMENT_TIMEOUT_S * 1000
+
+    # Wrapped end to end. This is a best-effort optimisation on top of the
+    # client-side timeouts, so nothing it does may prevent an engine being
+    # created — an engine object without `sync_engine`, or a SQLAlchemy version
+    # that moves the event API, must degrade rather than break every connection.
+    try:
+        from sqlalchemy import event
+
+        sync_engine = getattr(engine, "sync_engine", None)
+        if sync_engine is None:
+            logger.debug("Engine exposes no sync_engine — skipping statement_timeout hook")
+            return
+
+        @event.listens_for(sync_engine, "connect")
+        def _set_timeout(dbapi_conn, _record):  # pragma: no cover - driver callback
+            try:
+                cursor = dbapi_conn.cursor()
+                cursor.execute(f"SET statement_timeout = {ms}")
+                cursor.close()
+            except Exception:
+                logger.debug(
+                    "Endpoint rejected SET statement_timeout — relying on client timeouts"
+                )
+    except Exception:
+        logger.debug("Could not attach the statement_timeout hook", exc_info=True)
 
 
 async def _dispose_engine(engine: Any) -> None:
@@ -158,6 +208,7 @@ async def get_engine(connection_url: str):
             pool_recycle=1800,
             connect_args=_connect_args_for(connection_url),
         )
+        _apply_statement_timeout(engine, connection_url)
         _ENGINES[key] = (engine, now + _ENGINE_TTL_S)
         _ENGINES.move_to_end(key)
         while len(_ENGINES) > _ENGINES_MAX:
@@ -178,6 +229,13 @@ class SqlConnection:
         self.schema = config.get("schema") or ("dbo" if self.dialect == "sqlserver" else "public")
 
     def _connection_url(self) -> str:
+        # A pasted URL wins: it avoids every field-entry failure mode - a
+        # truncated 64-character username, a password containing characters the
+        # form mangles, a missing SSL setting.
+        raw = (self.config.get("connection_url") or "").strip()
+        if raw:
+            return normalise_sql_url(raw, self.dialect)
+
         host = self.config.get("host", "localhost")
         port = self.config.get("port")
         database = self.config.get("database", "")
@@ -340,6 +398,145 @@ _NOT_FOUND_MARKERS = (
 _MAPPED_BULLET_RE = re.compile(r"^\s*•\s*(.+?)(?:\s*\((.+)\))?\s*$")
 
 
+# Rows are capped per mapped table when warming the catalog. Generous, because
+# the result is cached for the TTL rather than fetched per turn.
+_CATALOG_ROW_LIMIT = 60
+
+# Columns that describe what KIND of thing a row is. Pulled to the front of each
+# rendered row so the agent can answer "which product is of which type".
+_KIND_KEYS = {"category", "type", "kind", "group", "segment", "service_type",
+              "product_type", "tier", "plan"}
+
+
+# Generic synonyms attached to a table's declared ROLE, so a caller's everyday
+# word reaches the right table whatever the tenant happens to have named it.
+# These are role-based, never tenant-based: nothing here mentions a specific
+# customer's products.
+_ROLE_SYNONYMS = {
+    "products": {"product", "products", "item", "items", "catalog", "catalogue",
+                 "sku", "skus", "range", "lineup"},
+    "services": {"service", "services", "offering", "offerings", "package",
+                 "packages", "plan", "plans", "pricing"},
+    "blog": {"blog", "blogs", "post", "posts", "article", "articles", "news"},
+    "faq": {"faq", "faqs", "question", "questions", "answer", "answers", "help"},
+    "appointments": {"appointment", "appointments", "booking", "bookings",
+                     "schedule", "slot", "slots"},
+    "orders": {"order", "orders", "purchase", "purchases"},
+    "staff": {"staff", "team", "people", "doctor", "doctors", "dentist", "dentists",
+              "practitioner", "practitioners", "consultant", "consultants"},
+}
+
+
+def _expand(words: set) -> set:
+    """Add naive singular/plural variants so "service" matches a "Services" table."""
+    out = set(words)
+    for w in words:
+        if len(w) > 3:
+            out.add(w[:-1] if w.endswith("s") else w + "s")
+    return out
+
+
+def table_query_terms(mapping: Dict[str, Any]) -> set:
+    """
+    Words that should route a question to THIS table.
+
+    Built from the tenant's own table name, display label and role — plus generic
+    synonyms for the role. Previously this was a fixed products/services/blog/faq
+    taxonomy with one customer's product names hardcoded into it, so a dental
+    clinic whose table is called "Treatments" was skipped entirely when a caller
+    said "services", and the agent answered that it had no matching records.
+    """
+    import re as _re
+
+    raw = " ".join(str(mapping.get(k) or "") for k in ("table", "label", "role"))
+    words = {w.lower() for w in _re.findall(r"\w+", raw) if len(w) > 2}
+    terms = _expand(words)
+
+    role = str(mapping.get("role") or "").lower()
+    for role_key, syns in _ROLE_SYNONYMS.items():
+        if role_key in role or role_key in words:
+            terms |= syns
+
+    # Column names are part of a table's vocabulary too ("qualification", "director").
+    cols = mapping.get("columns") or {}
+    col_names = cols if isinstance(cols, list) else list(cols.keys()) + list(cols.values())
+    col_words = set()
+    for c in col_names:
+        for w in _re.findall(r"\w+", str(c)):
+            if len(w) > 3:
+                col_words.add(w.lower())
+    return terms | _expand(col_words)
+
+
+def select_tables_for_query(mapped: list, q_words: set) -> tuple:
+    """
+    (tables_to_query, narrowed). Never returns an empty list.
+
+    If nothing matches the caller's words we query everything rather than
+    starving the answer — a vocabulary miss must degrade to "too much data",
+    never to "no matching records found".
+    """
+    if not q_words:
+        return list(mapped), False
+    matched = [m for m in mapped if q_words & table_query_terms(m)]
+    if matched:
+        return matched, True
+    return list(mapped), False
+
+
+_ASYNC_DRIVERS = {"postgres": "postgresql+asyncpg", "mysql": "mysql+aiomysql",
+                  "sqlserver": "mssql+pymssql"}
+
+# libpq understands these; the async drivers do not, and passing them straight
+# through makes connect() raise TypeError on an unexpected keyword argument.
+_LIBPQ_ONLY = {"sslmode", "channel_binding", "target_session_attrs", "options",
+               "application_name", "connect_timeout", "gssencmode", "sslrootcert",
+               "sslcert", "sslkey", "pgbouncer"}
+
+
+def normalise_sql_url(raw: str, dialect: str) -> str:
+    """
+    Turn a pasted connection string into one SQLAlchemy and the async driver accept.
+
+    Handles the three things that break a copy-paste from a hosting provider:
+      * a sync scheme ("postgres://", "postgresql://"), which would load psycopg2
+      * libpq-only query parameters - above all `sslmode=require`, which asyncpg
+        rejects as an unexpected keyword argument
+      * Prisma's Accelerate URL, which is not the Postgres wire protocol at all
+    """
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    url = (raw or "").strip()
+    if url.startswith("prisma+postgres://") or "accelerate.prisma-data.net" in url:
+        raise ValueError(
+            "That is a Prisma Accelerate URL. Accelerate speaks Prisma's own HTTP "
+            "protocol, not the Postgres wire protocol, so it cannot be used here. "
+            "Use the direct database URL instead (the one whose host is db.prisma.io)."
+        )
+
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if "+" not in scheme:
+        base = {"postgres": "postgres", "postgresql": "postgres",
+                "mysql": "mysql", "mssql": "sqlserver"}.get(scheme, dialect)
+        scheme = _ASYNC_DRIVERS.get(base, _ASYNC_DRIVERS.get(dialect, scheme))
+
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    sslmode = params.get("sslmode")
+    kept = {k: v for k, v in params.items() if k.lower() not in _LIBPQ_ONLY}
+
+    if scheme.startswith("postgresql+asyncpg"):
+        # asyncpg takes the libpq vocabulary, but under the name `ssl`.
+        if sslmode and sslmode.lower() == "disable":
+            kept.pop("ssl", None)
+        elif sslmode:
+            kept.setdefault("ssl", sslmode)
+        elif "ssl" not in kept:
+            kept["ssl"] = "require"
+
+    return urlunsplit((scheme, parts.netloc, parts.path, urlencode(kept), parts.fragment))
+
+
 def _parse_mapped_bullet(line: str) -> Optional[Dict[str, Any]]:
     m = _MAPPED_BULLET_RE.match(line)
     if not m:
@@ -438,25 +635,14 @@ class SqlPOSAdapter:
             lines = [f"- {r[0]}: Price={r[1]}, In Stock={r[2]} ({r[3]})" for r in rows]
             return "Product Catalog:\n" + "\n".join(lines)
 
-        experience_terms = {
-            "production", "productions", "set", "sets", "scenery", "scenic",
-            "po", "purchase", "order", "orders", "project", "projects",
-            "experience", "capability", "capabilities", "service", "services",
-            "film", "tv", "event", "events", "construction",
-        }
-        q_words = set(re.findall(r"\w+", q_clean)) if q_clean else set()
-        is_capability_query = bool(q_words & experience_terms)
+        q_words = {w.lower() for w in re.findall(r"\w+", q_clean)} if q_clean else set()
 
-        # Determine category intention from query
-        service_terms = {"service", "services", "package", "packages", "pricing", "cost", "costs", "plan", "plans", "development", "ecommerce", "e-commerce", "ai", "ml", "engineering"}
-        product_terms = {"product", "products", "mentore", "grabengo", "catalog", "item", "items", "tool", "tools", "software", "sku", "skus"}
-        blog_terms = {"blog", "blogs", "post", "posts", "article", "articles", "news"}
-        faq_terms = {"faq", "faqs", "question", "questions", "answer", "answers", "help"}
-
-        asking_services = bool(q_words & service_terms)
-        asking_products = bool(q_words & product_terms)
-        asking_blogs = bool(q_words & blog_terms)
-        asking_faqs = bool(q_words & faq_terms)
+        # Which of THIS tenant's tables does the question point at? Derived from
+        # their own labels/roles/columns rather than a fixed products-and-services
+        # taxonomy, so a clinic ("Treatments", "Doctors") or a production company
+        # ("Films", "Cast") routes just as well as a software vendor.
+        mapped, narrowed = select_tables_for_query(mapped, q_words)
+        is_capability_query = narrowed
 
         results = []
         for mapping in mapped:
@@ -471,15 +657,8 @@ class SqlPOSAdapter:
             t_combined = f"{t_lower} {l_lower} {role}"
             t_words = set(re.findall(r"\w+", t_combined))
 
-            # Specific category routing: skip non-matching table families when user asks for specific category
-            if asking_services and not ({"service", "services", "package", "packages", "pricing", "plan", "content", "card", "cards"} & t_words):
-                continue
-            if asking_products and not ({"product", "products", "item", "items", "catalog", "content", "card", "cards"} & t_words):
-                continue
-            if asking_blogs and not ({"blog", "blogs", "post", "posts", "article", "articles"} & t_words):
-                continue
-            if asking_faqs and not ({"faq", "faqs", "question", "questions", "answer", "answers"} & t_words):
-                continue
+            # Category routing already happened in select_tables_for_query, which
+            # works from this tenant's vocabulary instead of a fixed taxonomy.
 
             # Skip appointments unless explicitly asked
             if role == "appointments" and not (
@@ -554,10 +733,13 @@ class SqlPOSAdapter:
                 sql = f"SELECT {', '.join(select_parts)} FROM {qt} WHERE ({where_sql})"
                 params = {"q": f"%{_escape_like(query.strip())}%"}
 
+            # Was 15. This is a cached catalog probe, not a per-turn query, so a
+            # tenant with a couple of dozen services was being cut off — which is
+            # why "tell me about your products" only ever named a few.
             if self.sql.dialect == "sqlserver":
-                sql = sql.replace("SELECT", "SELECT TOP 15", 1)
+                sql = sql.replace("SELECT", f"SELECT TOP {_CATALOG_ROW_LIMIT}", 1)
             else:
-                sql += " LIMIT 15"
+                sql += f" LIMIT {_CATALOG_ROW_LIMIT}"
 
             try:
                 rows = await self.sql.fetch_all(sql, params or None)
@@ -571,6 +753,7 @@ class SqlPOSAdapter:
                     for r in rows:
                         display_name = None
                         extras = []
+                        kind = None
                         for i in range(min(len(r), len(field_names))):
                             key = str(field_names[i])
                             val = r[i]
@@ -578,8 +761,14 @@ class SqlPOSAdapter:
                                 continue
                             if key.lower() in name_keys and display_name is None:
                                 display_name = str(val).strip()
+                            elif key.lower() in _KIND_KEYS and kind is None:
+                                # Surfaced separately and first, so the model can
+                                # group items by type instead of listing them flat.
+                                kind = str(val).strip()
                             elif key.lower() not in {"id"}:
                                 extras.append(f"{key}: {val}")
+                        if kind:
+                            extras.insert(0, f"category: {kind}")
                         if display_name:
                             # Retain all rich details (description, content, features, hero text, answers)
                             suffix = f" ({', '.join(extras)})" if extras else ""

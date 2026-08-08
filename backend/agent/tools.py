@@ -198,10 +198,17 @@ async def query_pos_database(
     config: RunnableConfig = None,
 ) -> str:
     """
-    Query tenant inventory/SQL sources: products, productions, production sets, scenery,
-    projects, POs/purchase orders, capabilities, and experience — not only SKUs.
-    Pass product_query like "production sets", "productions", or a project/client name.
-    For order status, provide order_id plus customer_email or customer_phone.
+    Look up records in this company's connected database tables.
+
+    The tables differ per company: they may hold products, services, treatments,
+    staff, films, courses, properties, blog posts, FAQs or anything else. The
+    available category names are listed in the CONNECTED DATA / TENANT DATA MODEL
+    section of your instructions — pass one of those names, or the name of a
+    specific item, as `product_query`.
+
+    Use this whenever the caller asks what the company offers, has, or does, or
+    for detail on a named item. For order status, provide order_id plus
+    customer_email or customer_phone.
     """
     tenant = await _load_tenant_context(config or {})
     tenant_id = tenant.tenant_id

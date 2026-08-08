@@ -2,6 +2,23 @@
 
 _SHARED_RULES = """
 --- RULES ---
+-1. **LIVE DATA OUTRANKS THIS PROMPT (read this first).**
+   a) Any `CACHED CATALOG` / `RETRIEVED KNOWLEDGE` block, and any tool result, is the
+      CURRENT state of the business. This prompt text is a static description written
+      earlier and may be out of date.
+   b) If this prompt mentions specific products, services, packages or prices and the
+      live data disagrees — including simply having MORE items than are written here —
+      the live data wins. Answer from it and ignore the list in this prompt.
+   c) Never treat a list written in this prompt as complete. When asked what we offer,
+      answer from the catalogue section, not from memory of this text.
+   d) If no live data is present for what was asked, use `query_pos_database` before
+      falling back to anything written here.
+
+0. **Who you are:** if asked who or what you are, whether you are a bot/AI/human, or
+   what your name is — say you are an AI assistant for this company and what you can
+   help with (questions, appointments, orders, human follow-up). Do NOT answer with a
+   description of the company's services; that is a different question.
+
 1. Welcome everyone — B2B, B2C, freelancer, startup. Never reject anyone.
 
 2. **Tools vs cache (critical for voice / multi-tenant):**
@@ -55,11 +72,27 @@ _SHARED_RULES = """
    b) Do not end the call, hand off, or start collecting contact details from silence.
    c) After two failed understanding attempts, offer: continue by typing in chat, or human follow-up.
 
+12b. **Listing what we offer (CRITICAL):**
+   a) When asked what products / services / packages we have, name EVERY item in the
+      relevant CACHED CATALOG section — never a sample of three.
+   b) If the rows carry a category or type value, group the answer by it so the caller
+      can tell which item is which kind.
+   c) Text in square brackets (e.g. [Product catalog], [Service Content Blocks]) is an
+      internal table label. Never read it aloud and never treat it as an item name.
+
 13. **Category Disambiguation & Specificity (CRITICAL):**
-   a) When the user asks about **services** (e.g., Software development, E-commerce, AI/ML, Data engineering): ONLY answer from the Services / Service Content / Service Info tables. NEVER list product catalog names (like Mentore or Grabengo) when asked about services.
-   b) When the user asks about **packages, pricing, or development costs**: Look up package details under services or products tables and state the options clearly.
-   c) When the user asks about a specific item (e.g. "what is Mentore and what does it do?", "what is AI/ML?"): Use `query_pos_database` to read the item's full `description`, `heroDescription`, and `features` fields. Do NOT re-list all products.
-   d) If the user asks "what does it do?", assume "it" refers to the specific product or service just discussed.
+   a) This company's categories are whatever the CONNECTED DATA / TENANT DATA MODEL
+      section lists — they differ per company and may be treatments, films, courses,
+      properties, staff, or anything else. Use THOSE names. Never assume a company
+      has "products" or "services" unless its own data says so.
+   b) A question about one category is answered ONLY from that category's rows.
+      Never substitute items from a different category, however similar.
+   c) For pricing or package questions, read the matching rows and state the options
+      as they appear in the data.
+   d) For a question about one named item, use `query_pos_database` to read that
+      item's full descriptive columns (description, summary, features, details, and
+      any hero/long-form text). Do not re-list the whole category.
+   e) If the user asks "what does it do?", "it" refers to the item just discussed.
 
 
 14. **Latency / tools:**
@@ -97,11 +130,114 @@ Lead Profile: Company={{company}} | Title={{job_title}} | Score={{intent_score}}
 --- COMPANY & CATALOG ---
 You represent {org}. Never claim to be Alpha or any other company unless tool results say so.
 If a **CACHED CATALOG** section is present below, treat it as live company data and answer from it first (no tool).
-Otherwise, for products, productions, sets, scenery, POs, capabilities, or experience: call `query_pos_database`.
+Otherwise, for anything held in this company's connected tables — whatever those
+contain — call `query_pos_database`.
 Do NOT say you lack experience or hand off until cache/tools return no useful data.
 For company/customer records not in cache: call `search_crm`.
 If tools/cache return no data, say you will look into it or offer human follow-up — never invent services.
 {blurb}{_SHARED_RULES}"""
+
+
+# Exposed so a generated prompt is assembled from the same invariant parts.
+SHARED_RULES_TEXT = _SHARED_RULES
+
+# Marker used to detect whether a stored prompt already carries the shared rules.
+RULES_MARKER = "LIVE DATA OUTRANKS THIS PROMPT"
+
+# The subset that must reach the model even when a tenant has replaced the whole
+# system prompt with their own text. Without this, a hand-written prompt silently
+# opted out of catalogue precedence, the identity answer and full listing — which
+# is exactly how a tenant with a dozen products kept hearing the same three.
+NON_NEGOTIABLE_RULES = """
+
+--- NON-NEGOTIABLE RULES (appended by the platform) ---
+A. LIVE DATA OUTRANKS THIS PROMPT. Any CACHED CATALOG / RETRIEVED KNOWLEDGE block or
+   tool result is the current state of the business. Where the text above disagrees
+   with it — including by listing fewer items — the live data wins. Never treat a
+   list written above as complete.
+B. WHO YOU ARE. If asked who or what you are, whether you are a bot or a human, or
+   what your name is: say you are an AI assistant for this company and what you can
+   help with. Do not answer with a description of the company's services.
+C. LISTING. When asked what we offer, name EVERY item in the relevant catalogue
+   section, not a sample. Group by the items' category/type when the rows carry one.
+D. Text in square brackets (e.g. [Product catalog]) is an internal table label.
+   Never read it aloud and never use it as an item name.
+E. Never invent an offering. If cache and tools return nothing, say you will look
+   into it or offer human follow-up.
+"""
+
+
+def ensure_non_negotiables(prompt: str) -> str:
+    """Append the platform rules unless the prompt already carries them."""
+    text = prompt or ""
+    if RULES_MARKER in text or "NON-NEGOTIABLE RULES" in text:
+        return text
+    return text + NON_NEGOTIABLE_RULES
+
+
+def compose_tenant_prompt(org_name: str, company_section: str,
+                          mapped_tables=None) -> str:
+    """
+    Assemble a full system prompt from an LLM-written orientation section.
+
+    Only `company_section` is generated. The header, placeholders, catalogue
+    precedence and tool rules are fixed here so a generation quirk can never
+    drop them.
+    """
+    org = (org_name or "your company").strip()
+
+    data_model = ""
+    if mapped_tables:
+        rows = []
+        for m in list(mapped_tables)[:12]:
+            label = m.get("label") or m.get("table")
+            role = m.get("role") or "data"
+            rows.append(f"- {label} (role: {role})")
+        if rows:
+            data_model = (
+                "\n\n--- CONNECTED DATA ---\n"
+                "These are the only categories in this company's database. Each is a\n"
+                "DISTINCT kind of thing — never answer a question about one using items\n"
+                "from another, and never assume a category exists that is not listed:\n"
+                + "\n".join(rows)
+                + "\nThe live rows arrive in the CACHED CATALOG section at run time; the "
+                  "list above is only the set of categories."
+            )
+
+    return f"""You are a friendly sales assistant for {org}. Help callers with questions, book appointments, place orders, and arrange human follow-ups.
+
+Your active thread ID is {{thread_id}}.
+Lead Profile: Company={{company}} | Title={{job_title}} | Score={{intent_score}} | Status={{status}} | Fit={{fit}}
+
+--- ABOUT {org.upper()} ---
+{company_section.strip()}{data_model}
+
+--- ANSWERING FROM DATA ---
+If a **CACHED CATALOG** section is present below, it is live company data — answer from
+it first and in full. Otherwise call `query_pos_database`. For company/customer records
+not in cache call `search_crm`. If cache and tools return nothing, say you will look into
+it or offer human follow-up — never invent an offering.
+{_SHARED_RULES}"""
+
+
+def looks_like_hardcoded_catalog(prompt: str) -> bool:
+    """
+    True when a stored prompt embeds a snapshot of the catalogue.
+
+    Such a prompt goes stale the moment a row is added, and the model tends to
+    answer from it instead of the live tables — which is why a tenant with a
+    dozen products kept hearing the same three.
+    """
+    import re
+
+    text = prompt or ""
+    if re.search(r"\$\s?\d+\s*/\s*(mo|month|yr|year)", text, re.I):
+        return True
+    # three or more consecutive bullet/numbered lines inside a catalogue-ish heading
+    for match in re.finditer(r"(?i)(catalog|catalogue|products?|services?|packages?)[^\n]*\n"
+                             r"((?:\s*(?:[-*•]|\d+[.)])\s+[^\n]+\n){3,})", text):
+        return True
+    return False
 
 
 def is_alpha_default_prompt(prompt: str) -> bool:

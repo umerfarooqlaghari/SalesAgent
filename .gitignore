@@ -28,3 +28,14 @@ frontend/.next/
 
 # OS
 .DS_Store
+
+# --- audit tooling (2026-08) ---
+# Scratch snapshots written when the desktop bridge cannot delete. Safe to remove.
+_to_delete/
+
+# One-shot patch scripts. The code they produce is committed; these are only
+# useful for replaying or auditing a change.
+docs/audit_patches/
+
+# Runtime artefact, rewritten on every sync
+adapter_hub/sync_workers/metadata_store.json

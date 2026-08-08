@@ -27,7 +27,8 @@ from backend.agent.tools import (
     get_typed_chat_details,
 )
 from backend.agent.checkpointer import get_checkpointer
-from backend.agent.prompts import SYSTEM_PROMPT, build_tenant_system_prompt
+from backend.agent.prompts import (SYSTEM_PROMPT, build_tenant_system_prompt,
+                                   ensure_non_negotiables)
 from backend.agent.llm import get_chat_llm
 from backend.agent.rag import retrieve_context
 from backend.agent.parallel_tools import build_parallel_tool_node
@@ -259,6 +260,10 @@ async def _build_turn_context(
             getattr(_settings, "company_description", None) or "",
         )
     prompt_template = await get_tenant_system_prompt(tenant_id, fallback_prompt)
+    # A tenant can replace the entire system prompt from the admin UI, which used
+    # to drop every shared rule with it.
+    prompt_template = ensure_non_negotiables(prompt_template)
+
     system_prompt = safe_format_prompt(
         prompt_template,
         thread_id=thread_id,
@@ -335,6 +340,12 @@ async def _build_turn_context(
                     f"{catalog_section} question with items from them; call query_pos_database "
                     "if the caller asks about another category."
                 )
+            system_prompt += (
+                "\n\nWhen listing what we offer, name EVERY item in the section above rather "
+                "than a sample of them, and group them by their category/type value when the "
+                "rows carry one. The text in square brackets is an internal table label — never "
+                "read it back to the caller or use it as an item name."
+            )
         else:
             system_prompt += (
                 "\n\n--- CACHED CATALOG (this tenant's approved SQL tables — prefer over tools) ---\n"
