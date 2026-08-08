@@ -178,6 +178,17 @@ def _role_synonyms(role: Optional[str]) -> set:
     return out
 
 
+def is_catalog_warm(tenant_id: str) -> bool:
+    """
+    True when this process holds a live (unexpired) catalog for the tenant.
+
+    Recorded per turn by the telemetry: a cold catalog makes the model answer
+    from the system prompt alone — fluent but factually thin, which is precisely
+    what "the agent got dumb" looks like from the outside.
+    """
+    return _live_entry(tenant_id) is not None
+
+
 def get_cached_catalog(tenant_id: str, section: Optional[str] = None) -> Optional[str]:
     """
     Cached catalog text.

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import secrets
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -22,12 +23,37 @@ async def ensure_tenant_indexes() -> None:
 
 
 async def seed_default_tenant() -> None:
-    """Create the default tenant and map legacy test API key."""
+    """
+    Create the default tenant.
+
+    S05: this used to write hash_api_key(DEFAULT_TEST_API_KEY) into the tenant's
+    own `api_key_hash`, unconditionally. Gating the legacy `api_keys` collection
+    (below) did nothing about that, because `resolve_tenant_by_api_key` matches
+    `api_key_hash` on the PRIMARY path — so `X-API-Key: test_key_abc123`
+    authenticated as the default tenant with full `secret` scope in production.
+
+    In production the seeded tenant now gets a random secret key. In development
+    the well-known key is still mapped, because local tooling and the docs use
+    it — and there the legacy collection is available anyway.
+    """
+    from backend.config import settings
+
     db = get_db()
-    api_key_hash = hash_api_key(DEFAULT_TEST_API_KEY)
     existing = await db.tenants.find_one({"tenant_id": DEFAULT_TENANT_ID})
     if existing:
+        await _rotate_well_known_default_key(existing)
         return
+
+    if settings.is_production:
+        generated = f"sk_live_{secrets.token_urlsafe(32)}"
+        api_key_hash = hash_api_key(generated)
+        logger.warning(
+            "Seeded default tenant with a RANDOM secret key (production). The raw "
+            "key is intentionally not logged — rotate it from the dashboard to "
+            "obtain a usable one."
+        )
+    else:
+        api_key_hash = hash_api_key(DEFAULT_TEST_API_KEY)
 
     from backend.agent.prompts import SYSTEM_PROMPT
 
@@ -74,6 +100,38 @@ async def seed_default_tenant() -> None:
         await db.api_keys.insert_one(
             {"key": DEFAULT_TEST_API_KEY, "owner": "Alpha Default", "active": True, "tenant_id": DEFAULT_TENANT_ID}
         )
+
+
+async def _rotate_well_known_default_key(tenant_doc: dict) -> None:
+    """
+    S05, existing deployments: the seed already ran, so the well-known hash is
+    ALREADY in the database and gating the seeder fixes nothing. Detect it and
+    replace it with a random key on the next production boot.
+
+    Deliberately narrow: it only ever replaces a hash that equals
+    hash_api_key(DEFAULT_TEST_API_KEY), so a tenant with a real key is untouched.
+    """
+    from backend.config import settings
+
+    if not settings.is_production:
+        return
+    if tenant_doc.get("api_key_hash") != hash_api_key(DEFAULT_TEST_API_KEY):
+        return
+
+    db = get_db()
+    generated = f"sk_live_{secrets.token_urlsafe(32)}"
+    await db.tenants.update_one(
+        {"tenant_id": tenant_doc.get("tenant_id"), "api_key_hash": hash_api_key(DEFAULT_TEST_API_KEY)},
+        {"$set": {"api_key_hash": hash_api_key(generated)}},
+    )
+    invalidate_tenant(tenant_doc.get("tenant_id"))
+    logger.critical(
+        "SECURITY: tenant %s was authenticating with the publicly-known test API "
+        "key. Its api_key_hash has been rotated to a random value. Anyone who had "
+        "that key has lost access; regenerate a key from the dashboard. Treat any "
+        "data this tenant holds as having been readable.",
+        tenant_doc.get("tenant_id"),
+    )
 
 
 async def migrate_legacy_documents_to_default_tenant() -> None:

@@ -6,9 +6,13 @@ from backend.adapters.composite import CompositePOSAdapter
 from backend.adapters.crm_adapters import RestCRMAdapter, SqlCRMAdapter
 from backend.adapters.shopify_pos import ShopifyPOSAdapter
 from backend.adapters.sql_pos import SqlPOSAdapter
-from backend.adapters.stub_pos import EmptyPOSAdapter, StubPOSAdapter
+from backend.adapters.stub_pos import EmptyPOSAdapter, MisconfiguredPOSAdapter, StubPOSAdapter
 from backend.config import settings
-from backend.integrations.service import IntegrationService, normalize_integrations
+from backend.integrations.service import (
+    IntegrationService,
+    SecretDecryptionError,
+    normalize_integrations,
+)
 from backend.tenant.context import TenantContext
 
 logger = logging.getLogger(__name__)
@@ -65,20 +69,44 @@ class AdapterFactory:
             return _empty_or_demo(tenant)
 
         adapters: List[tuple[int, str, POSAdapter]] = []
+        config_errors: List[str] = []
         for src in inv.get("sources") or []:
             if not src.get("enabled", True):
                 continue
             provider_id = (src.get("provider") or "stub").lower()
             label = src.get("label") or provider_id
             priority = int(src.get("priority", 0))
-            config = IntegrationService.resolve_secrets("inventory", provider_id, src.get("config") or {})
+            try:
+                # This resolve_secrets call used to sit OUTSIDE the try. Once S08
+                # made it raise SecretDecryptionError instead of quietly
+                # returning "", the exception escaped AdapterFactory.pos, escaped
+                # query_pos_database (which builds the adapter before its own
+                # try), and reached the graph — where every products / services /
+                # packages question became "Sorry, I hit a small snag."
+                config = IntegrationService.resolve_secrets(
+                    "inventory", provider_id, src.get("config") or {}
+                )
+            except SecretDecryptionError as e:
+                logger.error(
+                    "INTEGRATION_SECRET_UNDECRYPTABLE tenant=%s category=inventory "
+                    "source=%s provider=%s: %s",
+                    getattr(tenant, "tenant_id", "?"), label, provider_id, e,
+                )
+                config_errors.append(str(e))
+                continue
             try:
                 adapter = AdapterFactory.build_inventory_source(provider_id, config, tenant)
                 adapters.append((priority, label, adapter))
             except Exception as e:
                 logger.error("Failed to build inventory adapter %s: %s", label, e)
+                config_errors.append(f"{label}: {e}")
 
         if not adapters:
+            # A tenant that HAS sources configured but none usable must not be
+            # told "nothing is connected" (wrong remedy) and must never be shown
+            # the shared demo catalogue.
+            if config_errors:
+                return MisconfiguredPOSAdapter(tenant, config_errors[0])
             return _empty_or_demo(tenant)
         if len(adapters) == 1:
             return adapters[0][2]
@@ -107,8 +135,19 @@ class AdapterFactory:
         if not block.get("enabled", True):
             return NoOpCRMAdapter()
         provider_id = (block.get("provider") or "internal").lower()
-        config = IntegrationService.resolve_secrets("crm", provider_id, block.get("config") or {})
-        return AdapterFactory.crm_from_config(provider_id, config, tenant)
+        try:
+            config = IntegrationService.resolve_secrets("crm", provider_id, block.get("config") or {})
+        except SecretDecryptionError as e:
+            logger.error(
+                "INTEGRATION_SECRET_UNDECRYPTABLE tenant=%s category=crm provider=%s: %s",
+                getattr(tenant, "tenant_id", "?"), provider_id, e,
+            )
+            return NoOpCRMAdapter()
+        try:
+            return AdapterFactory.crm_from_config(provider_id, config, tenant)
+        except Exception as e:
+            logger.error("Failed to build CRM adapter (%s): %s", provider_id, e)
+            return NoOpCRMAdapter()
 
     @staticmethod
     def calendar_from_config(
@@ -136,5 +175,18 @@ class AdapterFactory:
         if not block.get("enabled", True):
             return None
         provider_id = (block.get("provider") or "internal").lower()
-        config = IntegrationService.resolve_secrets("calendar", provider_id, block.get("config") or {})
-        return AdapterFactory.calendar_from_config(provider_id, config, tenant)
+        try:
+            config = IntegrationService.resolve_secrets(
+                "calendar", provider_id, block.get("config") or {}
+            )
+        except SecretDecryptionError as e:
+            logger.error(
+                "INTEGRATION_SECRET_UNDECRYPTABLE tenant=%s category=calendar provider=%s: %s",
+                getattr(tenant, "tenant_id", "?"), provider_id, e,
+            )
+            return None
+        try:
+            return AdapterFactory.calendar_from_config(provider_id, config, tenant)
+        except Exception as e:
+            logger.error("Failed to build calendar adapter (%s): %s", provider_id, e)
+            return None

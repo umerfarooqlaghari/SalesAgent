@@ -148,11 +148,55 @@ async def verify_vapi_signature(request: Request) -> None:
         logger.warning("VAPI_WEBHOOK_SECRET is unset — skipping signature verification (dev only).")
         return
 
-    signature = request.headers.get("X-Vapi-Signature", "")
+    # Vapi has shipped two server-URL auth mechanisms and which one a given
+    # assistant sends depends on how it was configured:
+    #
+    #   * a custom header  (commonly `X-Vapi-Secret`) whose value IS the shared
+    #     secret — a plain equality check;
+    #   * an HMAC-SHA256 of the raw body in `X-Vapi-Signature`.
+    #
+    # Accepting only the HMAC form was a live deploy risk: setting
+    # VAPI_WEBHOOK_SECRET would have 401'd every real request and killed voice
+    # entirely, with no way to tell that apart from an attack. Both are accepted;
+    # BOTH are constant-time; an absent/garbage credential is still rejected.
     body = await request.body()
-    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    if not signature or not hmac.compare_digest(signature, expected):
-        raise HTTPException(status_code=401, detail="Invalid Vapi signature.")
+    secret_bytes = secret.encode()
+
+    # Vapi's "Custom Credential" UI lets the operator pick ANY header name, and
+    # its default is `Authorization` with an optional `Bearer ` prefix. Accept
+    # that too, or a correctly-configured integration 401s and voice is dead.
+    shared = (
+        request.headers.get("X-Vapi-Secret")
+        or request.headers.get("X-Vapi-Token")
+        or ""
+    )
+    if not shared:
+        auth = request.headers.get("Authorization") or ""
+        if auth:
+            # Tolerate "Bearer <secret>" and a bare "<secret>".
+            shared = auth[7:].strip() if auth[:7].lower() == "bearer " else auth.strip()
+
+    if shared:
+        # .encode() first: hmac.compare_digest raises TypeError on str inputs
+        # containing non-ASCII, which would 500 instead of returning 401.
+        if hmac.compare_digest(shared.encode("utf-8", "replace"), secret_bytes):
+            return
+
+    signature = request.headers.get("X-Vapi-Signature", "")
+    if signature:
+        expected = hmac.new(secret_bytes, body, hashlib.sha256).hexdigest()
+        # Vapi has also been observed prefixing the digest (`sha256=…`); tolerate it.
+        candidate = signature.split("=", 1)[-1].strip().lower()
+        if hmac.compare_digest(candidate.encode("utf-8", "replace"), expected.encode()):
+            return
+
+    logger.warning(
+        "Rejected an unauthenticated Vapi request path=%s (had X-Vapi-Secret=%s, "
+        "X-Vapi-Signature=%s) — if real Vapi traffic is being rejected, check which "
+        "auth mechanism the assistant's server URL is configured to send.",
+        request.url.path, bool(shared), bool(signature),
+    )
+    raise HTTPException(status_code=401, detail="Invalid Vapi signature.")
 
 
 async def enforce_minutes_quota(tenant: TenantContext = Depends(get_tenant_or_api_key)) -> TenantContext:
@@ -782,6 +826,8 @@ _VAPI_MAX_TURNS = 12
 
 # V11: total wall-clock budget for one spoken turn, shared by the fast path and
 # the graph. Vapi drops calls that stall; keep this comfortably under its limit.
+from backend.observability import turn_metrics as _tm
+
 VOICE_TURN_DEADLINE = 7.0
 VOICE_FASTPATH_TIMEOUT = 2.0
 
@@ -1084,8 +1130,18 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
             except Exception:
                 logger.debug("Voice fast-path errored — falling through to graph", exc_info=True)
 
+        turn_outcome = _tm.OK
+        turn_detail = ""
+        try:
+            from backend.integrations.catalog_cache import is_catalog_warm
+
+            _catalog_was_warm = is_catalog_warm(tenant_id)
+        except Exception:
+            _catalog_was_warm = None
+
         if fast:
             assistant_msg = fast
+            turn_outcome = _tm.OK_FASTPATH
             logger.info(
                 "Voice FAQ fast-path ok call_id=%s tenant=%s ms=%.0f",
                 call_id,
@@ -1107,6 +1163,7 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
                     tenant_id,
                 )
                 assistant_msg = await _timeout_fallback()
+                turn_outcome = _tm.TURN_DEADLINE
             except GraphRecursionError:
                 # V06: this is not a TimeoutError, so it used to land in the generic
                 # handler below and surface as "Sorry, I hit a small snag."
@@ -1119,13 +1176,24 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
                 assistant_msg = (
                     "Let me make sure I have this right — could you repeat that last detail for me?"
                 )
+                turn_outcome = _tm.RECURSION_LIMIT
             except Exception as e:
                 logger.error("Vapi agent error for %s: %s", agent_thread_id, e, exc_info=True)
                 error_msg = str(e)
-                if "RESOURCE_EXHAUSTED" in error_msg or "429" in error_msg:
+                # Classify BEFORE choosing the wording, so the operator can tell a
+                # model-quota problem from a tool problem from a config problem.
+                # All three used to collapse into "hit a small snag".
+                turn_outcome = _tm.classify_exception(e)
+                turn_detail = type(e).__name__
+                if turn_outcome == _tm.QUOTA_EXHAUSTED:
                     assistant_msg = (
                         "I'm experiencing a brief system delay. "
                         "Could you repeat that, or I can have a team member call you back?"
+                    )
+                elif turn_outcome == _tm.CONFIG_ERROR:
+                    assistant_msg = (
+                        "I can't reach our catalog right now. "
+                        "Can I take your details so a colleague can follow up?"
                     )
                 else:
                     assistant_msg = "Sorry, I hit a small snag. Could you say that again?"
@@ -1138,6 +1206,16 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
         low = assistant_msg.lower()
         if "let me check" in low or "one moment" in low or "pull that up" in low:
             assistant_msg = await _timeout_fallback()
+
+        _tm.record_turn_bg(
+            tenant_id=tenant_id,
+            channel="voice",
+            outcome=turn_outcome,
+            duration_ms=(asyncio.get_event_loop().time() - t0) * 1000,
+            model=settings.GEMINI_MODEL,
+            catalog_warm=_catalog_was_warm,
+            detail=turn_detail,
+        )
 
         yield _sse(assistant_msg)
         yield _sse(finish="stop")

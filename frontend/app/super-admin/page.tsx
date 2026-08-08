@@ -5,11 +5,12 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   authHeaders,
-  fetchMe,
+  fetchMeResult,
   getAccessToken,
   getBackendUrl,
   getStoredUser,
   clearSession,
+  refreshSessionHint,
   type AuthUser,
 } from "@/lib/auth";
 
@@ -61,9 +62,22 @@ export default function SuperAdminPage() {
         router.replace("/login");
         return;
       }
-      const me = await fetchMe(getBackendUrl());
-      if (!me || me.role !== "super_admin") {
-        router.replace(me ? "/dashboard" : "/login");
+      // Same distinction as the tenant console (F03): a backend that is down
+      // is not a rejected session, and must not bounce the operator to /login.
+      const result = await fetchMeResult(getBackendUrl());
+      if (result.status === "unauthorized" || result.status === "unauthenticated") {
+        router.replace("/login");
+        return;
+      }
+      if (result.status === "unreachable") {
+        setError(`Could not reach the backend: ${result.error}`);
+        setLoading(false);
+        return;
+      }
+      const me = result.user;
+      refreshSessionHint(me);
+      if (me.role !== "super_admin") {
+        router.replace("/dashboard");
         return;
       }
       setUser(me);
@@ -75,17 +89,42 @@ export default function SuperAdminPage() {
           fetch(`${base}/api/superadmin/tenants`, { headers }),
           fetch(`${base}/api/superadmin/users`, { headers }),
         ]);
+        // F21: none of these had an else branch, so a 401/403/500 left the
+        // operator staring at an empty console with no indication that anything
+        // had failed. Every rejected request now names itself and its status.
+        const failures: string[] = [];
+
         if (statsRes.ok) setStats(await statsRes.json());
+        else failures.push(`platform stats (HTTP ${statsRes.status})`);
+
         if (tenantsRes.ok) {
           const data = await tenantsRes.json();
           setTenants(data.tenants || []);
+        } else {
+          failures.push(`tenants (HTTP ${tenantsRes.status})`);
         }
+
         if (usersRes.ok) {
           const data = await usersRes.json();
           setUsers(data.users || []);
+        } else {
+          failures.push(`users (HTTP ${usersRes.status})`);
         }
-      } catch {
-        setError("Failed to load platform data");
+
+        if (failures.length) {
+          setError(
+            `Could not load ${failures.join(", ")}. ` +
+              (failures.some((f) => f.includes("401") || f.includes("403"))
+                ? "Your session may no longer have super-admin rights."
+                : "The backend rejected the request.")
+          );
+        }
+      } catch (e) {
+        setError(
+          e instanceof Error
+            ? `Failed to load platform data: ${e.message}`
+            : "Failed to load platform data"
+        );
       } finally {
         setLoading(false);
       }

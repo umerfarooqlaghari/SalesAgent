@@ -240,6 +240,15 @@ async def _ensure_voice_indexes() -> None:
         [("tenant_id", 1), ("console_thread_id", 1)],
         name="voice_session_tenant_console_thread",
     )
+    # S15: the billing webhook's fallback lookup is by call_id. Without this the
+    # query was a full collection scan on every end-of-call report — and since
+    # nothing wrote the field, a scan that could never match. Sparse, because
+    # sessions registered before Vapi assigns an id have no call_id yet.
+    await _ensure_index(db.voice_call_sessions,
+        "call_id",
+        sparse=True,
+        name="voice_session_call_id",
+    )
     # S02: end-of-call-report webhooks can be redelivered by Vapi on retry —
     # this makes a duplicate delivery a no-op instead of double-billing.
     await _ensure_index(db.voice_billing_events, 

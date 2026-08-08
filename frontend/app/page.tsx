@@ -1,5 +1,3 @@
-"use client";
-
 import Link from "next/link";
 
 const AlphaLogo = ({ className = "w-5 h-5 text-white" }: { className?: string }) => (

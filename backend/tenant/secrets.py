@@ -34,6 +34,21 @@ def _get_fernet() -> Optional[Fernet]:
     return _fernet
 
 
+def get_fernet() -> Optional[Fernet]:
+    """
+    Public accessor. Scripts and tests must not reach for the private
+    `_get_fernet` — the repair migration originally imported a `get_fernet`
+    that did not exist, which would have crashed on first run.
+    """
+    return _get_fernet()
+
+
+def reset_fernet_cache() -> None:
+    """Drop the memoised Fernet so a changed ENCRYPTION_KEY is picked up. Tests only."""
+    global _fernet
+    _fernet = None
+
+
 def encrypt_secret(plaintext: str) -> str:
     f = _get_fernet()
     if not f:

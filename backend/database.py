@@ -415,6 +415,22 @@ async def link_voice_call(tenant_id: str, call_id: str, console_thread_id: str) 
         },
         upsert=True,
     )
+
+    # S15: the end-of-call billing webhook falls back to
+    # `voice_call_sessions.find_one({"call_id": ...})` when no link row is found,
+    # but NOTHING ever wrote call_id into that collection — the branch was dead,
+    # unindexed, and the minutes for those calls were silently never metered.
+    # The session is registered before Vapi assigns a call id, so this is the
+    # first moment the id exists: stamp it on. Scoped by tenant_id so it can
+    # never attach a call to someone else's session.
+    try:
+        await db.voice_call_sessions.update_one(
+            {"console_thread_id": console_thread_id, "tenant_id": tenant_id},
+            {"$set": {"call_id": call_id, "call_id_linked_at": linked_at}},
+        )
+    except Exception:
+        logger.debug("Could not stamp call_id onto the voice session", exc_info=True)
+
     return linked_at
 
 

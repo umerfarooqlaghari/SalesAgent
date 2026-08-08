@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import SqlSchemaWizard, { SQL_PROVIDERS, ui, type DiscoverResult } from "./SqlSchemaWizard";
 
 type FieldSchema = {
@@ -54,8 +54,15 @@ interface Props {
   getHeaders: () => Record<string, string>;
 }
 
-function defaultConfigForProvider(category: CategorySchema, providerId: string): Record<string, unknown> {
-  const provider = category.providers.find((p) => p.id === providerId);
+// F18: this took a non-optional CategorySchema, so both call sites reached for
+// `invCategory!`. If /api/admin/integration-schemas fails while /api/admin/tenant
+// succeeds, invCategory is undefined and clicking "Add inventory source" threw
+// inside here and blanked the whole tab. An empty default is the correct answer.
+function defaultConfigForProvider(
+  category: CategorySchema | undefined,
+  providerId: string
+): Record<string, unknown> {
+  const provider = category?.providers.find((p) => p.id === providerId);
   const config: Record<string, unknown> = {};
   provider?.fields.forEach((f) => {
     if (f.default !== undefined && f.default !== null) config[f.key] = f.default;
@@ -246,9 +253,11 @@ function ConnectionFields({
   );
 }
 
-export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
+function AdminIntegrations({ backendUrl, getHeaders }: Props) {
   const [schemas, setSchemas] = useState<CategorySchema[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationsState | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [tenantId, setTenantId] = useState("");
   const [orgName, setOrgName] = useState("");
   const [companyDescription, setCompanyDescription] = useState("");
@@ -264,50 +273,94 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
   const [syncingKnowledge, setSyncingKnowledge] = useState(false);
   const [discoveryCache, setDiscoveryCache] = useState<Record<string, DiscoverResult>>({});
 
-  const setDiscovery = (key: string, data: DiscoverResult | null) => {
+  // F17 + F22: `getDiscovery` used to read sessionStorage during render. That
+  // is an impure render (hydration mismatch) and it handed a brand-new object
+  // identity to the wizard on every single render, so nothing downstream could
+  // ever be memoised. It also meant a full map of the customer's production
+  // schema sat on disk. Discovery is now in-memory state only, and any copy an
+  // older build left behind is swept on mount.
+  useEffect(() => {
+    try {
+      const stale: string[] = [];
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const k = sessionStorage.key(i);
+        if (k && k.startsWith("alpha-discovery-")) stale.push(k);
+      }
+      stale.forEach((k) => sessionStorage.removeItem(k));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const setDiscovery = useCallback((key: string, data: DiscoverResult | null) => {
     setDiscoveryCache((prev) => {
       const next = { ...prev };
       if (data) next[key] = data;
       else delete next[key];
       return next;
     });
-    if (data) {
-      try {
-        sessionStorage.setItem(`alpha-discovery-${key}`, JSON.stringify(data));
-      } catch {
-        /* ignore */
-      }
-    }
-  };
+  }, []);
 
-  const getDiscovery = (key: string): DiscoverResult | null => {
-    if (discoveryCache[key]) return discoveryCache[key];
-    try {
-      const raw = sessionStorage.getItem(`alpha-discovery-${key}`);
-      if (raw) return JSON.parse(raw) as DiscoverResult;
-    } catch {
-      /* ignore */
-    }
-    return null;
-  };
+  const getDiscovery = useCallback(
+    (key: string): DiscoverResult | null => discoveryCache[key] ?? null,
+    [discoveryCache]
+  );
 
   const setMessage = (msg: string, ok: boolean | null = null) => {
     setStatus(msg);
     setStatusOk(ok ?? (msg.toLowerCase().includes("ok") || msg.toLowerCase().includes("success") || msg.toLowerCase().includes("found") ? true : msg ? false : null));
   };
 
+  // F08: overlapping loads used to race — Reload while a slow first load was
+  // still in flight meant whichever resolved last won, and a resolution after
+  // unmount wrote to a dead tree. Every load now carries a generation number
+  // and an AbortController; only the newest is allowed to commit.
+  const loadSeq = useRef(0);
+  const inFlight = useRef<AbortController | null>(null);
+
+  // F01, belt and braces: the parent now passes a stable `getHeaders`, but this
+  // panel should not lose a half-typed form the next time somebody drops an
+  // inline callback into the JSX. Reading it through a ref keeps `load`'s
+  // identity tied to `backendUrl` alone, so a churning parent cannot re-trigger
+  // the load effect no matter how it passes its props.
+  const getHeadersRef = useRef(getHeaders);
+  useEffect(() => {
+    getHeadersRef.current = getHeaders;
+  }, [getHeaders]);
+
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
+    inFlight.current?.abort();
+    const controller = new AbortController();
+    inFlight.current = controller;
+
+    setLoading(true);
+    setLoadError(null);
     try {
+      const headers = getHeadersRef.current();
       const [schemaRes, tenantRes] = await Promise.all([
-        fetch(`${backendUrl}/api/admin/integration-schemas`, { headers: getHeaders() }),
-        fetch(`${backendUrl}/api/admin/tenant`, { headers: getHeaders() }),
+        fetch(`${backendUrl}/api/admin/integration-schemas`, {
+          headers,
+          signal: controller.signal,
+        }),
+        fetch(`${backendUrl}/api/admin/tenant`, {
+          headers,
+          signal: controller.signal,
+        }),
       ]);
+      if (seq !== loadSeq.current) return;
+
       if (schemaRes.ok) {
         const data = await schemaRes.json();
+        if (seq !== loadSeq.current) return;
         setSchemas(data.categories || []);
+      } else {
+        setSchemas([]);
       }
+
       if (tenantRes.ok) {
         const data = await tenantRes.json();
+        if (seq !== loadSeq.current) return;
         setTenantId(data.tenant_id || "");
         setOrgName(data.org_name || "");
         setIntegrations(data.integrations);
@@ -317,15 +370,34 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
         setInitialCompanyDescription(desc);
         setSystemPrompt(prompt);
         setInitialSystemPrompt(prompt);
+        setLoadError(null);
+      } else {
+        setLoadError(
+          tenantRes.status === 401 || tenantRes.status === 403
+            ? "Your session is not allowed to read these settings (HTTP " + tenantRes.status + ")."
+            : `Could not load your integration settings (HTTP ${tenantRes.status}).`
+        );
       }
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      if (seq !== loadSeq.current) return;
       console.error(e);
-      setMessage("Failed to load integration settings.", false);
+      setLoadError(
+        e instanceof Error
+          ? `Could not reach the backend: ${e.message}`
+          : "Could not reach the backend."
+      );
+    } finally {
+      if (seq === loadSeq.current) setLoading(false);
     }
-  }, [backendUrl, getHeaders]);
+  }, [backendUrl]);
 
   useEffect(() => {
     load();
+    return () => {
+      loadSeq.current++;
+      inFlight.current?.abort();
+    };
   }, [load]);
 
   const save = async () => {
@@ -341,7 +413,20 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Save failed");
       setIntegrations(data.integrations);
-      if (data.settings?.system_prompt) setSystemPrompt(data.settings.system_prompt);
+
+      // F05: this endpoint takes only { integrations }, yet it used to push the
+      // server's system_prompt into the textarea while leaving
+      // initialSystemPrompt stale. Saving an integration therefore discarded a
+      // prompt you were part-way through writing AND left the dirty check
+      // permanently wrong. Only accept the server's copy when there is nothing
+      // unsaved to lose, and move both values together so "Update settings"
+      // stays honest.
+      const serverPrompt = data.settings?.system_prompt;
+      if (serverPrompt && systemPrompt === initialSystemPrompt) {
+        setSystemPrompt(serverPrompt);
+        setInitialSystemPrompt(serverPrompt);
+      }
+
       const hub = data.adapter_hub_sync;
       const hubMsg =
         hub?.ok && hub?.synchronized_count
@@ -451,10 +536,35 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
     }
   };
 
-  if (!integrations) {
+  // F06: the old early return sat *above* the status banner, so the catch
+  // branch's error message could never render — a failed load left a tab
+  // permanently reading "Loading integrations…" with no way to retry. Loading
+  // and failure are now distinct states, and failure offers a retry.
+  if (loading && !integrations) {
     return (
       <div className="flex flex-1 items-center justify-center bg-slate-50 min-h-[60vh]">
         <p className="text-sm text-gray-500">Loading integrations…</p>
+      </div>
+    );
+  }
+
+  if (!integrations) {
+    return (
+      <div className="flex flex-1 items-center justify-center bg-slate-50 min-h-[60vh] px-4">
+        <div className={`${ui.card} max-w-md w-full p-6 text-center space-y-3`}>
+          <h3 className="text-base font-semibold text-gray-900">
+            Couldn&apos;t load your integrations
+          </h3>
+          <p className="text-sm text-gray-600">
+            {loadError || "The backend did not return your integration settings."}
+          </p>
+          <p className={ui.hint}>
+            Check that the Backend Service URL in the sidebar points at your API, then try again.
+          </p>
+          <button type="button" onClick={load} disabled={loading} className={ui.btnPrimary}>
+            {loading ? "Retrying…" : "Retry"}
+          </button>
+        </div>
       </div>
     );
   }
@@ -492,6 +602,18 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
             }`}
           >
             {status}
+          </div>
+        )}
+
+        {schemas.length === 0 && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 flex flex-wrap items-center justify-between gap-3">
+            <span>
+              Provider definitions didn&apos;t load, so the connection forms are unavailable. Your
+              saved settings are intact.
+            </span>
+            <button type="button" onClick={load} disabled={loading} className={ui.btnSecondary}>
+              {loading ? "Retrying…" : "Retry"}
+            </button>
           </div>
         )}
 
@@ -579,7 +701,7 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
                         sources[idx] = {
                           ...src,
                           provider: e.target.value,
-                          config: defaultConfigForProvider(invCategory!, e.target.value),
+                          config: defaultConfigForProvider(invCategory, e.target.value),
                         };
                         setIntegrations({ ...integrations, inventory: { ...integrations.inventory, sources } });
                       }}
@@ -649,7 +771,10 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
             <button
               type="button"
               className={ui.btnSecondary}
+              disabled={!invCategory}
+              title={invCategory ? undefined : "Provider definitions have not loaded yet"}
               onClick={() => {
+                if (!invCategory) return;
                 const id = `src_${Date.now()}`;
                 setIntegrations({
                   ...integrations,
@@ -663,7 +788,7 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
                         provider: "postgres",
                         priority: integrations.inventory.sources.length,
                         label: "postgres",
-                        config: defaultConfigForProvider(invCategory!, "postgres"),
+                        config: defaultConfigForProvider(invCategory, "postgres"),
                       },
                     ],
                   },
@@ -836,3 +961,12 @@ export default function AdminIntegrations({ backendUrl, getHeaders }: Props) {
     </div>
   );
 }
+
+/**
+ * F01: the dashboard re-renders on every streamed WebSocket token. This panel
+ * was re-rendering with it, and because `getHeaders` was a fresh closure each
+ * time, `load` was invalidated, the effect re-fired, and /api/admin/tenant
+ * overwrote whatever you were typing. `getHeaders` is now stable on the parent
+ * side; memoising here stops the re-render reaching the panel at all.
+ */
+export default React.memo(AdminIntegrations);

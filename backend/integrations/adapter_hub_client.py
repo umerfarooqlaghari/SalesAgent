@@ -8,6 +8,20 @@ import httpx
 
 from backend.config import settings
 
+
+def _derive(tenant_id: str) -> str:
+    """Per-tenant Adapter-Hub key. Mirrors adapter_hub/auth/tenant_keys.py."""
+    import base64
+    import hashlib
+    import hmac
+
+    digest = hmac.new(
+        settings.ADAPTER_HUB_MASTER_KEY.encode("utf-8"),
+        b"adapter-hub-tenant-v1:" + (tenant_id or "").encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return "ahk_" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
 logger = logging.getLogger(__name__)
 
 AGENT_ID = "sales_agent"
@@ -16,7 +30,10 @@ AGENT_ID = "sales_agent"
 def _headers(tenant_id: str) -> Dict[str, str]:
     return {
         "Content-Type": "application/json",
-        "X-API-Key": settings.ADAPTER_HUB_MASTER_KEY,
+        # S10: send the key DERIVED for this tenant, not the shared master key.
+        # The hub recomputes it from the claimed tenant id, so a caller holding
+        # one tenant's key cannot act as another.
+        "X-API-Key": _derive(tenant_id),
         "X-Tenant-ID": tenant_id,
         "X-Agent-ID": AGENT_ID,
     }

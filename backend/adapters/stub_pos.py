@@ -142,3 +142,62 @@ class StubPOSAdapter:
 
     async def lookup_product(self, product_name: str) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(_lookup_product, product_name)    # P13
+
+
+class MisconfiguredPOSAdapter:
+    """
+    Returned when a tenant HAS an inventory source configured but it cannot be
+    used because of a server-side configuration fault — today that means a
+    stored secret that will not decrypt (ENCRYPTION_KEY rotated, or a pre-S08
+    build having written plaintext into the `*_enc` field).
+
+    This exists because the three possible answers are not interchangeable:
+
+      * EmptyPOSAdapter  -> "nothing is connected"      (operator adds a source)
+      * "no matching records found"                      (operator fixes data)
+      * this                                             (operator fixes the KEY)
+
+    Before this, the exception escaped the factory and the caller heard
+    "Sorry, I hit a small snag" on every products/services/packages question,
+    with the real cause only in a stack trace. The agent now says something
+    honest and the operator gets a message that names the actual remedy.
+    """
+
+    def __init__(self, tenant: TenantContext, reason: str = ""):
+        self.tenant = tenant
+        self.reason = reason or "a stored credential could not be decrypted"
+
+    def _message(self) -> str:
+        org = self.tenant.org_name or "this organization"
+        return (
+            f"The catalog for {org} is temporarily unavailable because of a server "
+            f"configuration problem ({self.reason}). This is not a problem with your "
+            "request. Apologise briefly, do not invent any items, and offer to take "
+            "their details so a team member can follow up."
+        )
+
+    async def list_products(self, query: Optional[str] = None) -> str:
+        return self._message()
+
+    async def get_order_status(
+        self,
+        order_id: int,
+        customer_email: Optional[str] = None,
+        customer_phone: Optional[str] = None,
+    ) -> str:
+        return self._message()
+
+    async def create_order(
+        self,
+        product_name: str,
+        customer_email: str,
+        customer_phone: str,
+        total_price: str,
+    ) -> int:
+        raise RuntimeError(f"Orders unavailable — {self.reason}.")
+
+    async def cancel_order(self, order_id: int) -> bool:
+        return False
+
+    async def lookup_product(self, product_name: str) -> Optional[Dict[str, Any]]:
+        return None

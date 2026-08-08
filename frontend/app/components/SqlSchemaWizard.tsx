@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
 const SQL_PROVIDERS = new Set(["postgres", "sqlserver", "mysql"]);
 
@@ -111,7 +111,8 @@ interface Props {
   backendUrl: string;
   getHeaders: () => Record<string, string>;
   sourceId?: string;
-  discoveryKey: string;
+  /** Identifies this source's discovery entry in the parent's in-memory cache. */
+  discoveryKey?: string;
   discovered: DiscoverResult | null;
   onDiscovered: (data: DiscoverResult | null) => void;
   onMessage?: (msg: string) => void;
@@ -216,14 +217,18 @@ function MappedTableCard({
         tabIndex={0}
         onKeyDown={(e) => e.key === "Enter" && onToggleExpand()}
       >
-        <div className="pt-0.5">
+        {/* F15: stopPropagation on onChange does not stop the separate click
+            event bubbling to the wrapper, so ticking the box also expanded or
+            collapsed the card. The wrapper swallows the click instead. */}
+        <div
+          className="pt-0.5"
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => e.stopPropagation()}
+        >
           <input
             type="checkbox"
             checked={entry.enabled}
-            onChange={(e) => {
-              e.stopPropagation();
-              onUpdate({ enabled: e.target.checked });
-            }}
+            onChange={(e) => onUpdate({ enabled: e.target.checked })}
             className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
             title="Enable this table for the agent"
           />
@@ -377,7 +382,6 @@ export default function SqlSchemaWizard({
   backendUrl,
   getHeaders,
   sourceId,
-  discoveryKey,
   discovered,
   onDiscovered,
   onMessage,
@@ -407,12 +411,10 @@ export default function SqlSchemaWizard({
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Could not scan database");
 
+      // F22: the discovered schema is a full map of the customer's production
+      // database. It used to be mirrored into sessionStorage here *and* again
+      // in the parent. It now lives only in React state for the life of the tab.
       onDiscovered(data as DiscoverResult);
-      try {
-        sessionStorage.setItem(`alpha-discovery-${discoveryKey}`, JSON.stringify(data));
-      } catch {
-        /* ignore quota */
-      }
 
       // F07: re-scanning used to unconditionally replace mapped_tables (and
       // silently cap it at 12), discarding hours of column-level curation with
@@ -468,8 +470,19 @@ export default function SqlSchemaWizard({
 
   const toggleColumn = (entry: MappedTable, colName: string, on: boolean) => {
     const cols = { ...entry.columns };
-    if (on) cols[colName] = colName;
-    else delete cols[colName];
+    if (on) {
+      cols[colName] = colName;
+    } else {
+      // F16: the checkbox is "included" when the physical column appears among
+      // the VALUES, but the old delete was by key. Suggested and legacy entries
+      // are aliased ({ product_name: "name" }), so un-checking removed nothing
+      // and the box snapped straight back on. Drop every alias pointing at this
+      // physical column, plus a same-named key if one exists.
+      delete cols[colName];
+      for (const [key, physical] of Object.entries(cols)) {
+        if (physical === colName) delete cols[key];
+      }
+    }
     const search = entry.search_columns.filter((s) => Object.values(cols).includes(s));
     updateEntry(entry.id, { columns: cols, search_columns: search });
   };
@@ -605,24 +618,109 @@ export default function SqlSchemaWizard({
         </>
       )}
 
-      <details className="group">
-        <summary className={`${ui.btnGhost} cursor-pointer list-none`}>
-          Advanced: edit raw JSON mapping
-        </summary>
-        <textarea
-          rows={8}
-          className={`${ui.input} mt-2 font-mono text-xs`}
-          value={JSON.stringify({ ...tableMap, mapped_tables: mappedTables }, null, 2)}
-          onChange={(e) => {
-            try {
-              onConfigChange({ ...config, table_map: JSON.parse(e.target.value) });
-            } catch {
-              onConfigChange({ ...config, table_map: e.target.value });
-            }
-          }}
-        />
-      </details>
+      <RawMappingEditor
+        tableMap={tableMap}
+        mappedTables={mappedTables}
+        onCommit={(parsed) => onConfigChange({ ...config, table_map: parsed })}
+      />
     </div>
+  );
+}
+
+/**
+ * F02: this editor used to write straight through on every keystroke, and on a
+ * parse failure it wrote the raw *string* into `table_map`. `parseTableMap`
+ * then failed to parse that string, returned `{}`, and `mapped_tables`
+ * vanished — from the UI and from whatever Save persisted next. One stray
+ * character destroyed the whole mapping.
+ *
+ * The textarea now owns its own draft. Nothing reaches the config until the
+ * text parses to a JSON object, and only on blur or an explicit Apply.
+ */
+function RawMappingEditor({
+  tableMap,
+  mappedTables,
+  onCommit,
+}: {
+  tableMap: Record<string, unknown>;
+  mappedTables: MappedTable[];
+  onCommit: (parsed: Record<string, unknown>) => void;
+}) {
+  const canonical = useMemo(
+    () => JSON.stringify({ ...tableMap, mapped_tables: mappedTables }, null, 2),
+    [tableMap, mappedTables]
+  );
+
+  const [draft, setDraft] = useState(canonical);
+  const [dirty, setDirty] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Follow changes made through the visual editor, but never clobber text the
+  // user is part-way through typing.
+  useEffect(() => {
+    if (!dirty) setDraft(canonical);
+  }, [canonical, dirty]);
+
+  const commit = () => {
+    if (!dirty) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(draft);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "That is not valid JSON.");
+      return;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      setError("The mapping must be a JSON object, e.g. { \"mapped_tables\": [] }.");
+      return;
+    }
+    setError(null);
+    setDirty(false);
+    onCommit(parsed as Record<string, unknown>);
+  };
+
+  const revert = () => {
+    setDraft(canonical);
+    setDirty(false);
+    setError(null);
+  };
+
+  return (
+    <details className="group">
+      <summary className={`${ui.btnGhost} cursor-pointer list-none`}>
+        Advanced: edit raw JSON mapping
+      </summary>
+      <textarea
+        rows={8}
+        aria-label="Raw JSON mapping"
+        className={`${ui.input} mt-2 font-mono text-xs ${
+          error ? "border-red-400 focus:border-red-500 focus:ring-red-500/20" : ""
+        }`}
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          setDirty(true);
+          if (error) setError(null);
+        }}
+        onBlur={commit}
+      />
+      {error && (
+        <p className="mt-1 text-xs font-medium text-red-600">
+          {error} Your existing mapping is unchanged.
+        </p>
+      )}
+      {dirty && (
+        <div className="mt-2 flex items-center gap-2">
+          <button type="button" className={ui.btnSecondary} onClick={commit}>
+            Apply JSON
+          </button>
+          <button type="button" className={ui.btnGhost} onClick={revert}>
+            Discard
+          </button>
+          <span className="text-xs text-gray-500">Unapplied edits</span>
+        </div>
+      )}
+    </details>
   );
 }
 

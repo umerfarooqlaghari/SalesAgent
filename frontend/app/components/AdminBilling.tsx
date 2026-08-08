@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
-import { getAccessToken, getBackendUrl } from "@/lib/auth";
+import { getAccessToken } from "@/lib/auth";
 
 interface AdminBillingProps {
   backendUrl: string;
@@ -14,12 +14,36 @@ interface Plan {
   minutes: number;
 }
 
+/**
+ * F24: this surface ran on `useState<any>`, so `used.toFixed(1)` was only
+ * "safe" because nothing checked it — a server returning a string for
+ * used_minutes threw at render and blanked the tab. Typed, and coerced at the
+ * boundary.
+ */
+interface BillingInfo {
+  tier?: string;
+  used_minutes?: number | string;
+  allowed_minutes?: number | string;
+}
+
+function toNumber(value: unknown, fallback: number): number {
+  const n = typeof value === "number" ? value : parseFloat(String(value ?? ""));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message ? err.message : fallback;
+}
+
 export default function AdminBilling({ backendUrl }: AdminBillingProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [billingInfo, setBillingInfo] = useState<any>(null);
+  const [billingInfo, setBillingInfo] = useState<BillingInfo | null>(null);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [upgradingPlanId, setUpgradingPlanId] = useState<string | null>(null);
+  // F19: the portal button had no in-flight guard, so repeated clicks opened
+  // several Stripe billing-portal sessions in a row.
+  const [portalBusy, setPortalBusy] = useState(false);
 
   const fetchBillingData = async () => {
     setLoading(true);
@@ -44,7 +68,7 @@ export default function AdminBilling({ backendUrl }: AdminBillingProps) {
       } else {
         setError("Failed to retrieve tenant billing information.");
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
       setError("Network error fetching billing details.");
     } finally {
@@ -79,16 +103,17 @@ export default function AdminBilling({ backendUrl }: AdminBillingProps) {
         // Redirect to checkout session
         window.location.href = data.checkout_url;
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
-      setError(err.message || "Failed to start payment checkout.");
+      setError(errorMessage(err, "Failed to start payment checkout."));
     } finally {
       setUpgradingPlanId(null);
     }
   };
 
   const handlePortalRedirect = async () => {
-    setLoading(true);
+    if (portalBusy) return;
+    setPortalBusy(true);
     setError(null);
     try {
       const res = await fetch(`${backendUrl}/api/billing/portal`, {
@@ -106,11 +131,11 @@ export default function AdminBilling({ backendUrl }: AdminBillingProps) {
       if (data.portal_url) {
         window.location.href = data.portal_url;
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
-      setError(err.message || "Portal redirect failed.");
+      setError(errorMessage(err, "Portal redirect failed."));
     } finally {
-      setLoading(false);
+      setPortalBusy(false);
     }
   };
 
@@ -122,8 +147,8 @@ export default function AdminBilling({ backendUrl }: AdminBillingProps) {
     );
   }
 
-  const used = billingInfo?.used_minutes || 0;
-  const allowed = billingInfo?.allowed_minutes || 30;
+  const used = toNumber(billingInfo?.used_minutes, 0);
+  const allowed = Math.max(1, toNumber(billingInfo?.allowed_minutes, 30));
   const usagePercentage = Math.min(100, Math.round((used / allowed) * 100));
   const currentTier = billingInfo?.tier || "free";
 
@@ -183,9 +208,10 @@ export default function AdminBilling({ backendUrl }: AdminBillingProps) {
             <button
               type="button"
               onClick={handlePortalRedirect}
-              className="w-full mt-4 rounded-xl border border-slate-300 hover:bg-slate-50 text-slate-700 font-bold text-xs py-2.5 transition-all text-center"
+              disabled={portalBusy}
+              className="w-full mt-4 rounded-xl border border-slate-300 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed text-slate-700 font-bold text-xs py-2.5 transition-all text-center"
             >
-              Manage Subscription in Stripe
+              {portalBusy ? "Opening Stripe…" : "Manage Subscription in Stripe"}
             </button>
           ) : (
             <div className="text-xs text-purple-600 font-bold mt-4">

@@ -54,16 +54,56 @@ def _escape_like(value: str) -> str:
 _BLOCKED_NETWORKS = tuple(
     ipaddress.ip_network(cidr)
     for cidr in (
+        "0.0.0.0/8",       # 0.0.0.0 routes to localhost on Linux
         "127.0.0.0/8",
         "10.0.0.0/8",
         "172.16.0.0/12",
         "192.168.0.0/16",
-        "169.254.0.0/16",  # link-local, includes the cloud metadata endpoint
+        "169.254.0.0/16",  # link-local, includes the AWS/GCP metadata endpoint
+        "100.64.0.0/10",   # carrier-grade NAT — cloud internal / Tailscale
+        "192.0.0.192/32",  # Oracle Cloud metadata
         "::1/128",
+        "::/128",
         "fc00::/7",
         "fe80::/10",
     )
 )
+
+
+def _host_from_url(url: str) -> Optional[str]:
+    """
+    Pull the hostname out of a SQLAlchemy/DB URL.
+
+    Needed because `_connection_url()` PREFERS a pasted `connection_url` over the
+    discrete host/port fields. Guarding `config["host"]` therefore checked the
+    wrong thing entirely for those tenants — see `_effective_host`.
+    """
+    try:
+        from urllib.parse import urlsplit
+
+        return urlsplit(url).hostname
+    except Exception:
+        return None
+
+
+def _normalise_ip(raw_ip: str):
+    """
+    IPv4-mapped IPv6 (`::ffff:169.254.169.254`) is NOT contained in 169.254.0.0/16
+    when compared as an IPv6Address, so a resolver returning only a AAAA record
+    walked straight through the blocklist. Fold those down to their IPv4 form.
+    """
+    try:
+        ip = ipaddress.ip_address(raw_ip)
+    except ValueError:
+        return None
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        return mapped
+    # 6to4 (2002::/16) and Teredo (2001::/32) can also encapsulate a v4 address.
+    sixtofour = getattr(ip, "sixtofour", None)
+    if sixtofour is not None:
+        return sixtofour
+    return ip
 
 
 def _assert_public_host(host: str) -> None:
@@ -74,15 +114,22 @@ def _assert_public_host(host: str) -> None:
     own internal network (including 169.254.169.254 cloud metadata) for
     anyone holding a tenant API key.
     """
+    if not host:
+        # Nothing to check. Refusing here would block every tenant whose config
+        # has no discrete host field, which is the normal shape for a pasted
+        # connection URL.
+        return
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
-        return  # let the real connection attempt surface a normal DNS error
+        # Let the real connection attempt surface a normal DNS error rather than
+        # a security-sounding one. NOTE: this is deliberately fail-open, so a
+        # host whose resolution fails here is still handed to the driver.
+        logger.debug("Could not resolve %s for the SSRF check", host)
+        return
     for info in infos:
-        raw_ip = info[4][0]
-        try:
-            ip = ipaddress.ip_address(raw_ip)
-        except ValueError:
+        ip = _normalise_ip(info[4][0])
+        if ip is None:
             continue
         if any(ip in net for net in _BLOCKED_NETWORKS):
             raise ValueError("Refusing to connect to a private or link-local database host.")
@@ -255,8 +302,28 @@ class SqlConnection:
             return f"mysql+aiomysql://{username}:{password}@{host}:{port}/{database}"
         raise ValueError(f"Unsupported SQL provider: {self.provider}")
 
+    def _effective_host(self) -> Optional[str]:
+        """
+        The host the driver will ACTUALLY dial.
+
+        This used to be `config.get("host", "localhost")`. When a tenant pastes a
+        full `connection_url` — the normal path for Prisma/Neon/Supabase, and the
+        one `_connection_url()` explicitly prefers — there is no `host` field, so
+        that expression returned the literal string "localhost", which resolves
+        to 127.0.0.1 and tripped the SSRF guard on EVERY query. That is what made
+        every products/services/packages question fail.
+
+        It was also a security hole in the other direction: with a connection_url
+        set, the guard inspected "localhost" instead of the real target, so the
+        URL form bypassed the SSRF check entirely.
+        """
+        url = (self.config.get("connection_url") or "").strip()
+        if url:
+            return _host_from_url(normalise_sql_url(url, self.dialect)) or _host_from_url(url)
+        return self.config.get("host") or None
+
     async def _engine(self):
-        _assert_public_host(self.config.get("host", "localhost"))
+        _assert_public_host(self._effective_host())
         return await get_engine(self._connection_url())
 
     async def test(self) -> None:

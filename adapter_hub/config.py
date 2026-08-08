@@ -14,6 +14,19 @@ class Settings(BaseSettings):
     # Security keys
     ENCRYPTION_KEY: str = os.getenv("ENCRYPTION_KEY", _DEFAULT_ENCRYPTION_KEY) # 32-byte url-safe base64 key
     MASTER_API_KEY: str = os.getenv("ADAPTER_HUB_MASTER_KEY", _DEFAULT_MASTER_API_KEY)
+    # S10: the master key stops being a usable tenant credential in production.
+    # Callers must present the per-tenant derived key instead.
+    ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
+
+    @property
+    def is_production(self) -> bool:
+        return self.ENVIRONMENT.strip().lower() not in (
+            "development", "dev", "local", "test", "testing",
+        )
+
+    @property
+    def allow_master_key_fallback(self) -> bool:
+        return not self.is_production
 
     # Redis configuration
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")

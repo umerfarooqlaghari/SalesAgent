@@ -221,9 +221,12 @@ async def query_pos_database(
         logger.info("Serving query_pos_database from cache for tenant %s (%s)", tenant_id, cache_key)
         return cached_res
 
-    pos = AdapterFactory.pos(tenant)
-
     try:
+        # Defence in depth: building the adapter resolves stored secrets, which
+        # can raise. Outside this try, any such failure escaped the tool and the
+        # graph turned it into the generic "Sorry, I hit a small snag."
+        pos = AdapterFactory.pos(tenant)
+
         if order_id is not None:
             res = await pos.get_order_status(
                 int(order_id),

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
 from backend.auth.dependencies import get_current_user, require_super_admin
 from backend.auth.rate_limit import check_rate_limit
+from backend.config import settings
 from backend.auth.service import (
     UserSession,
     get_or_create_publishable_key,
@@ -20,6 +21,32 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 def _client_ip(request: Request) -> str:
+    """
+    The caller's real IP.
+
+    S13: this returned `request.client.host`, which behind Render/any reverse
+    proxy is the PROXY's address — identical for every visitor. The limiter
+    therefore degraded to a single global bucket: 5 logins per minute for the
+    whole platform, and one attacker could lock every customer out.
+
+    X-Forwarded-For is client-controlled, so it is only trusted when the request
+    genuinely arrived through a proxy we run. TRUSTED_PROXY_HOPS says how many
+    trailing entries our own infrastructure appends (Render appends exactly 1);
+    we index from the RIGHT by that count, so a spoofed prefix cannot shift
+    which entry we read. With 0 hops configured the header is ignored entirely.
+    """
+    hops = max(0, int(getattr(settings, "TRUSTED_PROXY_HOPS", 0) or 0))
+    if hops:
+        forwarded = request.headers.get("X-Forwarded-For") or ""
+        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+        # Each proxy APPENDS the peer it received from, so the entry written by
+        # the outermost proxy we control is `hops` from the right. Counting from
+        # the right is what makes a spoofed prefix harmless — the client can add
+        # entries on the left, but cannot change which index we read.
+        if len(parts) >= hops:
+            return parts[-hops]
+        if parts:
+            return parts[0]
     return request.client.host if request.client else "unknown"
 
 
@@ -44,9 +71,12 @@ async def register(request: Request, payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+# S13: this consumes a hashed single-use token and had no limiter at all, so
+# tokens could be guessed at line rate.
 @router.post("/verify-email")
-async def verify_email_route(payload: Dict[str, Any] = Body(...)):
+async def verify_email_route(request: Request, payload: Dict[str, Any] = Body(...)):
     """S24: activate the account from the single-use link sent at registration."""
+    _enforce_rate_limit(request, "verify-email", limit=10, window_seconds=3600)
     token = (payload.get("token") or "").strip()
     if not token:
         raise HTTPException(status_code=400, detail="token is required")
@@ -60,6 +90,12 @@ async def verify_email_route(payload: Dict[str, Any] = Body(...)):
 async def login(request: Request, payload: Dict[str, Any] = Body(...)):
     """Email + password login → JWT session."""
     _enforce_rate_limit(request, "login", limit=5, window_seconds=60)
+    # S13: the per-IP bucket does nothing against a distributed attempt on ONE
+    # account. Bucket by email too — 10 failures an hour for a given address,
+    # whatever address they come from. Lowercased so casing cannot sidestep it.
+    _target = (payload.get("email") or "").strip().lower()
+    if _target:
+        _enforce_rate_limit(request, f"login-acct:{_target}", limit=10, window_seconds=3600)
     email = payload.get("email")
     password = payload.get("password")
     api_key = (payload.get("api_key") or "").strip()
@@ -173,9 +209,11 @@ async def forgot_password(request: Request, payload: Dict[str, Any] = Body(...))
     await send_reset_password_email(email, token)
     return {"message": "If this email is registered, a password reset link has been sent."}
 
+# S13: same — an unlimited oracle against reset_token_hash.
 @router.post("/reset-password")
-async def reset_password(payload: Dict[str, Any] = Body(...)):
+async def reset_password(request: Request, payload: Dict[str, Any] = Body(...)):
     """Verify reset token and update password."""
+    _enforce_rate_limit(request, "reset-password", limit=10, window_seconds=3600)
     import hashlib
     from datetime import datetime, timezone
     from backend.database import get_db

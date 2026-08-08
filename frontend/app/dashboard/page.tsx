@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import Vapi from "@vapi-ai/web";
 import AdminIntegrations from "../components/AdminIntegrations";
@@ -8,14 +8,24 @@ import AdminBilling from "../components/AdminBilling";
 import {
   authHeaders,
   clearSession,
-  fetchMe,
+  fetchMeResult,
   getAccessToken,
   getBackendUrl,
   getStoredApiKey,
   getStoredUser,
+  isAllowedBackendUrl,
+  refreshSessionHint,
   saveApiKey,
   type AuthUser,
 } from "@/lib/auth";
+
+// F10: these used to fall back to a developer's personal Vapi credentials. A
+// deploy that forgot the env vars silently routed every tenant's calls into
+// that account with nothing surfaced in the UI. No literals, and the call
+// button disables itself when the configuration is missing.
+const VAPI_PUBLIC_KEY = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY || "";
+const VAPI_ASSISTANT_ID = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID || "";
+const VAPI_CONFIGURED = Boolean(VAPI_PUBLIC_KEY && VAPI_ASSISTANT_ID);
 
 interface Lead {
   _id?: string;
@@ -32,7 +42,18 @@ interface Message {
   role: "user" | "assistant";
   content: string;
   thought?: string;
+  /**
+   * F20: `messages` is replaced wholesale by the history frame, so an array
+   * index made a stable key impossible — the expanded <details> panel stayed
+   * put while the message underneath it changed. Every message gets a client
+   * id the moment it enters state.
+   */
+  _key?: string;
 }
+
+let messageKeySeq = 0;
+const withKey = (m: Message): Message => (m._key ? m : { ...m, _key: `m${++messageKeySeq}` });
+const withKeys = (list: Message[]): Message[] => (list || []).map(withKey);
 
 interface ToolCall {
   tool: string;
@@ -70,6 +91,13 @@ export default function Dashboard() {
   const [backendUrl, setBackendUrl] = useState<string>(() =>
     typeof window !== "undefined" ? getBackendUrl() : "http://127.0.0.1:8765"
   );
+  // F03: the committed URL above drives auth, threads and the WebSocket. The
+  // draft below is what the input box shows, so typing no longer re-runs any
+  // of them mid-keystroke.
+  const [backendUrlDraft, setBackendUrlDraft] = useState<string>(backendUrl);
+  const [backendUrlNote, setBackendUrlNote] = useState<string>("");
+  const [authError, setAuthError] = useState<string>("");
+  const [authRetry, setAuthRetry] = useState<number>(0);
   const [voiceEnabled, setVoiceEnabled] = useState<boolean>(false);
   const voiceEnabledRef = useRef(false);
   const [isCalling, setIsCalling] = useState<boolean>(false);
@@ -78,7 +106,6 @@ export default function Dashboard() {
   const activeVapiCallIdRef = useRef<string | null>(null);
   const isCallingRef = useRef(false);
   const threadIdRef = useRef(threadId);
-  const accessTokenRef = useRef<string | null>(null);
   const apiKeyRef = useRef(apiKey);
   const backendUrlRef = useRef(backendUrl);
   const tenantIdRef = useRef("alpha_default");
@@ -88,7 +115,6 @@ export default function Dashboard() {
   useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
   useEffect(() => { backendUrlRef.current = backendUrl; }, [backendUrl]);
   useEffect(() => { isCallingRef.current = isCalling; }, [isCalling]);
-  useEffect(() => { accessTokenRef.current = getAccessToken(); }, [authChecked]);
 
   const orgDisplayName = tenantInfo?.org_name || sessionUser?.org_name || "Console";
   const orgInitial = orgDisplayName.trim().charAt(0).toUpperCase() || "C";
@@ -111,12 +137,30 @@ export default function Dashboard() {
         router.replace("/super-admin");
         return;
       }
-      const me = await fetchMe(backendUrl);
-      if (!me || !me.tenant_id) {
+      // F03: `fetchMe` collapsed "the server rejected your token" and "I could
+      // not reach the server" into the same `null`, and this branch answered
+      // both by clearing the session. A backend that was briefly down — or a
+      // Backend URL field mid-edit — therefore logged the operator out and
+      // discarded the transcript. Only a real 401/403 ends the session now.
+      const result = await fetchMeResult(backendUrl);
+      if (result.status === "unauthorized" || result.status === "unauthenticated") {
         clearSession();
         router.replace("/login");
         return;
       }
+      if (result.status === "unreachable") {
+        setAuthError(result.error);
+        setStatusText(`Cannot reach ${backendUrl}`);
+        return;
+      }
+      const me = result.user;
+      if (!me.tenant_id) {
+        clearSession();
+        router.replace("/login");
+        return;
+      }
+      setAuthError("");
+      refreshSessionHint(me);
       setSessionUser(me);
       setTenantInfo({ tenant_id: me.tenant_id, org_name: me.org_name || me.tenant_id });
       tenantIdRef.current = me.tenant_id;
@@ -137,7 +181,7 @@ export default function Dashboard() {
       }
     };
     initAuth();
-  }, [router, backendUrl]);
+  }, [router, backendUrl, authRetry]);
 
   useEffect(() => {
     if (!authChecked) return;
@@ -193,8 +237,13 @@ export default function Dashboard() {
     voiceEnabledRef.current = voiceEnabled;
   }, [voiceEnabled]);
 
-  // Load saved API Key from localStorage on mount
-  const getHeaders = () => authHeaders();
+  // F01: this was a brand-new function on every render. AdminIntegrations takes
+  // it as a prop and lists it in the deps of its `load` callback, so every
+  // streamed WebSocket token invalidated `load`, re-fetched /api/admin/tenant
+  // and overwrote whatever the operator was typing into the integrations form.
+  // `authHeaders()` reads localStorage at call time, so an empty dep list is
+  // correct — the identity is stable, the value is not stale.
+  const getHeaders = useCallback(() => authHeaders(), []);
 
   const getWsAuthQuery = () => {
     const token = getAccessToken();
@@ -246,10 +295,42 @@ export default function Dashboard() {
     }
   };
 
-  const handleBackendUrlChange = (val: string) => {
+  /**
+   * F03: committing only happens on blur / Enter, and only for a URL that
+   * actually parses. Previously every keystroke wrote through to `backendUrl`,
+   * which is a dependency of the auth effect, the thread effect and the
+   * WebSocket effect — so typing "h", "ht", "htt"… fired three cascades per
+   * character and signed the operator out on the first one.
+   *
+   * F04: an origin the app is not configured to talk to is never persisted.
+   */
+  const commitBackendUrl = () => {
+    const val = backendUrlDraft.trim();
+    if (!val || val === backendUrl) {
+      setBackendUrlDraft(backendUrl);
+      setBackendUrlNote("");
+      return;
+    }
+    try {
+      new URL(val);
+    } catch {
+      setBackendUrlNote("That is not a valid URL — reverted.");
+      setBackendUrlDraft(backendUrl);
+      return;
+    }
+    if (!isAllowedBackendUrl(val)) {
+      setBackendUrlNote("That origin is not allowed for this deployment — reverted.");
+      setBackendUrlDraft(backendUrl);
+      return;
+    }
+    setBackendUrlNote("");
     setBackendUrl(val);
     if (typeof window !== "undefined") {
-      localStorage.setItem("sdr_backend_url", val);
+      try {
+        localStorage.setItem("sdr_backend_url", val);
+      } catch {
+        /* private mode */
+      }
     }
   };
 
@@ -281,62 +362,107 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      const vapiPublicKey = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY || "e8cd4840-5e48-4005-9b73-353ac169e70e";
-      vapiRef.current = new Vapi(vapiPublicKey);
-
-      vapiRef.current.on("call-start", async (call: { id?: string }) => {
-        isCallingRef.current = true;
-        setIsCalling(true);
-        setStatusText("Vapi call connected!");
-        const callId = call?.id;
-        if (callId) {
-          await linkCallToThread(callId);
-        }
-      });
-
-      vapiRef.current.on("call-end", async () => {
-        isCallingRef.current = false;
-        setIsCalling(false);
-        setStatusText("Vapi call ended.");
-        const callId = activeVapiCallIdRef.current;
-        if (callId) {
-          try {
-            await fetch(`${backendUrlRef.current}/api/voice/link/${callId}`, {
-              method: "DELETE",
-              headers: getHeaders(),
-            });
-          } catch (e) {
-            console.error("Failed to unlink voice call:", e);
-          }
-          activeVapiCallIdRef.current = null;
-          setActiveVoiceCallId(null);
-        }
-      });
-
-      vapiRef.current.on("message", (message: { type?: string; call?: { id?: string } }) => {
-        const callId = message?.call?.id;
-        if (callId && !activeVapiCallIdRef.current) {
-          linkCallToThread(callId);
-        }
-      });
-
-      vapiRef.current.on("error", (e: any) => {
-        console.error("Vapi call error:", e);
-        isCallingRef.current = false;
-        setIsCalling(false);
-        setStatusText("Vapi error: " + (e.message || "Failed"));
-      });
+    if (typeof window === "undefined") return;
+    if (!VAPI_CONFIGURED) {
+      // F10: no silent fallback into somebody else's Vapi account.
+      setStatusText("Voice calling is not configured for this deployment.");
+      return;
     }
 
-    return () => {
-      if (vapiRef.current) {
-        vapiRef.current.stop();
+    const client = new Vapi(VAPI_PUBLIC_KEY);
+    vapiRef.current = client;
+
+    // F14: these were anonymous closures and cleanup only called stop(). Under
+    // StrictMode's double mount (and on every hot reload) the first client was
+    // orphaned while still holding live listeners that kept writing to state
+    // belonging to the unmounted tree. Named handlers, detached explicitly.
+    const onCallStart = async (call: { id?: string }) => {
+      isCallingRef.current = true;
+      setIsCalling(true);
+      setStatusText("Vapi call connected!");
+      const callId = call?.id;
+      if (callId) {
+        await linkCallToThread(callId);
       }
     };
-  }, []);
+
+    const onCallEnd = async () => {
+      isCallingRef.current = false;
+      setIsCalling(false);
+      setStatusText("Vapi call ended.");
+      const callId = activeVapiCallIdRef.current;
+      if (callId) {
+        try {
+          await fetch(`${backendUrlRef.current}/api/voice/link/${callId}`, {
+            method: "DELETE",
+            headers: getHeaders(),
+          });
+        } catch (e) {
+          console.error("Failed to unlink voice call:", e);
+        }
+        activeVapiCallIdRef.current = null;
+        setActiveVoiceCallId(null);
+      }
+    };
+
+    const onMessage = (message: { type?: string; call?: { id?: string } }) => {
+      const callId = message?.call?.id;
+      if (callId && !activeVapiCallIdRef.current) {
+        linkCallToThread(callId);
+      }
+    };
+
+    const onError = (e: any) => {
+      console.error("Vapi call error:", e);
+      isCallingRef.current = false;
+      setIsCalling(false);
+      setStatusText("Vapi error: " + (e?.message || "Failed"));
+    };
+
+    // The published Vapi typings declare `on` with per-event signatures that do
+    // not carry the payload we need, so registration goes through a narrow
+    // structural view of the emitter rather than a blanket `any` on the client.
+    type Emitter = {
+      on: (evt: string, fn: (...args: any[]) => void) => void;
+      off?: (evt: string, fn: (...args: any[]) => void) => void;
+      removeAllListeners?: () => void;
+    };
+    const emitter = client as unknown as Emitter;
+
+    emitter.on("call-start", onCallStart);
+    emitter.on("call-end", onCallEnd);
+    emitter.on("message", onMessage);
+    emitter.on("error", onError);
+
+    return () => {
+      try {
+        client.stop();
+      } catch {
+        /* already stopped */
+      }
+      try {
+        if (typeof emitter.off === "function") {
+          emitter.off("call-start", onCallStart);
+          emitter.off("call-end", onCallEnd);
+          emitter.off("message", onMessage);
+          emitter.off("error", onError);
+        } else if (typeof emitter.removeAllListeners === "function") {
+          emitter.removeAllListeners();
+        }
+      } catch {
+        /* best effort */
+      }
+      if (vapiRef.current === client) vapiRef.current = null;
+    };
+  }, [getHeaders]);
 
   const handleToggleVapiCall = async () => {
+    if (!VAPI_CONFIGURED || !vapiRef.current) {
+      setStatusText(
+        "Voice calling is not configured — set NEXT_PUBLIC_VAPI_PUBLIC_KEY and NEXT_PUBLIC_VAPI_ASSISTANT_ID."
+      );
+      return;
+    }
     if (isCalling) {
       vapiRef.current.stop();
     } else {
@@ -358,8 +484,7 @@ export default function Dashboard() {
         } catch {
           /* non-blocking */
         }
-        const assistantId = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID || "a5b5e387-3e26-4ad0-ad0f-8454b675f1c9";
-        vapiRef.current.start(assistantId, {
+        vapiRef.current.start(VAPI_ASSISTANT_ID, {
           metadata: {
             console_thread_id: threadIdRef.current,
             tenant_id: tenantIdRef.current,
@@ -488,132 +613,182 @@ export default function Dashboard() {
   }, [messages]);
 
   // Handle WebSocket Connection
+  //
+  // F12: `onclose` used to schedule nothing, so one dropped frame left the
+  // console permanently "Disconnected" with no way back short of a reload. And
+  // the transcript was wiped at the top of this effect on *any* dependency
+  // change — switching backend URL or rotating the API key blanked the message
+  // list before anything replaced it. Now: reconnect with exponential backoff,
+  // and only clear the transcript when the thread actually changes.
+  const lastThreadRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (!threadId || !authChecked || !tenantInfo) return;
 
     const wsAuth = getWsAuthQuery();
     if (!wsAuth) return;
 
-    setMessages([]);
-    setStreamingThought("");
-    setStreamingResponse("");
-    setToolCalls([]);
-    streamingThoughtRef.current = "";
-    streamingResponseRef.current = "";
-    toolCallsRef.current = [];
+    if (lastThreadRef.current !== threadId) {
+      lastThreadRef.current = threadId;
+      setMessages([]);
+      setStreamingThought("");
+      setStreamingResponse("");
+      setToolCalls([]);
+      streamingThoughtRef.current = "";
+      streamingResponseRef.current = "";
+      toolCallsRef.current = [];
+    }
 
-    const socket = new WebSocket(`${getWsUrl(backendUrl)}/ws/chat/${threadId}?${wsAuth}`);
+    let cancelled = false;
+    let attempt = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let socket: WebSocket | null = null;
 
-    socket.onopen = () => {
-      setConnected(true);
-      setStatusText("Connected. Idle.");
-    };
+    const connect = () => {
+      if (cancelled) return;
 
-    socket.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+      const s = new WebSocket(`${getWsUrl(backendUrl)}/ws/chat/${threadId}?${wsAuth}`);
+      socket = s;
+      ws.current = s;
 
-      if (data.type === "unauthorized") {
-        setStatusText("Error: API Key Unauthorized");
-        setConnected(false);
-        socket.close();
-        return;
-      }
+      s.onopen = () => {
+        if (cancelled) return;
+        attempt = 0;
+        setConnected(true);
+        setStatusText("Connected. Idle.");
+      };
 
-      if (data.type === "history") {
-        setMessages(data.messages);
-      } else if (data.type === "lead_status") {
-        setActiveLead(data.lead);
-        fetchLeads();
-      } else if (data.type === "status") {
-        setStatusText(data.status);
-        if (data.status === "Idle") {
-          const finalResponse = streamingResponseRef.current;
-          const finalThought = streamingThoughtRef.current;
+      s.onmessage = (event) => {
+        // F13: one non-JSON frame used to throw straight out of the handler and
+        // abort processing of that frame with nothing logged.
+        let data: any;
+        try {
+          data = JSON.parse(event.data);
+        } catch {
+          console.warn("Ignoring malformed WebSocket frame");
+          return;
+        }
+        if (!data || typeof data !== "object") return;
 
-          if (finalResponse || finalThought) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "assistant",
-                content: finalResponse,
-                thought: finalThought || undefined
+        if (data.type === "unauthorized") {
+          setStatusText("Error: API Key Unauthorized");
+          setConnected(false);
+          // A rejected ticket will be rejected again — do not reconnect.
+          cancelled = true;
+          s.close();
+          return;
+        }
+
+        if (data.type === "history") {
+          setMessages(withKeys(data.messages || []));
+        } else if (data.type === "lead_status") {
+          setActiveLead(data.lead);
+          fetchLeads();
+        } else if (data.type === "status") {
+          setStatusText(data.status);
+          if (data.status === "Idle") {
+            const finalResponse = streamingResponseRef.current;
+            const finalThought = streamingThoughtRef.current;
+
+            if (finalResponse || finalThought) {
+              setMessages((prev) => [
+                ...prev,
+                withKey({
+                  role: "assistant",
+                  content: finalResponse,
+                  thought: finalThought || undefined
+                })
+              ]);
+
+              // Speak complete final response if TTS Voice Mode is toggled ON
+              if (voiceEnabledRef.current && finalResponse) {
+                speakResponse(finalResponse);
               }
-            ]);
 
-            // Speak complete final response if TTS Voice Mode is toggled ON
-            if (voiceEnabledRef.current && finalResponse) {
-              speakResponse(finalResponse);
+              streamingResponseRef.current = "";
+              streamingThoughtRef.current = "";
+              toolCallsRef.current = [];
+              setStreamingThought("");
+              setStreamingResponse("");
+              setToolCalls([]);
             }
-
-            streamingResponseRef.current = "";
-            streamingThoughtRef.current = "";
-            toolCallsRef.current = [];
-            setStreamingThought("");
-            setStreamingResponse("");
-            setToolCalls([]);
           }
-        }
-      } else if (data.type === "stream_start") {
-        setStatusText("Streaming...");
-        setStreamingThought("");
-        setStreamingResponse("");
-        streamingThoughtRef.current = "";
-        streamingResponseRef.current = "";
-      } else if (data.type === "thought") {
-        streamingThoughtRef.current += data.token;
-        setStreamingThought(streamingThoughtRef.current);
-      } else if (data.type === "response") {
-        streamingResponseRef.current += data.token;
-        setStreamingResponse(streamingResponseRef.current);
-      } else if (data.type === "tool_start") {
-        const updated = [...toolCallsRef.current, { tool: data.tool, inputs: data.inputs, status: "running" as const }];
-        toolCallsRef.current = updated;
-        setToolCalls(updated);
-      } else if (data.type === "tool_end") {
-        const updated = toolCallsRef.current.map((t) =>
-          t.tool === data.tool && t.status === "running"
-            ? { ...t, output: data.output, status: "completed" as const }
-            : t
-        );
-        toolCallsRef.current = updated;
-        setToolCalls(updated);
-      } else if (data.type === "human_response") {
-        setMessages((prev) => [...prev, { role: "assistant", content: data.message }]);
-        if (voiceEnabledRef.current && data.message) {
-          speakResponse(data.message);
-        }
-      } else if (data.type === "handoff") {
-        setStatusText(`Handoff requested: ${data.reason}`);
-        fetchLeads();
-      } else if (data.type === "error") {
-        setStatusText(`Error: ${data.message}`);
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: `⚠️ Error: ${data.message}`
+        } else if (data.type === "stream_start") {
+          setStatusText("Streaming...");
+          setStreamingThought("");
+          setStreamingResponse("");
+          streamingThoughtRef.current = "";
+          streamingResponseRef.current = "";
+        } else if (data.type === "thought") {
+          streamingThoughtRef.current += data.token;
+          setStreamingThought(streamingThoughtRef.current);
+        } else if (data.type === "response") {
+          streamingResponseRef.current += data.token;
+          setStreamingResponse(streamingResponseRef.current);
+        } else if (data.type === "tool_start") {
+          const updated = [...toolCallsRef.current, { tool: data.tool, inputs: data.inputs, status: "running" as const }];
+          toolCallsRef.current = updated;
+          setToolCalls(updated);
+        } else if (data.type === "tool_end") {
+          const updated = toolCallsRef.current.map((t) =>
+            t.tool === data.tool && t.status === "running"
+              ? { ...t, output: data.output, status: "completed" as const }
+              : t
+          );
+          toolCallsRef.current = updated;
+          setToolCalls(updated);
+        } else if (data.type === "human_response") {
+          setMessages((prev) => [...prev, withKey({ role: "assistant", content: data.message })]);
+          if (voiceEnabledRef.current && data.message) {
+            speakResponse(data.message);
           }
-        ]);
-        streamingResponseRef.current = "";
-        streamingThoughtRef.current = "";
-        toolCallsRef.current = [];
-        setStreamingThought("");
-        setStreamingResponse("");
-        setToolCalls([]);
-      }
+        } else if (data.type === "handoff") {
+          setStatusText(`Handoff requested: ${data.reason}`);
+          fetchLeads();
+        } else if (data.type === "error") {
+          setStatusText(`Error: ${data.message}`);
+          setMessages((prev) => [
+            ...prev,
+            withKey({
+              role: "assistant",
+              content: `⚠️ Error: ${data.message}`
+            })
+          ]);
+          streamingResponseRef.current = "";
+          streamingThoughtRef.current = "";
+          toolCallsRef.current = [];
+          setStreamingThought("");
+          setStreamingResponse("");
+          setToolCalls([]);
+        }
+      };
+
+      const scheduleReconnect = () => {
+        if (cancelled) return;
+        attempt += 1;
+        // 1s, 2s, 4s, 8s, 16s, then every 30s. Capped, and always clearable.
+        const delay = Math.min(30000, 1000 * Math.pow(2, Math.min(attempt - 1, 4)));
+        setStatusText(`Disconnected — reconnecting in ${Math.round(delay / 1000)}s…`);
+        retryTimer = setTimeout(connect, delay);
+      };
+
+      s.onclose = () => {
+        if (ws.current === s) ws.current = null;
+        setConnected(false);
+        if (cancelled) {
+          setStatusText("Disconnected");
+          return;
+        }
+        scheduleReconnect();
+      };
+
+      s.onerror = () => {
+        setConnected(false);
+        if (!cancelled) setStatusText("Connection error");
+      };
     };
 
-    socket.onclose = () => {
-      setConnected(false);
-      setStatusText("Disconnected");
-    };
-
-    socket.onerror = () => {
-      setConnected(false);
-      setStatusText("Connection error");
-    };
-
-    ws.current = socket;
+    connect();
     fetchLeadProfile(threadId);
 
     setThreads((prev) => {
@@ -623,7 +798,15 @@ export default function Dashboard() {
     });
 
     return () => {
-      socket.close();
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (socket) {
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.onmessage = null;
+        socket.close();
+      }
+      if (ws.current === socket) ws.current = null;
     };
   }, [threadId, authChecked, backendUrl, tenantInfo, apiKey]);
 
@@ -636,7 +819,7 @@ export default function Dashboard() {
 
     // During voice call: save typed detail and inject into Vapi — do not run chat WebSocket agent
     if (duringCall) {
-      setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
+      setMessages((prev) => [...prev, withKey({ role: "user", content: userMsg })]);
       setChatInput("");
       try {
         await fetch(`${backendUrl}/api/conversations/${threadId}/typed`, {
@@ -663,7 +846,7 @@ export default function Dashboard() {
 
     if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
 
-    setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
+    setMessages((prev) => [...prev, withKey({ role: "user", content: userMsg })]);
 
     ws.current.send(JSON.stringify({ message: userMsg }));
     setChatInput("");
@@ -717,7 +900,7 @@ export default function Dashboard() {
         body: JSON.stringify({ message: supervisorMessage.trim() })
       });
       if (res.ok) {
-        setMessages((prev) => [...prev, { role: "assistant", content: supervisorMessage.trim(), thought: "Sent by human operator" }]);
+        setMessages((prev) => [...prev, withKey({ role: "assistant", content: supervisorMessage.trim(), thought: "Sent by human operator" })]);
         setSupervisorMessage("");
       }
     } catch (e) {
@@ -750,6 +933,59 @@ export default function Dashboard() {
   const voiceActive = isCalling || !!activeVoiceCallId;
 
   if (!authChecked) {
+    // F03: an unreachable backend is not a failed login. Say so, and let the
+    // operator point the console somewhere else instead of silently signing
+    // them out and throwing the conversation away.
+    if (authError) {
+      return (
+        <div className="flex h-[100dvh] items-center justify-center bg-[#0A0E1A] px-4 text-slate-300">
+          <div className="w-full max-w-md space-y-4 rounded-2xl border border-slate-700 bg-slate-900/60 p-6">
+            <h1 className="text-base font-semibold text-white">Can&apos;t reach the backend</h1>
+            <p className="text-sm text-slate-400">{authError}</p>
+            <div>
+              <label className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                Backend Service URL
+              </label>
+              <input
+                type="text"
+                value={backendUrlDraft}
+                onChange={(e) => setBackendUrlDraft(e.target.value)}
+                onBlur={commitBackendUrl}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitBackendUrl();
+                  }
+                }}
+                className="w-full rounded-lg border border-slate-600 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-100 focus:border-indigo-500 focus:outline-none"
+              />
+              {backendUrlNote && (
+                <p className="mt-1 text-[11px] font-semibold text-rose-400">{backendUrlNote}</p>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthError("");
+                  setAuthRetry((n) => n + 1);
+                }}
+                className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-500"
+              >
+                Retry
+              </button>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="rounded-lg border border-slate-600 px-3 py-1.5 text-xs font-semibold text-slate-300 hover:bg-slate-800"
+              >
+                Sign out
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="flex h-[100dvh] items-center justify-center bg-[#0A0E1A] text-slate-400">
         Loading console…
@@ -872,11 +1108,30 @@ export default function Dashboard() {
           </div>
           <input
             type="text"
-            value={backendUrl}
-            onChange={(e) => handleBackendUrlChange(e.target.value)}
+            value={backendUrlDraft}
+            onChange={(e) => setBackendUrlDraft(e.target.value)}
+            onBlur={commitBackendUrl}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitBackendUrl();
+              } else if (e.key === "Escape") {
+                setBackendUrlDraft(backendUrl);
+                setBackendUrlNote("");
+              }
+            }}
             placeholder="e.g. https://salesagent-b6po.onrender.com"
             className="w-full bg-white border border-slate-200 rounded-lg px-3 py-1.5 text-xs text-slate-800 placeholder-slate-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all font-mono"
           />
+          <p className="mt-1 text-[9px] text-slate-400">
+            {backendUrlNote ? (
+              <span className="font-semibold text-rose-500">{backendUrlNote}</span>
+            ) : backendUrlDraft !== backendUrl ? (
+              <span className="font-semibold text-amber-600">Press Enter to apply</span>
+            ) : (
+              "Applied on Enter or when you click away."
+            )}
+          </p>
         </div>
 
         {/* Action Button */}
@@ -1045,13 +1300,19 @@ export default function Dashboard() {
             <button
               type="button"
               onClick={handleToggleVapiCall}
-              className={`inline-flex h-9 items-center gap-2 rounded-md border px-3 text-xs font-semibold transition-colors ${
+              disabled={!VAPI_CONFIGURED}
+              title={
+                VAPI_CONFIGURED
+                  ? undefined
+                  : "Voice calling is not configured for this deployment (missing NEXT_PUBLIC_VAPI_PUBLIC_KEY / NEXT_PUBLIC_VAPI_ASSISTANT_ID)."
+              }
+              className={`inline-flex h-9 items-center gap-2 rounded-md border px-3 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                 isCalling
                   ? "border-rose-300 bg-rose-50 text-rose-700"
                   : "border-slate-200 bg-white text-indigo-600 hover:bg-slate-50"
               }`}
             >
-              {isCalling ? "End call" : "Start call"}
+              {!VAPI_CONFIGURED ? "Voice unconfigured" : isCalling ? "End call" : "Start call"}
             </button>
             <div className="hidden lg:block text-right pl-2 border-l border-slate-200">
               <div className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Status</div>
@@ -1098,7 +1359,7 @@ export default function Dashboard() {
                     {/* Render past conversation */}
                     {messages.map((msg, idx) => (
                       <div
-                        key={idx}
+                        key={msg._key ?? `idx-${idx}`}
                         className={`flex gap-4 max-w-4xl ${msg.role === "user" ? "ml-auto flex-row-reverse" : ""
                           }`}
                       >
@@ -1423,7 +1684,7 @@ export default function Dashboard() {
                   <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:p-6">
                     {messages.map((msg, idx) => (
                       <div
-                        key={idx}
+                        key={msg._key ?? `idx-${idx}`}
                         className={`flex gap-4 max-w-4xl ${msg.role === "user" ? "ml-auto flex-row-reverse" : ""
                           }`}
                       >

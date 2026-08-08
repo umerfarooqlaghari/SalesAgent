@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { getBackendUrl, saveSession } from "@/lib/auth";
+import { getBackendUrl, getStoredUser, refreshSessionHint, saveSession } from "@/lib/auth";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -11,6 +11,20 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // F09: the edge middleware gates /dashboard and /super-admin on the
+  // `sdr_session` hint cookie. Anyone already signed in before this shipped has
+  // a localStorage session but no cookie, and would be bounced here forever.
+  // Heal it once, then send them where they were going.
+  useEffect(() => {
+    const stored = getStoredUser();
+    if (!stored) return;
+    refreshSessionHint(stored);
+    const params = new URLSearchParams(window.location.search);
+    const next = params.get("next");
+    const safeNext = next && next.startsWith("/") && !next.startsWith("//") ? next : null;
+    router.replace(safeNext || (stored.role === "super_admin" ? "/super-admin" : "/dashboard"));
+  }, [router]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -26,7 +40,12 @@ export default function LoginPage() {
       if (!res.ok) throw new Error(data.detail || "Login failed");
 
       saveSession(data.access_token, data.user);
-      if (data.user.role === "super_admin") {
+      const params = new URLSearchParams(window.location.search);
+      const next = params.get("next");
+      const safeNext = next && next.startsWith("/") && !next.startsWith("//") ? next : null;
+      if (safeNext) {
+        router.push(safeNext);
+      } else if (data.user.role === "super_admin") {
         router.push("/super-admin");
       } else {
         router.push("/dashboard");
