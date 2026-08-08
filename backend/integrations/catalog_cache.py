@@ -21,9 +21,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# A05: bounded + evicted — an unbounded dict here grows forever across every
-# tenant ever warmed, and _LOCKS previously kept one asyncio.Lock per tenant
-# forever with no eviction at all.
+# A05: bounded + evicted on every write, not just lazily on a read of an
+# expired entry — an unbounded per-tenant cache dict on a multi-tenant
+# process is a slow memory leak that only shows up in production traffic.
 _CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _LOCKS: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
 _CACHE_MAX = 2000
@@ -76,7 +76,6 @@ def _live_entry(tenant_id: str) -> Optional[Dict[str, Any]]:
     if time.time() > float(entry.get("expires_at", 0)):
         _CACHE.pop(tenant_id, None)
         return None
-    _CACHE.move_to_end(tenant_id)
     return entry
 
 
@@ -262,7 +261,6 @@ async def warmup_catalog(tenant_id: str, force: bool = False) -> Dict[str, Any]:
         _CACHE.move_to_end(tenant_id)
         while len(_CACHE) > _CACHE_MAX:
             _CACHE.popitem(last=False)
-        _LOCKS.pop(tenant_id, None)
         logger.info(
             "Warmed catalog for %s: %d sections (%s), %d chars",
             tenant_id, len(sections), ", ".join(sections), len(text),
@@ -274,8 +272,6 @@ def schedule_warmup(tenant_id: str, force: bool = False) -> None:
     """Fire-and-forget warmup (safe to call from request handlers)."""
     try:
         loop = asyncio.get_running_loop()
-        # A28: an untracked task can be garbage-collected mid-flight, silently
-        # dropping the warmup.
         task = loop.create_task(warmup_catalog(tenant_id, force=force))
         _BACKGROUND.add(task)
         task.add_done_callback(_BACKGROUND.discard)

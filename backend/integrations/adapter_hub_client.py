@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
 
 import httpx
 
@@ -12,26 +11,6 @@ from backend.config import settings
 logger = logging.getLogger(__name__)
 
 AGENT_ID = "sales_agent"
-
-
-def _assert_safe_transport(base: str) -> None:
-    """
-    A23: a tenant's plaintext DB password is about to cross the network in
-    sync_tenant_inventory. Refuse unless the hub URL is HTTPS or loopback.
-    """
-    parsed = urlparse(base)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme == "https" or host in ("localhost", "127.0.0.1", "::1"):
-        return
-    raise RuntimeError(
-        f"Refusing to sync tenant DB credentials to a non-HTTPS adapter-hub URL ({parsed.scheme or 'no scheme'})"
-    )
-
-
-def _scrub(text: str, secret: Optional[str]) -> str:
-    if secret:
-        text = text.replace(secret, "***")
-    return text
 
 
 def _headers(tenant_id: str) -> Dict[str, str]:
@@ -45,6 +24,32 @@ def _headers(tenant_id: str) -> Dict[str, str]:
 
 def _base() -> str:
     return (settings.ADAPTER_HUB_URL or "").rstrip("/")
+
+
+def _assert_safe_transport(base: str) -> None:
+    """
+    A23: adapter-hub receives a tenant's plaintext DB password over this
+    connection (see hub_config below). Refuse anything but HTTPS or an
+    explicit loopback address so that config can never traverse a plaintext
+    hop to a non-local host.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base)
+    if parsed.scheme == "https":
+        return
+    if parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1"):
+        return
+    raise RuntimeError(
+        f"Refusing to send tenant credentials to adapter-hub over an insecure transport: {base!r}"
+    )
+
+
+def _scrub(text: str, secret: Optional[str]) -> str:
+    """Redact a known secret value (e.g. a DB password) out of error text."""
+    if not secret:
+        return text
+    return text.replace(secret, "***")
 
 
 def mapped_tables_to_whitelist(mapped_tables: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -69,12 +74,11 @@ def mapped_tables_to_whitelist(mapped_tables: List[Dict[str, Any]]) -> Dict[str,
         entry = {"table": table, "label": label, "columns": cols, "role": role}
         tables.append(entry)
 
-        # Also populate canonical slots when role matches
+        # A22: a missing column used to be defaulted to a literal "0"/"Pending"
+        # string, so a tenant whose products table has no price column had
+        # adapter-hub confidently answer "$0" instead of "unknown" for every
+        # item.
         if role == "products" and "products" not in whitelist:
-            # A22: "0"/"Pending"/"" are DATA defaults, not column names. Putting
-            # them where a physical column name belongs produced queries like
-            # SELECT "0" AS price against the tenant's own database. Omit the
-            # key entirely when no source column maps to it.
             product_cols = {
                 "id": cols.get("id") or cols.get("sku") or next(iter(cols.values())),
                 "name": cols.get("name") or cols.get("title") or next(iter(cols.values())),
@@ -186,21 +190,19 @@ async def sync_tenant_inventory(
     if not whitelist.get("tables"):
         return {"ok": False, "error": "No mapped tables to sync"}
 
+    password = resolved_config.get("password")
+    _assert_safe_transport(_base())
+
     # Strip secrets already resolved — pass plaintext for hub encrypt
     hub_config = {
         "host": resolved_config.get("host"),
         "port": resolved_config.get("port") or 5432,
         "database": resolved_config.get("database"),
         "username": resolved_config.get("username"),
-        "password": resolved_config.get("password"),
+        "password": password,
         "schema": resolved_config.get("schema") or "public",
         "ssl": resolved_config.get("ssl", True),
     }
-
-    # A23: assert https/loopback before the password ever leaves this process,
-    # and scrub it out of any exception text that bubbles up to logs.
-    password = hub_config.get("password")
-    _assert_safe_transport(_base())
 
     try:
         await register_connection(tenant_id, provider, hub_config)
@@ -208,4 +210,7 @@ async def sync_tenant_inventory(
         sync_result = await trigger_sync(tenant_id)
         return sync_result
     except Exception as e:
+        # A23: an httpx error can embed the request URL/body (including the
+        # password just sent) in its string representation — never let that
+        # reach logs or an API response unscrubbed.
         raise RuntimeError(_scrub(str(e), password)) from None

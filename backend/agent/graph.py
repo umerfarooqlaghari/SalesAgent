@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import re
+import time
+from collections import OrderedDict
 from typing import Literal, Dict, Any
 
 from langchain_core.messages import BaseMessage, SystemMessage
@@ -205,22 +207,41 @@ def _needs_tools(
     return True
 
 
-async def sdr_node(state: AgentState) -> Dict[str, Any]:
-    messages = state.get("messages", [])
-    lead_profile = state.get("lead_profile")
-    tenant_id = _tenant_id_from_state(state)
-    user_text = _last_user_text(messages)
-    thread_id = state.get("thread_id", "unknown")
-    is_voice = str(thread_id).startswith("vapi_") or state.get("channel") == "voice"
+# P03: sdr_node runs at least twice per tool-using turn, and the second pass
+# rebuilt the entire prompt — tenant lookup, mappings, knowledge, catalog
+# selection and RAG — for a result that is byte-identical to the first. The
+# built prompt deliberately does NOT live in graph state (R7: the chat graph is
+# checkpointed to Mongo and the prompt carries the full catalog + knowledge
+# blocks), so it is memoised here instead.
+#
+# The key includes the lead profile because post_tool_node can legitimately
+# refresh it mid-turn on the chat path, which changes the "Lead Profile:" line.
+_PROMPT_MEMO: "OrderedDict[tuple, tuple[float, tuple]]" = OrderedDict()
+_PROMPT_MEMO_TTL = 30.0        # only needs to survive one turn
+_PROMPT_MEMO_MAX = 256
 
-    company = job_title = status = fit = "Unknown"
-    intent_score = 0
-    if lead_profile:
-        company = lead_profile.company or "Unknown"
-        job_title = lead_profile.job_title or "Unknown"
-        intent_score = lead_profile.intent_score or 0
-        status = lead_profile.status or "New"
-        fit = str(lead_profile.fit) if lead_profile.fit is not None else "Unknown"
+
+def invalidate_prompt_memo() -> None:
+    _PROMPT_MEMO.clear()
+
+
+async def _build_turn_context(
+    state: AgentState,
+    tenant_id: str,
+    thread_id: str,
+    user_text: str,
+    is_voice: bool,
+    lead_fields: tuple,
+):
+    """Assemble the system prompt and the routing flags for this turn."""
+    company, job_title, intent_score, status, fit = lead_fields
+
+    key = (tenant_id, thread_id, user_text, lead_fields, is_voice)
+    hit = _PROMPT_MEMO.get(key)
+    if hit and time.monotonic() <= hit[0]:
+        _PROMPT_MEMO.move_to_end(key)
+        return hit[1]
+    _PROMPT_MEMO.pop(key, None)
 
     ctx = await get_tenant_by_id(tenant_id)
 
@@ -329,6 +350,36 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
             if rag_snippets:
                 system_prompt += f"\n\n--- RETRIEVED KNOWLEDGE (prefer for factual answers) ---\n{rag_snippets}"
                 has_facts = True
+
+    result = (system_prompt, inventory_intent, has_facts, catalog)
+    _PROMPT_MEMO[key] = (time.monotonic() + _PROMPT_MEMO_TTL, result)
+    _PROMPT_MEMO.move_to_end(key)
+    while len(_PROMPT_MEMO) > _PROMPT_MEMO_MAX:
+        _PROMPT_MEMO.popitem(last=False)
+    return result
+
+
+async def sdr_node(state: AgentState) -> Dict[str, Any]:
+    messages = state.get("messages", [])
+    lead_profile = state.get("lead_profile")
+    tenant_id = _tenant_id_from_state(state)
+    user_text = _last_user_text(messages)
+    thread_id = state.get("thread_id", "unknown")
+    is_voice = str(thread_id).startswith("vapi_") or state.get("channel") == "voice"
+
+    company = job_title = status = fit = "Unknown"
+    intent_score = 0
+    if lead_profile:
+        company = lead_profile.company or "Unknown"
+        job_title = lead_profile.job_title or "Unknown"
+        intent_score = lead_profile.intent_score or 0
+        status = lead_profile.status or "New"
+        fit = str(lead_profile.fit) if lead_profile.fit is not None else "Unknown"
+
+    system_prompt, inventory_intent, has_facts, catalog = await _build_turn_context(
+        state, tenant_id, thread_id, user_text, is_voice,
+        (company, job_title, intent_score, status, fit),
+    )
 
     intent = state.get("intent") or "Inquiry"
     system_prompt += f"\n\nDetected intent: {intent}. Keep replies concise for low latency."

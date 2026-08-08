@@ -1,7 +1,7 @@
 import os
 import logging
-import hashlib
 import hmac
+import hashlib
 
 from typing import Dict, Any, List, Optional, AsyncIterator
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body, Depends, Request
@@ -41,6 +41,7 @@ from backend.database import (
     get_recent_typed_chat_messages,
     resolve_voice_thread,
     register_voice_session,
+    _extract_voice_metadata,
 )
 from backend.agent.graph import get_agent_graph
 from backend.admin.routes import router as admin_router
@@ -73,34 +74,6 @@ def spawn_background(coro, *, label: str = "task"):
 
     task.add_done_callback(_done)
     return task
-
-
-async def verify_vapi_signature(request: Request) -> None:
-    """
-    S01/S02: /chat/completions and /webhook had no auth at all — anyone with a
-    call_id (webhook) or nothing at all (chat/completions) could invoke a
-    tenant's agent, forge transcript turns, or push a victim past their
-    billing limit. Verify Vapi's HMAC over the raw request body.
-
-    VAPI_WEBHOOK_SECRET is optional in dev (loud warning, request allowed) but
-    required in production — enforced the same way as the other secrets in
-    backend/config.py.
-    """
-    secret = settings.VAPI_WEBHOOK_SECRET
-    if not secret:
-        if settings.is_production:
-            raise HTTPException(status_code=503, detail="Voice webhook signing secret is not configured.")
-        logger.warning("VAPI_WEBHOOK_SECRET is not set — accepting unsigned Vapi requests (dev only).")
-        return
-
-    signature = request.headers.get("X-Vapi-Signature") or ""
-    raw_body = await request.body()
-    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-    if not signature or not hmac.compare_digest(signature, expected):
-        logger.warning("Rejected Vapi request with invalid/missing X-Vapi-Signature on %s", request.url.path)
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("backend.main")
 
@@ -110,14 +83,12 @@ app.include_router(auth_router)
 app.include_router(superadmin_router)
 app.include_router(billing_router)
 
-# S06: allow_origins=["*"] + allow_credentials=True let any web page read
-# authenticated responses (browsers reflect the caller's Origin when "*" is
-# paired with credentials). Embed/widget routes DO need to be callable from
-# arbitrary customer websites, but they authenticate with a publishable key,
-# never cookies/credentials — so they get their own credential-less policy.
-# Must list every route reachable via enforce_minutes_quota/get_tenant_or_api_key
-# (publishable-key-eligible) — a route that doesn't match one of these prefixes
-# silently falls back to the ALLOWED_ORIGINS-restricted dashboard policy.
+# S06: tenant websites embed our widget/voice endpoints directly with an API
+# key (no cookies) — those need an open CORS policy. Everything else (the
+# authenticated dashboard SPA, which sends cookies/JWT) must be locked to
+# configured origins with allow_credentials=True. A single shared
+# allow_origins=["*"] + allow_credentials=True policy previously exposed every
+# authenticated dashboard route to any origin.
 _EMBED_PATH_PREFIXES = (
     "/api/embed",
     "/api/widget",
@@ -128,19 +99,12 @@ _EMBED_PATH_PREFIXES = (
 )
 
 
-def _dashboard_allowed_origins() -> list[str]:
+def _dashboard_allowed_origins() -> list:
     origins = settings.allowed_origins_list
-    if origins:
-        return origins
-    # Dev convenience only — production must set ALLOWED_ORIGINS explicitly
-    # (validate_production_secrets() already enforces this at startup).
-    return [settings.DASHBOARD_URL]
+    return origins if origins else [settings.DASHBOARD_URL]
 
 
 class ScopedCORSMiddleware:
-    """Two CORS policies in one app: open+credential-less for embed routes,
-    explicit-allowlist+credentialed for everything else (dashboard/admin)."""
-
     def __init__(self, app):
         self.embed_app = CORSMiddleware(
             app,
@@ -158,13 +122,60 @@ class ScopedCORSMiddleware:
         )
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("path", "").startswith(_EMBED_PATH_PREFIXES):
-            await self.embed_app(scope, receive, send)
-        else:
-            await self.dashboard_app(scope, receive, send)
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if any(path.startswith(p) for p in _EMBED_PATH_PREFIXES):
+                await self.embed_app(scope, receive, send)
+                return
+        await self.dashboard_app(scope, receive, send)
 
 
 app.add_middleware(ScopedCORSMiddleware)
+
+
+async def verify_vapi_signature(request: Request) -> None:
+    """
+    S01/S02: /chat/completions and /webhook take an assistant-configured URL
+    and used to accept ANY POST with no auth at all — a raw HMAC signature
+    check on the outbound webhook secret is the mechanism Vapi itself
+    supports, so this is the only realistic way to authenticate Vapi's own
+    requests (they carry no tenant API key).
+    """
+    secret = settings.VAPI_WEBHOOK_SECRET
+    if not secret:
+        if settings.is_production:
+            raise HTTPException(status_code=503, detail="Voice webhook is not configured.")
+        logger.warning("VAPI_WEBHOOK_SECRET is unset — skipping signature verification (dev only).")
+        return
+
+    signature = request.headers.get("X-Vapi-Signature", "")
+    body = await request.body()
+    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    if not signature or not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="Invalid Vapi signature.")
+
+
+async def enforce_minutes_quota(tenant: TenantContext = Depends(get_tenant_or_api_key)) -> TenantContext:
+    """
+    S14/S16: publishable-key routes (public key, widget config, embed
+    session, direct query) previously had no quota check at all, or (in
+    get_widget_config) an inline check that the other three routes lacked —
+    letting a tenant keep starting calls/queries past their allowed minutes.
+    """
+    db = get_db()
+    tenant_doc = await db.tenants.find_one(
+        {"tenant_id": tenant.tenant_id},
+        {"used_minutes": 1, "allowed_minutes": 1},
+    )
+    if tenant_doc:
+        used = tenant_doc.get("used_minutes", 0.0)
+        allowed = tenant_doc.get("allowed_minutes", 30)
+        if used >= allowed:
+            raise HTTPException(
+                status_code=403,
+                detail="SaaS billing limits exceeded. Please upgrade your plan.",
+            )
+    return tenant
 
 _THOUGHT_OPEN = "<thought>"
 _THOUGHT_CLOSE = "</thought>"
@@ -325,6 +336,25 @@ async def append_typed_message(
     return {"status": "saved", "thread_id": thread_id}
 
 
+async def _tenant_from_jwt(token: str):
+    """
+    S18 ripple: a password reset bumps token_version, so a websocket auth
+    check that only verifies the JWT signature (and never compares
+    token_version against the live session) would keep honouring a JWT that
+    was supposed to be invalidated by the reset.
+    """
+    payload = decode_access_token(token)
+    if not payload or not payload.get("sub"):
+        return None
+    session = await get_user_session(payload["sub"])
+    if not session or not session.tenant_id:
+        return None
+    if payload.get("tver", 0) != session.token_version:
+        return None
+    from backend.tenant.registry import get_tenant_by_id
+    return await get_tenant_by_id(session.tenant_id)
+
+
 @app.websocket("/ws/chat/{thread_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -334,38 +364,26 @@ async def websocket_endpoint(
 ):
     await websocket.accept()
 
-    async def _tenant_from_jwt(jwt_token: str):
-        payload = decode_access_token(jwt_token)
-        if not payload or not payload.get("sub"):
-            return None
-        session = await get_user_session(payload["sub"])
-        # S18: reject a JWT issued before a password reset bumped token_version.
-        if not session or payload.get("tver", 0) != session.token_version or not session.tenant_id:
-            return None
-        from backend.tenant.registry import get_tenant_by_id
-        return await get_tenant_by_id(session.tenant_id)
-
     tenant = None
     if token:
         tenant = await _tenant_from_jwt(token)
     if not tenant and api_key:
         tenant = await resolve_tenant_by_api_key(api_key)
 
-    # S11: query-string credentials land in proxy/APM/browser-history logs.
-    # When the query string didn't already authenticate, accept a JSON auth
-    # frame as the first message instead — additive, existing query-param
-    # clients are unaffected.
+    # S11: query-string credentials land in server access logs and browser
+    # history. Until the frontend drops that path entirely, also accept a
+    # first-frame JSON auth message so a client CAN avoid putting the token in
+    # the URL — additive, does not remove the existing query-string support.
     if not tenant:
-        import asyncio as _asyncio
-
         try:
-            first = await _asyncio.wait_for(websocket.receive_json(), timeout=5.0)
+            import asyncio
+            first = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
         except Exception:
             first = None
         if isinstance(first, dict) and first.get("type") == "auth":
             if first.get("token"):
                 tenant = await _tenant_from_jwt(first["token"])
-            if not tenant and first.get("api_key"):
+            elif first.get("api_key"):
                 tenant = await resolve_tenant_by_api_key(first["api_key"])
 
     if not tenant:
@@ -538,26 +556,6 @@ async def websocket_endpoint(
         logger.error(f"WebSocket error on thread {thread_id}: {e}", exc_info=True)
     finally:
         active_connections.pop(conn_key, None)
-
-async def enforce_minutes_quota(tenant: TenantContext = Depends(get_tenant_or_api_key)) -> TenantContext:
-    """
-    S14/S16: only /api/embed/config used to check the minutes quota — every
-    other credential-issuing route (/api/voice/public-key, /api/embed/session)
-    and the unmetered /api/query text endpoint handed out full agent access
-    regardless of usage. A scraper with just a publishable key could drain a
-    victim's Gemini/Vapi budget through any of them.
-    """
-    db = get_db()
-    doc = await db.tenants.find_one(
-        {"tenant_id": tenant.tenant_id}, {"used_minutes": 1, "allowed_minutes": 1}
-    )
-    if doc:
-        used = doc.get("used_minutes", 0.0)
-        allowed = doc.get("allowed_minutes", 30)
-        if used >= allowed:
-            raise HTTPException(status_code=403, detail="SaaS billing limits exceeded. Please upgrade your plan.")
-    return tenant
-
 
 @app.get("/api/voice/public-key")
 async def get_vapi_public_key(tenant: TenantContext = Depends(enforce_minutes_quota)):
@@ -870,25 +868,29 @@ def _extract_assistant_text(messages_out: list) -> str:
 
     return "Got it! How else can I help you today?"
 
-@app.post("/api/voice/chat/completions")
-@app.post("/chat/completions")
-async def vapi_chat_completions(data: Dict[str, Any] = Body(...), _sig: None = Depends(verify_vapi_signature)):
+@app.post("/api/voice/chat/completions", dependencies=[Depends(verify_vapi_signature)])
+@app.post("/chat/completions", dependencies=[Depends(verify_vapi_signature)])
+async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
     messages_list = data.get("messages", [])
     wants_stream = data.get("stream", False)
     call_data = data.get("call", {}) or {}
 
-    agent_thread_id, console_thread_id, tenant_id, link_doc = await resolve_voice_thread(call_data, data)
+    voice_thread = await resolve_voice_thread(call_data, data)
+    agent_thread_id = voice_thread.agent_thread_id
+    console_thread_id = voice_thread.console_thread_id
+    tenant_id = voice_thread.tenant_id
 
-    # P11: only the two minute counters are needed here — project them instead
-    # of pulling the full tenant document (system prompt + every integration
-    # config) just to compare two numbers.
+    # Check if tenant has exceeded billing minutes limit.
+    # P11: projected — this used to pull the whole tenant document (the entire
+    # system prompt and every integration config) to read two numbers.
     db = get_db()
-    billing_doc = await db.tenants.find_one(
-        {"tenant_id": tenant_id}, {"used_minutes": 1, "allowed_minutes": 1}
+    tenant_doc = await db.tenants.find_one(
+        {"tenant_id": tenant_id},
+        {"used_minutes": 1, "allowed_minutes": 1},
     )
-    if billing_doc:
-        used = billing_doc.get("used_minutes", 0.0)
-        allowed = billing_doc.get("allowed_minutes", 30)
+    if tenant_doc:
+        used = tenant_doc.get("used_minutes", 0.0)
+        allowed = tenant_doc.get("allowed_minutes", 30)
         if used >= allowed:
             blocked_msg = "We're sorry, this assistant has exceeded its usage limits. Please upgrade the account on your dashboard."
             fallback = {
@@ -920,13 +922,12 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...), _sig: None = D
             break
 
     # Pull typed chat context when console is linked to this call.
-    # P09: link_doc was already fetched inside resolve_voice_thread — reuse it
-    # instead of re-querying voice_call_links for the same row on every turn.
+    # P09: reuses the link document resolve_voice_thread already fetched.
     typed_context = ""
-    since_iso = None
     if console_thread_id:
-        since_iso = link_doc.get("linked_at") if link_doc else None
-        typed_context = await _get_typed_chat_context(tenant_id, console_thread_id, since_iso=since_iso)
+        typed_context = await _get_typed_chat_context(
+            tenant_id, console_thread_id, since_iso=voice_thread.linked_at
+        )
 
     # If Vapi sent no user speech but caller typed in chat, use typed content instead of resetting
     if not user_content.strip() and typed_context:
@@ -943,9 +944,8 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...), _sig: None = D
             ).strip()
             typed_context = ""
         elif not console_thread_id:
-            # P10: the tenant read for the greeting text is only worth paying for
-            # on this first-turn, no-history, no-console-link path — every other
-            # turn used to fetch it and throw it away.
+            # P10: computed lazily — this branch is the only one that speaks it,
+            # and it used to cost a tenant read on every turn.
             greeting = await _voice_greeting(tenant_id)
             fallback = {
                 "choices": [{"message": {"role": "assistant", "content": greeting}}]
@@ -1152,43 +1152,38 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...), _sig: None = D
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")
 
-@app.post("/api/voice/webhook")
-@app.post("/webhook")
-async def vapi_webhook(data: Dict[str, Any] = Body(...), _sig: None = Depends(verify_vapi_signature)):
+@app.post("/api/voice/webhook", dependencies=[Depends(verify_vapi_signature)])
+@app.post("/webhook", dependencies=[Depends(verify_vapi_signature)])
+async def vapi_webhook(data: Dict[str, Any] = Body(...)):
     message = data.get("message", {})
     msg_type = message.get("type")
     logger.info(f"Received Vapi webhook event: {msg_type}")
-    
+
     if msg_type == "end-of-call-report":
         call = message.get("call", {})
         call_id = call.get("id")
         duration = call.get("duration")  # In seconds
 
         if call_id and duration is not None:
+            # S02: clamp an obviously bogus/malicious duration (a compromised
+            # or misbehaving Vapi-compatible client claiming a multi-day call)
+            # before it inflates a tenant's billed minutes.
+            duration = max(0, min(float(duration), 4 * 3600))
+
             db = get_db()
-
-            # S02: make metering idempotent per call_id — a retried or replayed
-            # end-of-call-report must not double-count a call's duration.
-            from pymongo.errors import DuplicateKeyError
-            from datetime import datetime, timezone
-
+            # S02: end-of-call-report can be redelivered (Vapi retries on a
+            # non-2xx or timed-out response). A unique index on call_id makes
+            # a duplicate delivery a no-op instead of double-billing minutes.
             try:
-                await db.voice_billing_events.insert_one({
-                    "call_id": call_id,
-                    "event": "end-of-call-report",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                })
-            except DuplicateKeyError:
-                logger.info("Duplicate end-of-call-report for call_id=%s — not re-metering", call_id)
-                return {"status": "success", "event": msg_type, "duplicate": True}
+                await db.voice_billing_events.insert_one({"call_id": call_id, "duration": duration})
+            except Exception as e:
+                if "duplicate key" in str(e).lower() or e.__class__.__name__ == "DuplicateKeyError":
+                    logger.info("Duplicate end-of-call-report for call %s — skipping re-metering", call_id)
+                    return {"status": "success", "event": msg_type}
+                raise
 
-            # S02: clamp a caller-controlled duration to a sane per-call ceiling.
-            try:
-                duration = max(0.0, min(float(duration), 4 * 3600.0))
-            except (TypeError, ValueError):
-                duration = 0.0
-
-            # Resolve tenant ID from call link or call sessions
+            # Resolve tenant ID from call link or call sessions, falling back
+            # to whatever metadata Vapi attached to the call itself.
             tenant_id = None
             link_doc = await db.voice_call_links.find_one({"call_id": call_id})
             if link_doc:
@@ -1199,14 +1194,7 @@ async def vapi_webhook(data: Dict[str, Any] = Body(...), _sig: None = Depends(ve
                     tenant_id = session.get("tenant_id")
 
             if not tenant_id:
-                # S15: a call that ends before any /chat/completions turn (and
-                # so was never linked into voice_call_links) still carries the
-                # tenant in Vapi's own call metadata — use it as a last resort
-                # instead of silently dropping the metering event.
-                from backend.database import _extract_voice_metadata
-
-                meta = _extract_voice_metadata({"call": call})
-                tenant_id = meta.get("tenant_id") or meta.get("tenantId")
+                tenant_id = _extract_voice_metadata({"call": call}).get("tenant_id")
 
             if tenant_id:
                 minutes_used = duration / 60.0
@@ -1220,10 +1208,8 @@ async def vapi_webhook(data: Dict[str, Any] = Body(...), _sig: None = Depends(ve
                 )
             else:
                 logger.error(
-                    "Unattributable Vapi metering event: call_id=%s duration=%s could not be "
-                    "linked to any tenant (no voice_call_links row, no voice_call_sessions row, "
-                    "no metadata.tenant_id).",
-                    call_id, duration,
+                    "Vapi call %s ended with no attributable tenant — %.2f minutes not metered.",
+                    call_id, duration / 60.0,
                 )
-                
+
     return {"status": "success", "event": msg_type}

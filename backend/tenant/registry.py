@@ -65,9 +65,9 @@ async def seed_default_tenant() -> None:
     )
     logger.info("Seeded default tenant '%s' with test API key.", DEFAULT_TENANT_ID)
 
-    # S05: the legacy plaintext key is a convenience for local dev/demo only —
-    # in production this becomes a live, undocumented admin credential for the
-    # default tenant that anyone with the repo can use.
+    # S05: the legacy api_keys doc maps a well-known, publicly-documented test
+    # key ("test_key_abc123") straight to the default tenant. Keeping that
+    # doc alive in production would let anyone authenticate with it.
     from backend.config import settings
 
     if not settings.is_production and not await db.api_keys.find_one({"key": DEFAULT_TEST_API_KEY}):
@@ -127,8 +127,9 @@ async def resolve_tenant_by_api_key(api_key: str) -> Optional[TenantContext]:
         set_key_scope("secret")
         return TenantContext.from_document(doc)
 
-    # S05: legacy plaintext fallback — dev/demo convenience only. Never honor
-    # it in production, where it would be an undocumented always-on admin key.
+    # Legacy fallback: api_keys collection → default tenant.
+    # S05: this path accepts the well-known DEFAULT_TEST_API_KEY, so it must
+    # never be reachable in production.
     from backend.config import settings
 
     if settings.is_production:
@@ -204,6 +205,13 @@ def invalidate_tenant(tenant_id: Optional[str] = None) -> None:
         invalidate_inventory_mappings(tenant_id)
     except Exception:  # pragma: no cover - defensive
         logger.debug("inventory mapping invalidation failed", exc_info=True)
+
+    try:
+        from backend.agent.graph import invalidate_prompt_memo
+
+        invalidate_prompt_memo()
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("prompt memo invalidation failed", exc_info=True)
 
     if tenant_id:
         try:

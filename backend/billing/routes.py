@@ -1,4 +1,5 @@
 import logging
+import uuid
 import stripe
 from typing import Any, Dict
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
@@ -48,14 +49,12 @@ async def create_checkout_session(
     plan = PLANS[price_id]
 
     # MOCK MODE: Upgrade directly in DB if Stripe credentials are empty.
-    # S07: without a gate, any authenticated tenant could repeatedly self-grant
-    # the Enterprise plan simply by never configuring Stripe.
+    # S07: this used to run whenever STRIPE_API_KEY was blank, including in
+    # production if it was ever misconfigured/unset — letting any tenant
+    # self-upgrade to Enterprise minutes for free with no payment at all.
     if not settings.STRIPE_API_KEY:
         if settings.is_production or not settings.ALLOW_MOCK_BILLING:
-            raise HTTPException(
-                status_code=503,
-                detail="Billing is not configured. Contact support to upgrade your plan.",
-            )
+            raise HTTPException(status_code=503, detail="Billing is not configured.")
         logger.warning("Stripe key is missing. Simulating sandbox upgrade for tenant %s", tenant.tenant_id)
         db = get_db()
         await db.tenants.update_one(
@@ -94,13 +93,11 @@ async def create_checkout_session(
         )
         return {"checkout_url": session.url, "simulated": False}
     except Exception as e:
-        import uuid
-
         correlation_id = uuid.uuid4().hex[:12]
         logger.error("Stripe checkout creation failed [%s]: %s", correlation_id, e, exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Checkout could not be started. Reference: {correlation_id}",
+            detail=f"Checkout creation failed. Reference: {correlation_id}",
         )
 
 @router.post("/portal")
@@ -123,13 +120,11 @@ async def create_customer_portal(
         )
         return {"portal_url": portal_session.url}
     except Exception as e:
-        import uuid
-
         correlation_id = uuid.uuid4().hex[:12]
         logger.error("Stripe portal session creation failed [%s]: %s", correlation_id, e, exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Billing portal is unavailable right now. Reference: {correlation_id}",
+            detail=f"Customer portal redirect failed. Reference: {correlation_id}",
         )
 
 @router.post("/webhook")

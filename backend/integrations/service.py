@@ -106,10 +106,9 @@ class IntegrationService:
                 try:
                     stored[f"{key}{SECRET_SUFFIX}"] = encrypt_secret(str(value))
                 except RuntimeError as e:
-                    # S08: this used to fall back to storing the raw secret in
-                    # plaintext. Fail loud instead — every tenant DB password,
-                    # Shopify token and service-account JSON must be encrypted
-                    # at rest, never silently stored in the clear.
+                    # S08: silently falling back to plaintext storage for a
+                    # password/API key because ENCRYPTION_KEY wasn't configured
+                    # was worse than refusing the save outright.
                     raise ValueError(
                         f"Cannot save {key}: ENCRYPTION_KEY is not configured on the server."
                     ) from e
@@ -125,20 +124,16 @@ class IntegrationService:
             else:
                 stored[key] = value
 
-        # A16: the admin UI sometimes sends fields alongside the ones formally
-        # declared on the provider (e.g. mapped_tables as a sibling of
-        # table_map) — only copying provider.fields silently discarded them.
-        # Pass through anything else verbatim, and carry forward any such key
-        # this save didn't touch so it isn't lost on a partial update.
+        # A16: any config/existing key that isn't one of the provider's known
+        # fields (e.g. mapped_tables, admin-authored schema metadata) used to
+        # be silently dropped on every save because the loop above only ever
+        # writes keys declared on the provider. Pass those through untouched.
         known_keys = {f.key for f in provider.fields}
-        for key, value in config.items():
-            if key in known_keys or key.endswith(SECRET_SUFFIX):
-                continue
-            stored[key] = value
-        for key, value in existing.items():
-            if key in known_keys or key.endswith(SECRET_SUFFIX) or key in stored:
-                continue
-            stored[key] = value
+        for source in (existing, config):
+            for key, value in source.items():
+                if key in known_keys or key.endswith(SECRET_SUFFIX):
+                    continue
+                stored[key] = value
 
         return stored
 
@@ -230,11 +225,10 @@ class IntegrationService:
             settings["company_description"] = incoming["company_description"]
         if "webhook_url" in incoming:
             settings["webhook_url"] = incoming["webhook_url"]
-        # S21: rate_limit_per_minute is plan-tier metadata set by billing (see
-        # billing/routes.py), not something a tenant should be able to
-        # overwrite through their own settings save — a free-tier tenant could
-        # otherwise grant themselves a paid plan's limit (and nothing enforced
-        # it anyway, which is a separate gap tracked as S13's rate limiter).
+        # S21: rate_limit_per_minute is tier-controlled (see billing/routes.py)
+        # and must not be tenant-writable through the settings save endpoint —
+        # a tenant could otherwise set it to an arbitrary value regardless of
+        # their plan.
 
         await db.tenants.update_one(
             {"tenant_id": tenant_id},
@@ -358,13 +352,13 @@ class IntegrationService:
             except ValueError:
                 return {"ok": False, "error": "Tenant not found"}
 
-        # A15: each SQL source has its own connection. The old code kept a single
-        # `resolved`/`provider_id` pair that got overwritten every loop iteration
-        # while `all_mapped` accumulated tables from every source — so a
-        # warehouse's tables ended up synced through whichever connection
-        # (often the CRM one) happened to resolve last. Sync each source through
-        # its own connection instead.
-        sources: List[tuple[str, Dict[str, Any], List[Dict[str, Any]]]] = []
+        # A15: this used to resolve ONE shared connection (overwritten on each
+        # loop iteration) and sync every source's mapped tables through
+        # whichever connection happened to be resolved last — a tenant with a
+        # separate warehouse DB and CRM DB had the warehouse's tables silently
+        # synced through the CRM's connection (or vice-versa). Each source now
+        # syncs through its own resolved connection.
+        sources: List[tuple] = []  # (provider_id, resolved_config, mapped_tables)
 
         inv = integrations.get("inventory") or {}
         for src in inv.get("sources") or []:
@@ -373,7 +367,9 @@ class IntegrationService:
             pid = (src.get("provider") or "").lower()
             if pid not in SQL_PROVIDERS:
                 continue
-            resolved = IntegrationService.resolve_secrets("inventory", pid, src.get("config") or {})
+            resolved = IntegrationService.resolve_secrets(
+                "inventory", pid, src.get("config") or {}
+            )
             tm = parse_table_map_raw(resolved)
             mapped = get_mapped_tables(tm, "inventory")
             if mapped:
@@ -382,7 +378,9 @@ class IntegrationService:
         crm = integrations.get("crm") or {}
         crm_provider = (crm.get("provider") or "").lower()
         if crm.get("enabled", True) and crm_provider in SQL_PROVIDERS:
-            crm_resolved = IntegrationService.resolve_secrets("crm", crm_provider, crm.get("config") or {})
+            crm_resolved = IntegrationService.resolve_secrets(
+                "crm", crm_provider, crm.get("config") or {}
+            )
             tm = parse_table_map_raw(crm_resolved)
             mapped = get_mapped_tables(tm, "crm")
             if mapped:
@@ -391,13 +389,11 @@ class IntegrationService:
         if not sources:
             return {"ok": False, "skipped": True, "error": "No SQL inventory/CRM sources to sync"}
 
-        results: List[Dict[str, Any]] = []
+        results = []
         total_synced = 0
-        any_ok = False
-        errors: List[str] = []
-
+        errors = []
         for provider_id, resolved, mapped in sources:
-            # Dedupe by table name within this source's own connection only.
+            # Dedupe by table name within this source only.
             seen = set()
             unique_mapped = []
             for mt in mapped:
@@ -409,23 +405,20 @@ class IntegrationService:
 
             try:
                 res = await sync_tenant_inventory(tenant_id, provider_id, resolved, unique_mapped)
-            except Exception as e:
-                logger.warning("Adapter-hub sync failed for %s/%s: %s", tenant_id, provider_id, e)
-                res = {"ok": False, "error": str(e)}
-
-            results.append(res)
-            if res.get("ok"):
-                any_ok = True
+                results.append(res)
                 total_synced += int(res.get("synchronized_count") or 0)
-            elif res.get("error"):
-                errors.append(str(res["error"]))
+                if not res.get("ok"):
+                    errors.append(res.get("error"))
+            except Exception as e:
+                logger.warning("Adapter-hub sync failed for %s (%s): %s", tenant_id, provider_id, e)
+                errors.append(str(e))
+                results.append({"ok": False, "error": str(e)})
 
         return {
-            "ok": any_ok,
+            "ok": not errors,
             "synchronized_count": total_synced,
             "results": results,
-            "error": "; ".join(errors) if errors and not any_ok else None,
-            "skipped": bool(results) and all(r.get("skipped") for r in results),
+            "error": "; ".join(e for e in errors if e) or None,
         }
 
     @staticmethod
@@ -464,23 +457,9 @@ class IntegrationService:
                 ok = await adapter.check_availability("2099-01-01", "9:00 AM")
                 return {"ok": True, "message": "Calendar connection successful.", "available": ok}
             return {"ok": False, "message": f"Unknown category: {category}"}
-        except ValueError as e:
-            # S17: our own guard messages (e.g. the private/link-local host
-            # refusal) are safe and deliberately worded — show them as-is.
-            return {"ok": False, "message": str(e)}
         except Exception as e:
-            # S17: everything else is a raw driver exception, which can embed
-            # internal network details (host reachability, auth responses) —
-            # a VPC scanning oracle if handed back verbatim. Log full detail
-            # server-side, return a generic message with a correlation id.
-            import uuid
-
-            correlation_id = uuid.uuid4().hex[:12]
-            logger.exception("Integration test failed [%s] for %s/%s", correlation_id, category, provider_id)
-            return {
-                "ok": False,
-                "message": f"Connection failed. Check your connection details and try again. Reference: {correlation_id}",
-            }
+            logger.exception("Integration test failed for %s/%s", category, provider_id)
+            return {"ok": False, "message": str(e)}
 
     @staticmethod
     async def discover_schema(

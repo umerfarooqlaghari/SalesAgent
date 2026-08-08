@@ -3,7 +3,7 @@ import logging
 import re
 import sqlite3
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, NamedTuple, Optional
 from motor.motor_asyncio import AsyncIOMotorClient
 from .config import get_mongodb_connection_uri, settings
 
@@ -160,9 +160,8 @@ async def get_conversation(tenant_id: str, thread_id: str) -> Optional[Dict[str,
     return doc
 
 async def list_conversations(tenant_id: str, limit: int = 200) -> List[Dict[str, Any]]:
-    # S20: no cap + full 'messages' arrays let one tenant with a long history
-    # OOM the worker for everyone. The list view only needs thread metadata —
-    # full transcripts are fetched per-thread via get_conversation.
+    # S20: an unbounded find() plus every message array pulled the full chat
+    # history of every thread for a tenant into memory on one admin page load.
     db = get_db()
     cursor = (
         db.conversations.find({"tenant_id": tenant_id}, {"messages": 0})
@@ -244,9 +243,13 @@ async def create_appointment(
     return doc
 
 async def list_appointments(tenant_id: str, limit: int = 500) -> List[Dict[str, Any]]:
-    """Returns appointments for a tenant ordered by date/time (capped — S20)."""
+    """Returns all appointments for a tenant ordered by date/time."""
     db = get_db()
-    cursor = db.appointments.find({"tenant_id": tenant_id}).sort([("date", 1), ("time", 1)]).limit(min(limit, 500))
+    cursor = (
+        db.appointments.find({"tenant_id": tenant_id})
+        .sort([("date", 1), ("time", 1)])
+        .limit(min(limit, 500))
+    )
     appts = []
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
@@ -365,7 +368,7 @@ async def create_order(
     return doc
 
 async def list_orders(tenant_id: str, limit: int = 500) -> List[Dict[str, Any]]:
-    """Returns customer orders for a tenant, newest first (capped — S20)."""
+    """Returns all customer orders for a tenant, newest first."""
     db = get_db()
     cursor = db.orders.find({"tenant_id": tenant_id}).sort([("created_at", -1)]).limit(min(limit, 500))
     orders = []
@@ -378,15 +381,16 @@ async def list_orders(tenant_id: str, limit: int = 500) -> List[Dict[str, Any]]:
 # Voice call ↔ console chat linking (typed details during calls)
 # ---------------------------------------------------------------------------
 
-async def link_voice_call(tenant_id: str, call_id: str, console_thread_id: str) -> Dict[str, Any]:
-    """Link a Vapi call to the console chat thread so typed messages are visible to the voice agent.
-
-    Returns the linked document so callers (resolve_voice_thread) don't need a
-    second find_one for the row we just wrote (see P09).
+async def link_voice_call(tenant_id: str, call_id: str, console_thread_id: str) -> str:
+    """
+    Link a Vapi call to the console chat thread so typed messages are visible to
+    the voice agent. Returns the ISO timestamp it wrote, so callers do not have
+    to re-read the document (P09).
     """
     from datetime import datetime, timezone
 
     db = get_db()
+    linked_at = datetime.now(timezone.utc).isoformat()
     # T11: the filter used to be {call_id} alone, and call_id was globally unique,
     # so any tenant could POST a victim's live call id and rewrite the row's
     # tenant_id — redirecting that customer's conversation into their own
@@ -399,7 +403,6 @@ async def link_voice_call(tenant_id: str, call_id: str, console_thread_id: str) 
         )
         raise PermissionError("This call is linked to a different tenant.")
 
-    linked_at = datetime.now(timezone.utc).isoformat()
     await db.voice_call_links.update_one(
         {"call_id": call_id, "tenant_id": tenant_id},
         {
@@ -412,12 +415,7 @@ async def link_voice_call(tenant_id: str, call_id: str, console_thread_id: str) 
         },
         upsert=True,
     )
-    return {
-        "tenant_id": tenant_id,
-        "call_id": call_id,
-        "console_thread_id": console_thread_id,
-        "linked_at": linked_at,
-    }
+    return linked_at
 
 
 async def register_voice_session(tenant_id: str, console_thread_id: str) -> None:
@@ -469,17 +467,35 @@ def _extract_voice_metadata(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]
     return meta
 
 
+class VoiceThread(NamedTuple):
+    """
+    Resolution result for one spoken turn.
+
+    P09: this used to be a bare 3-tuple, so the caller re-read voice_call_links
+    immediately afterwards just to get `linked_at`. Returning the document we
+    already fetched removes a Mongo round-trip from every turn.
+
+    Access fields by name. Three-way positional unpacking no longer works, since
+    `link_doc` is a fourth field.
+    """
+
+    agent_thread_id: str
+    console_thread_id: Optional[str]
+    tenant_id: str
+    link_doc: Optional[Dict[str, Any]] = None
+
+    @property
+    def linked_at(self) -> Optional[str]:
+        return (self.link_doc or {}).get("linked_at")
+
+
 async def resolve_voice_thread(
     call_data: Optional[Dict[str, Any]],
     payload: Optional[Dict[str, Any]] = None,
-) -> tuple[str, Optional[str], str, Optional[Dict[str, Any]]]:
+) -> "VoiceThread":
     """
     Resolve which thread the voice agent should use and the tenant scope.
     Prefers explicit link, then call metadata from Vapi start(), else isolated vapi_{call_id} thread.
-
-    Returns (agent_thread_id, console_thread_id, tenant_id, link_doc). The 4th
-    element is the voice_call_links document already fetched/written in here —
-    callers must reuse it instead of re-querying (see P09).
     """
     call_data = call_data or {}
     call_id = call_data.get("id") or "vapi_default_session"
@@ -499,7 +515,10 @@ async def resolve_voice_thread(
         tenant_id = link_doc.get("tenant_id") or tenant_id
         linked_thread = link_doc.get("console_thread_id")
         if linked_thread:
-            return linked_thread, linked_thread, tenant_id or settings.DEFAULT_TENANT_ID, link_doc
+            return VoiceThread(
+                linked_thread, linked_thread,
+                tenant_id or settings.DEFAULT_TENANT_ID, link_doc,
+            )
 
     if console_from_meta:
         if not tenant_id:
@@ -507,7 +526,7 @@ async def resolve_voice_thread(
             tenant_id = (session or {}).get("tenant_id")
         tenant_id = tenant_id or settings.DEFAULT_TENANT_ID
         try:
-            new_link = await link_voice_call(tenant_id, call_id, console_from_meta)
+            linked_at = await link_voice_call(tenant_id, call_id, console_from_meta)
         except PermissionError:
             # T11 now rejects a cross-tenant claim. On this path that must degrade
             # to an isolated thread rather than raising — a raised exception here
@@ -516,11 +535,18 @@ async def resolve_voice_thread(
                 "Voice link contested for call %s (tenant %s) — using an isolated thread",
                 call_id, tenant_id,
             )
-            return f"vapi_{call_id}", None, tenant_id, None
-        return console_from_meta, console_from_meta, tenant_id, new_link
+            return VoiceThread(f"vapi_{call_id}", None, tenant_id, link_doc)
+        # Freshly linked above; link_voice_call hands back the timestamp it wrote
+        # so typed messages from before the link are not pulled into this turn.
+        return VoiceThread(
+            console_from_meta, console_from_meta, tenant_id,
+            {"call_id": call_id, "tenant_id": tenant_id,
+             "console_thread_id": console_from_meta,
+             "linked_at": linked_at},
+        )
 
     isolated = f"vapi_{call_id}"
-    return isolated, None, tenant_id or settings.DEFAULT_TENANT_ID, None
+    return VoiceThread(isolated, None, tenant_id or settings.DEFAULT_TENANT_ID, link_doc)
 
 async def get_linked_console_thread(call_id: str) -> Optional[str]:
     db = get_db()

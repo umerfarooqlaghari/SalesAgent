@@ -32,6 +32,15 @@ def _quote_ident(name: str, dialect: str) -> str:
     return f'"{safe}"'
 
 
+def _table_map(config: Dict[str, Any]) -> Dict[str, Any]:
+    # A25: delegate to the guarded parser — this used to call json.loads directly
+    # with no try/except, so one malformed table_map (unbalanced admin JSON edit)
+    # raised out of the constructor and 500'd every route touching that source.
+    from backend.integrations.table_map_util import parse_table_map_raw
+
+    return parse_table_map_raw(config)
+
+
 def _escape_like(value: str) -> str:
     """
     A20: '%' and '_' are LIKE metacharacters, not literals. Caller-supplied text
@@ -63,8 +72,7 @@ def _assert_public_host(host: str) -> None:
     ranges before ever attempting a connection. Without this, "test
     connection" / "discover schema" is a scanning oracle against the backend's
     own internal network (including 169.254.169.254 cloud metadata) for
-    anyone holding a tenant API key — a real tenant's external database is
-    never legitimately on one of these ranges from this server's perspective.
+    anyone holding a tenant API key.
     """
     try:
         infos = socket.getaddrinfo(host, None)
@@ -80,35 +88,35 @@ def _assert_public_host(host: str) -> None:
             raise ValueError("Refusing to connect to a private or link-local database host.")
 
 
-def _table_map(config: Dict[str, Any]) -> Dict[str, Any]:
-    # A25: delegate to the guarded parser — this used to call json.loads directly
-    # with no try/except, so one malformed table_map (unbalanced admin JSON edit)
-    # raised out of the constructor and 500'd every route touching that source.
-    from backend.integrations.table_map_util import parse_table_map_raw
-
-    return parse_table_map_raw(config)
-
-
 _ENGINES: "OrderedDict[str, tuple[Any, float]]" = OrderedDict()  # url_hash -> (engine, expires_at)
 _ENGINES_LOCK = asyncio.Lock()
 _ENGINE_TTL_S = 1800  # matches pool_recycle
 _ENGINES_MAX = 200
 
-# P05: an unresponsive tenant DB (bad host, firewalled port, overloaded server)
-# used to pin an async worker indefinitely — no connect timeout was ever passed
-# to the driver. These are driver-specific: asyncpg takes seconds, pymssql takes
-# timeout/login_timeout, aiomysql takes connect_timeout.
+# P05: a tenant database is a third-party system on the voice critical path.
+# Without these, an unresponsive host (network partition, table lock, a paused
+# cloud instance) hangs the request until the OS gives up — pinning a worker and
+# blowing the whole spoken-turn budget.
 _CONNECT_TIMEOUT_S = 5
-_QUERY_TIMEOUT_S = 5
+_STATEMENT_TIMEOUT_S = 8
+_QUERY_TIMEOUT_S = 10.0   # belt-and-braces around the driver's own timeout
 
 
-def _connect_args_for(connection_url: str) -> Dict[str, Any]:
-    if connection_url.startswith("postgresql+asyncpg"):
-        return {"timeout": _CONNECT_TIMEOUT_S, "command_timeout": _QUERY_TIMEOUT_S}
-    if connection_url.startswith("mssql+pymssql"):
-        return {"timeout": _QUERY_TIMEOUT_S, "login_timeout": _CONNECT_TIMEOUT_S}
-    if connection_url.startswith("mysql+aiomysql"):
+def _connect_args_for(connection_url: str) -> dict:
+    """Driver-specific connect/statement timeouts."""
+    url = (connection_url or "").lower()
+    if url.startswith("postgresql+asyncpg"):
+        return {
+            "timeout": _CONNECT_TIMEOUT_S,
+            "command_timeout": _STATEMENT_TIMEOUT_S,
+            # asyncpg applies this server-side, so a runaway query is cancelled
+            # by Postgres itself rather than merely abandoned by us.
+            "server_settings": {"statement_timeout": str(_STATEMENT_TIMEOUT_S * 1000)},
+        }
+    if url.startswith("mysql+aiomysql"):
         return {"connect_timeout": _CONNECT_TIMEOUT_S}
+    if "pymssql" in url or "aioodbc" in url:
+        return {"timeout": _CONNECT_TIMEOUT_S, "login_timeout": _CONNECT_TIMEOUT_S}
     return {}
 
 
@@ -286,10 +294,19 @@ class SqlConnection:
                 result = await conn.execute(text(sql), params or {})
                 return list(result.fetchall())
 
-        # P05: belt-and-suspenders on top of the driver connect_args — some
-        # drivers (pymssql) don't enforce a distinct per-query timeout, so a
-        # slow query past connect can still hang the worker without this.
-        return await asyncio.wait_for(_run(), timeout=_CONNECT_TIMEOUT_S + _QUERY_TIMEOUT_S)
+        # P05: the outer deadline also covers connection acquisition and pool
+        # waits, which the driver's own command_timeout does not.
+        try:
+            return await asyncio.wait_for(_run(), timeout=_QUERY_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.error(
+                "Tenant SQL query exceeded %.0fs (provider=%s) — abandoning",
+                _QUERY_TIMEOUT_S, self.provider,
+            )
+            raise TimeoutError(
+                f"The {self.provider} database did not respond within "
+                f"{_QUERY_TIMEOUT_S:.0f}s."
+            ) from None
 
     async def execute_write(self, sql: str, params: Optional[Dict[str, Any]] = None) -> None:
         if self.read_only:
@@ -301,12 +318,66 @@ class SqlConnection:
             async with engine.begin() as conn:
                 await conn.execute(text(sql), params or {})
 
-        await asyncio.wait_for(_run(), timeout=_CONNECT_TIMEOUT_S + _QUERY_TIMEOUT_S)
+        try:
+            await asyncio.wait_for(_run(), timeout=_QUERY_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.error(
+                "Tenant SQL write exceeded %.0fs (provider=%s) — abandoning",
+                _QUERY_TIMEOUT_S, self.provider,
+            )
+            raise TimeoutError(
+                f"The {self.provider} database did not respond within "
+                f"{_QUERY_TIMEOUT_S:.0f}s."
+            ) from None
+
+
+_NOT_FOUND_MARKERS = (
+    "No products found",
+    "No matching records found",
+    "table is connected but returned no rows",
+    "query error:",
+)
+_MAPPED_BULLET_RE = re.compile(r"^\s*•\s*(.+?)(?:\s*\((.+)\))?\s*$")
+
+
+def _parse_mapped_bullet(line: str) -> Optional[Dict[str, Any]]:
+    m = _MAPPED_BULLET_RE.match(line)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    if not name:
+        return None
+    extras_raw = m.group(2) or ""
+    price = None
+    stock = None
+    description = ""
+    for part in extras_raw.split(", "):
+        if ":" not in part:
+            continue
+        key, _, val = part.partition(":")
+        key = key.strip().lower()
+        val = val.strip()
+        if key == "price":
+            price = val
+        elif key in ("stock", "stock_quantity", "quantity"):
+            try:
+                stock = int(re.sub(r"[^\d-]", "", val) or "0")
+            except ValueError:
+                stock = None
+        elif key in ("description", "details", "summary") and not description:
+            description = val
+    if price is None and stock is None:
+        return None
+    return {
+        "name": name,
+        "price": price if price is not None else "",
+        "stock_quantity": stock if stock is not None else 0,
+        "description": description,
+    }
 
 
 class SqlPOSAdapter:
     """Generic SQL-backed inventory adapter driven entirely by table_map config."""
-
     def __init__(self, provider: str, config: Dict[str, Any], tenant: TenantContext):
         self.provider = provider
         self.config = config
@@ -334,22 +405,27 @@ class SqlPOSAdapter:
             price_c = self._col("products", "price")
             stock_c = self._col("products", "stock")
             desc_c = self._col("products", "description")
-            # A11: the legacy path had no row limit at all — fetch_all would
-            # materialize the whole table. Match the dialect-aware cap used on
-            # the mapped path below.
-            limit_clause = "TOP 50 " if self.sql.dialect == "sqlserver" else ""
-            select_prefix = f"SELECT {limit_clause}{name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt}"
 
             if not is_generic:
-                like_op = "ILIKE" if self.sql.dialect == "postgres" else "LIKE"
-                sql = f"{select_prefix} WHERE {name_c} {like_op} :q ESCAPE '\\'"
-                params = {"q": f"%{_escape_like(query.strip())}%"}
+                # A20: escape LIKE metacharacters in caller-supplied text so
+                # "50% off" can't silently turn into a wildcard scan.
+                escaped_q = _escape_like(query.strip())
+                if self.sql.dialect == "sqlserver":
+                    sql = f"SELECT TOP 50 {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} LIKE :q ESCAPE '\\'"
+                elif self.sql.dialect == "mysql":
+                    sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} LIKE :q ESCAPE '\\' LIMIT 50"
+                else:
+                    sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} WHERE {name_c} ILIKE :q ESCAPE '\\'  LIMIT 50"
+                params = {"q": f"%{escaped_q}%"}
             else:
-                sql = select_prefix
+                # A11: an unbounded SELECT * equivalent against a large legacy
+                # products table pulled every row into memory on every "list
+                # everything" question.
+                if self.sql.dialect == "sqlserver":
+                    sql = f"SELECT TOP 50 {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt}"
+                else:
+                    sql = f"SELECT {name_c}, {price_c}, {stock_c}, {desc_c} FROM {qt} LIMIT 50"
                 params = None
-
-            if self.sql.dialect != "sqlserver":
-                sql += " LIMIT 50"
 
             try:
                 rows = await self.sql.fetch_all(sql, params)
@@ -555,61 +631,33 @@ class SqlPOSAdapter:
 
         return f"Order #{db_id} Details: Status={db_status}, Items={db_items}, Total={db_total}."
 
-    _NOT_FOUND_MARKERS = (
-        "No products found",
-        "No matching records found",
-        "returned no rows",
-        "query error",
-        "Inventory query failed",
-    )
-    _MAPPED_BULLET_RE = re.compile(r"^\s*•\s*(.+)$")
-
     async def lookup_product(self, product_name: str) -> Optional[Dict[str, Any]]:
+        """
+        A10: this used to fabricate {"price": "0", "stock_quantity": 1} whenever
+        the response text didn't match the expected legacy regex — the caller
+        (order/booking flow) then quoted a confident but entirely made-up price
+        and "in stock" status to the customer instead of surfacing "not found".
+        """
         catalog = await self.list_products(product_name)
-        if any(marker in catalog for marker in self._NOT_FOUND_MARKERS):
+        if any(marker in catalog for marker in _NOT_FOUND_MARKERS):
             return None
 
-        lines = catalog.split("\n")
-        legacy_line = lines[1] if len(lines) > 1 else catalog
-        m = re.match(r"- (.+?): Price=(.+?), In Stock=(\d+)", legacy_line)
-        if m:
-            return {
-                "name": m.group(1),
-                "price": m.group(2),
-                "stock_quantity": int(m.group(3)),
-                "description": "",
-            }
+        lines = [ln for ln in catalog.split("\n") if ln.strip()]
+        body_lines = lines[1:] if len(lines) > 1 else lines
 
-        # A10: the mapped path never matches the legacy "- Name: Price=..."
-        # shape (it's "[Label]\n  • Name (key: val, ...)"), so the regex above
-        # always misses for tenants using mapped tables. Returning a fabricated
-        # {price: "0", stock: 1} let the agent confirm an imaginary $0 item to a
-        # caller. Best-effort parse the mapped bullet; otherwise say not found.
-        for line in lines:
-            bullet = self._MAPPED_BULLET_RE.match(line)
-            if not bullet:
-                continue
-            name_part, _, extras_part = bullet.group(1).partition(" (")
-            extras: Dict[str, str] = {}
-            if extras_part.endswith(")"):
-                for pair in extras_part[:-1].split(", "):
-                    k, _, v = pair.partition(": ")
-                    if k:
-                        extras[k.strip().lower()] = v.strip()
-            price = extras.get("price") or extras.get("cost")
-            stock_raw = extras.get("stock") or extras.get("stock_quantity") or extras.get("quantity")
-            if price is None and stock_raw is None:
-                return None
-            try:
-                stock_val = int(re.sub(r"[^\d-]", "", stock_raw)) if stock_raw else 0
-            except ValueError:
-                stock_val = 0
-            return {
-                "name": name_part.strip() or product_name,
-                "price": price or "0",
-                "stock_quantity": stock_val,
-                "description": "",
-            }
+        for line in body_lines:
+            legacy = re.match(r"- (.+?): Price=(.+?), In Stock=(\d+)", line)
+            if legacy:
+                return {
+                    "name": legacy.group(1),
+                    "price": legacy.group(2),
+                    "stock_quantity": int(legacy.group(3)),
+                    "description": "",
+                }
+            mapped = _parse_mapped_bullet(line)
+            if mapped:
+                return mapped
+
         return None
 
     async def create_order(

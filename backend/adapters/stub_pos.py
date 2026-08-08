@@ -55,12 +55,12 @@ class StubPOSAdapter:
         self.tenant = tenant
 
     async def list_products(self, query: Optional[str] = None) -> str:
-        # P13: sqlite3 is synchronous and holds the GIL for the duration of the
-        # call, serializing every concurrent voice call on this worker. Push it
-        # to a thread so other coroutines keep running while the disk I/O happens.
+        # P13: sqlite3 is a synchronous C extension. Called directly from an
+        # async def it holds the GIL for the whole connect + scan, serialising
+        # every other concurrent voice turn on the process.
         return await asyncio.to_thread(self._list_products_sync, query)
 
-    def _list_products_sync(self, query: Optional[str]) -> str:
+    def _list_products_sync(self, query: Optional[str] = None) -> str:
         conn = sqlite3.connect(SQLITE_DB_PATH)
         cursor = conn.cursor()
         try:
@@ -95,15 +95,15 @@ class StubPOSAdapter:
         if not customer_email and not customer_phone:
             return "Error: You must provide the customer's email or phone number to verify ownership."
 
-        return await asyncio.to_thread(
+        return await asyncio.to_thread(  # P13
             self._get_order_status_sync, order_id, customer_email, customer_phone
         )
 
     def _get_order_status_sync(
         self,
         order_id: int,
-        customer_email: Optional[str],
-        customer_phone: Optional[str],
+        customer_email: Optional[str] = None,
+        customer_phone: Optional[str] = None,
     ) -> str:
         conn = sqlite3.connect(SQLITE_DB_PATH)
         cursor = conn.cursor()
@@ -133,12 +133,12 @@ class StubPOSAdapter:
         customer_phone: str,
         total_price: str,
     ) -> int:
-        return await asyncio.to_thread(
+        return await asyncio.to_thread(  # P13
             _create_sqlite_order, customer_email, customer_phone, product_name, total_price
         )
 
     async def cancel_order(self, order_id: int) -> bool:
-        return await asyncio.to_thread(_cancel_sqlite_order, order_id)
+        return await asyncio.to_thread(_cancel_sqlite_order, order_id)   # P13
 
     async def lookup_product(self, product_name: str) -> Optional[Dict[str, Any]]:
-        return await asyncio.to_thread(_lookup_product, product_name)
+        return await asyncio.to_thread(_lookup_product, product_name)    # P13

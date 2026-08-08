@@ -9,28 +9,13 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# A05: bounded + evicted, mirroring the tenant-doc cache in registry.py — an
-# unbounded dict here grows forever across every tenant ever warmed.
+# A26: bounded + evicted, mirroring catalog_cache.py's pattern — an unbounded
+# per-tenant dict is a slow memory leak under real multi-tenant traffic.
 _CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_LOCKS: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
 _CACHE_MAX = 2000
 _TTL_SECONDS = 30 * 60
 _MAX_CHARS = 5000
-
-# A01: warmup_knowledge is awaited from several concurrent entry points
-# (sdr_node, voice fast path, embed/config) with no lock — each racer would
-# insert its own baseline/RAG chunks, duplicating them without bound.
-_LOCKS: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
-
-
-def _lock_for(tenant_id: str) -> asyncio.Lock:
-    lock = _LOCKS.get(tenant_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _LOCKS[tenant_id] = lock
-    _LOCKS.move_to_end(tenant_id)
-    while len(_LOCKS) > _CACHE_MAX:
-        _LOCKS.popitem(last=False)
-    return lock
 
 # Used only when a tenant has zero knowledge chunks (keeps voice FAQ from going empty)
 _ALPHA_DEVS_BASELINE = [
@@ -86,13 +71,23 @@ def get_cached_knowledge(tenant_id: str) -> Optional[str]:
     if time.time() > float(entry.get("expires_at", 0)):
         _CACHE.pop(tenant_id, None)
         return None
-    _CACHE.move_to_end(tenant_id)
     text = (entry.get("text") or "").strip()
     return text or None
 
 
 def invalidate_knowledge(tenant_id: str) -> None:
     _CACHE.pop(tenant_id, None)
+
+
+def _lock_for(tenant_id: str) -> asyncio.Lock:
+    lock = _LOCKS.get(tenant_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _LOCKS[tenant_id] = lock
+    _LOCKS.move_to_end(tenant_id)
+    while len(_LOCKS) > _CACHE_MAX:
+        _LOCKS.popitem(last=False)
+    return lock
 
 
 async def warmup_knowledge(tenant_id: str, force: bool = False) -> Dict[str, Any]:
@@ -102,6 +97,10 @@ async def warmup_knowledge(tenant_id: str, force: bool = False) -> Dict[str, Any
         if existing:
             return {"ok": True, "cached": True, "chars": len(existing)}
 
+    # A01: without a per-tenant lock, N concurrent callers (e.g. the first N
+    # calls that land in the same cold-cache window) each raced past the
+    # cache-miss check and each ran _seed_baseline_knowledge — duplicating the
+    # baseline FAQ chunks once per concurrent caller.
     async with _lock_for(tenant_id):
         if not force:
             existing = get_cached_knowledge(tenant_id)
@@ -122,8 +121,9 @@ async def warmup_knowledge(tenant_id: str, force: bool = False) -> Dict[str, Any
 
         db = get_db()
         knowledge_count = 0
-        # A26: deterministic ordering, otherwise which 40 chunks reach the
-        # prompt varies between warmups and answers become non-reproducible.
+        # A26: sorted so a knowledge base with more than 40 chunks warms the
+        # MOST RECENT ones (the ones an admin is most likely to have just
+        # edited) instead of whatever order Mongo happened to return.
         cursor = db.tenant_knowledge.find({"tenant_id": tenant_id}).sort("created_at", -1).limit(40)
         async for doc in cursor:
             knowledge_count += 1
@@ -163,6 +163,6 @@ async def warmup_knowledge(tenant_id: str, force: bool = False) -> Dict[str, Any
         _CACHE.move_to_end(tenant_id)
         while len(_CACHE) > _CACHE_MAX:
             _CACHE.popitem(last=False)
-        _LOCKS.pop(tenant_id, None)
         logger.info("Warmed knowledge cache for %s (%d chars)", tenant_id, len(text))
+        _LOCKS.pop(tenant_id, None)
         return {"ok": True, "cached": False, "chars": len(text)}

@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 from backend.integrations.providers import get_provider
 
 MASK = "••••••••"
+_SECRET_KEY_PATTERN = re.compile(r"(password|token|secret|key|json)", re.IGNORECASE)
 
 # T01: a tenant with no configured inventory must get NOTHING, not the shared
 # demo catalog. The old default enabled a "stub" source for every unconfigured
@@ -92,18 +93,15 @@ def normalize_integrations(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
-_SECRET_KEY_PATTERN = re.compile(r"(password|token|secret|key|json)", re.IGNORECASE)
-
-
 def mask_config(category: str, provider_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
     provider = get_provider(category, provider_id)
     masked = deepcopy(config)
     if not provider:
-        # S26: an unknown/legacy provider id used to return the raw config
-        # unmasked. Fail closed — mask anything that looks like a secret key
-        # rather than trusting the (missing) provider's declared field list.
-        for key, value in list(masked.items()):
-            if value and _SECRET_KEY_PATTERN.search(key):
+        # S26: an unrecognized provider used to return the config untouched —
+        # fail closed and mask anything that LOOKS like a secret instead of
+        # trusting the (attacker-influenced) provider_id to resolve correctly.
+        for key in list(masked.keys()):
+            if _SECRET_KEY_PATTERN.search(key) and masked[key]:
                 masked[key] = MASK
         return masked
     for key in provider.secret_fields:
