@@ -817,6 +817,14 @@ class SqlPOSAdapter:
 
             try:
                 rows = await self.sql.fetch_all(sql, params or None)
+                if not rows and not is_generic and query and len(query.strip()) >= 4 and params:
+                    # Fuzzy prefix fallback: e.g. "Grabingo" -> "Grab%"
+                    prefix = query.strip()[:4]
+                    fuzzy_params = {"q": f"%{_escape_like(prefix)}%"}
+                    try:
+                        rows = await self.sql.fetch_all(sql, fuzzy_params)
+                    except Exception:
+                        pass
                 if rows:
                     lines = []
                     name_keys = {

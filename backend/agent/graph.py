@@ -264,7 +264,11 @@ def _dedupe_tools(tools_list: list) -> list:
 
 _ACTION_KEYWORDS = (
     "book", "appointment", "schedule", "order", "buy", "purchase", "cancel",
-    "reschedule", "handoff", "human", "representative", "email", "phone",
+    "reschedule", "handoff", "human", "representative", "email", "phone", "number",
+    "name", "date", "time", "call", "register", "meeting", "consultation", "talk",
+    "contact", "reach", "my name", "my email", "my number", "zero", "one", "two",
+    "three", "four", "five", "six", "seven", "eight", "nine", "pm", "am", "tomorrow",
+    "today", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
 )
 
 def _needs_tools(

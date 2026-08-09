@@ -1201,7 +1201,7 @@ async def vapi_chat_completions(data: Dict[str, Any] = Body(...)):
             return max(0.5, VOICE_TURN_DEADLINE - (asyncio.get_event_loop().time() - t0))
 
         _low = (enriched_user_content or "").lower()
-        looks_like_action = any(k in _low for k in _ACTION_KEYWORDS)
+        looks_like_action = any(k in _low for k in _ACTION_KEYWORDS) or len(messages_list) >= 2
 
         # FAQ fast-path: no LangGraph, no tools — prevents "let me check" stalls.
         # Skipped for action intents (book/order/cancel), which always need tools.

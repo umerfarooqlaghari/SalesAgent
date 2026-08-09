@@ -284,15 +284,24 @@ async def handoff_to_human(
     return "Perfect, I've passed your details to our team. A representative will reach out to you within a few minutes. Is there anything else I can help you with?"
 
 
+_WORD_DIGITS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "oh": "0",
+}
+
+
 def _normalize_email(raw: Optional[str]) -> str:
     if not raw:
         return ""
     text = raw.strip()
-    # Handle spoken dictation transcriptions: "at" -> "@", "dot" -> "."
+    # Handle spoken dictation transcriptions: "at" -> "@", "dot" / "the regional com" -> "."
     text = re.sub(r"\s+(at|@)\s+", "@", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(at|@)\b", "@", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+(dot|\.)\s+", ".", text, flags=re.IGNORECASE)
     text = re.sub(r"\bdot\b", ".", text, flags=re.IGNORECASE)
+    # Common speech-to-text transcriptions for ".com"
+    text = re.sub(r"\s+com\b", ".com", text, flags=re.IGNORECASE)
     text = text.replace(" ", "").lower()
     return text
 
@@ -300,7 +309,10 @@ def _normalize_email(raw: Optional[str]) -> str:
 def _normalize_phone(raw: Optional[str]) -> str:
     if not raw:
         return ""
-    digits = re.sub(r"[^\d+]", "", raw)
+    text = raw.strip().lower()
+    for word, digit in _WORD_DIGITS.items():
+        text = re.sub(rf"\b{word}\b", digit, text)
+    digits = re.sub(r"[^\d+]", "", text)
     return digits if len(digits) >= 6 else raw.strip()
 
 

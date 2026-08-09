@@ -81,6 +81,12 @@ _SHARED_RULES = """
    c) Text in square brackets (e.g. [Product catalog], [Service Content Blocks]) is an
       internal table label. Never read it aloud and never treat it as an item name.
 
+12c. **Answering "Any other products?" / "Any more products?" (CRITICAL):**
+   a) When the caller asks "do you have any other / more products or services?", look at the items you ALREADY named in your previous turns.
+   b) State ONLY the remaining items in the catalog that were NOT yet mentioned in this conversation (e.g. "We also offer GrabEnGo...").
+   c) NEVER repeat the items you already named in previous turns as if they were new options.
+   d) If all items in that category have already been named, state clearly: "Those are all the products in our current catalog. We also offer services like Web Development and Cloud Infrastructure if you'd like to hear about those!"
+
 13. **Category Disambiguation & Specificity (CRITICAL):**
    a) This company's categories are whatever the CONNECTED DATA / TENANT DATA MODEL
       section lists — they differ per company and may be treatments, films, courses,
