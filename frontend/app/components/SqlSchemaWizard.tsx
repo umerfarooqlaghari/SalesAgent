@@ -63,7 +63,7 @@ function columnsForTable(tables: TableInfo[], tableName: string): ColumnInfo[] {
 
 function migrateLegacyMapped(category: string, tableMap: Record<string, unknown>): MappedTable[] {
   const raw = tableMap.mapped_tables;
-  if (Array.isArray(raw) && raw.length) return raw as MappedTable[];
+  if (Array.isArray(raw)) return raw as MappedTable[];
 
   const out: MappedTable[] = [];
   if (category === "crm" && tableMap.companies_table) {
