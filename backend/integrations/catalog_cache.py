@@ -376,12 +376,13 @@ def select_catalog_section(tenant_id: str, user_text: str) -> Optional[str]:
     return _section_containing_item(sections, user_text)
 
 
-_ITEM_LINE = re.compile(r"^\s*[•\-*]\s*([^(\n]{2,80}?)\s*(?:\(|$)")
+_ITEM_LINE = re.compile(r"^\s*[•\-*]\s*([^(\n]{2,120}?)\s*(?:\(|$)")
 
 
 def _section_containing_item(sections: Dict[str, str], user_text: str) -> Optional[str]:
     q = (user_text or "").lower()
-    best, best_len = None, 0
+    q_toks = _tokens(user_text)
+    best, best_score = None, 0
     for label, body in sections.items():
         if label == "all":
             continue
@@ -390,11 +391,19 @@ def _section_containing_item(sections: Dict[str, str], user_text: str) -> Option
             if not m:
                 continue
             name = m.group(1).strip().lower()
-            if len(name) < 3 or name not in q:
+            if len(name) < 3:
                 continue
-            # Longest match wins, so "Forest Set" beats "Forest".
-            if len(name) > best_len:
-                best, best_len = label, len(name)
+            # Match if full name in q, or q in name, or token overlap
+            if name in q or q in name:
+                score = len(name) * 10
+            else:
+                toks = _tokens(name)
+                hit = len(q_toks & toks)
+                if hit < 2 and not (hit == 1 and any(len(t) >= 5 for t in (q_toks & toks))):
+                    continue
+                score = hit * 5
+            if score > best_score:
+                best, best_score = label, score
     return best
 
 

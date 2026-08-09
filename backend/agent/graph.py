@@ -251,6 +251,17 @@ _VOICE_FAST_TOOLS = [
     cancel_order,
 ]
 
+
+def _dedupe_tools(tools_list: list) -> list:
+    seen = set()
+    out = []
+    for t in tools_list:
+        name = getattr(t, "name", id(t))
+        if name not in seen:
+            seen.add(name)
+            out.append(t)
+    return out
+
 _ACTION_KEYWORDS = (
     "book", "appointment", "schedule", "order", "buy", "purchase", "cancel",
     "reschedule", "handoff", "human", "representative", "email", "phone",
@@ -265,11 +276,11 @@ def _needs_tools(
     text = (user_text or "").lower()
     if any(k in text for k in _ACTION_KEYWORDS):
         return True
-    # Tenant-mapped inventory: tools unless their SQL catalog is already warm
+    # Always keep tools bound when inventory intent or SQL sources exist,
+    # so the LLM can execute query_pos_database if the prompt snippet
+    # doesn't contain the specific product, service, or FAQ requested.
     if inventory_intent:
-        return not has_catalog_cache
-    if has_fact_cache:
-        return False
+        return True
     return True
 
 
@@ -500,7 +511,7 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
     )
     if use_tools:
         if is_voice and inventory_intent:
-            tools = list(dict.fromkeys([*_VOICE_FAST_TOOLS, query_pos_database]))
+            tools = _dedupe_tools([*_VOICE_FAST_TOOLS, query_pos_database])
         elif is_voice and has_facts:
             tools = _VOICE_FAST_TOOLS
         else:

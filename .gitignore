@@ -39,3 +39,4 @@ adapter_hub/tests/
 maintenance_report_*.txt
 adapter_hub/sync_workers/metadata_store.json
 
+backend/tests/test_embed_api.py

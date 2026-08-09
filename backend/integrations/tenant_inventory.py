@@ -118,7 +118,11 @@ async def inventory_vocab(tenant_id: str) -> Set[str]:
             vocab.add(w + "s")
     if mapped:
         # Always treat these as catalog-intent when SQL inventory exists
-        vocab.update({"catalog", "inventory", "stock", "availability", "offer", "offers"})
+        vocab.update({
+            "catalog", "inventory", "stock", "availability", "offer", "offers",
+            "faq", "faqs", "question", "questions", "answer", "answers", "help",
+            "service", "services", "product", "products", "item", "items",
+        })
     else:
         vocab.update(_GENERIC_INVENTORY_HINTS)
     return vocab
