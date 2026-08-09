@@ -971,7 +971,7 @@ _SPEAKABLE_TOOLS = {
 
 
 def _extract_assistant_text(messages_out: list) -> str:
-    """Pull the last speakable assistant text from graph output (handles tool-call turns)."""
+    """Pull the last speakable assistant text or speakable tool result from graph output."""
     import re
 
     def _normalize_content(content) -> str:
@@ -985,20 +985,44 @@ def _extract_assistant_text(messages_out: list) -> str:
             content = re.sub(r"<thought>.*?</thought>", "", content, flags=re.DOTALL).strip()
         return (content or "").strip()
 
-    # Prefer the last AI message with spoken content
-    for msg in reversed(messages_out):
+    if not messages_out:
+        return "Got it! How else can I help you today?"
+
+    # Examine ONLY the output messages produced in the current turn (after the last HumanMessage)
+    last_human_idx = -1
+    for idx in range(len(messages_out) - 1, -1, -1):
+        if getattr(messages_out[idx], "type", None) in ("human", "user"):
+            last_human_idx = idx
+            break
+
+    turn_messages = messages_out[last_human_idx + 1:] if last_human_idx != -1 else messages_out
+
+    # 1. Prefer speakable tool results from the CURRENT turn (e.g. book_appointment confirmation)
+    for msg in reversed(turn_messages):
+        if getattr(msg, "type", None) == "tool" and getattr(msg, "name", None) in _SPEAKABLE_TOOLS:
+            text = _normalize_content(getattr(msg, "content", ""))
+            if text:
+                return text
+
+    # 2. Prefer AI spoken text from the CURRENT turn
+    for msg in reversed(turn_messages):
         if getattr(msg, "type", None) == "ai":
             text = _normalize_content(getattr(msg, "content", ""))
             if text:
                 return text
 
-    # V08: fall back ONLY to tools whose output is written for a caller. Data tools
-    # can return SQL dumps, and adapter errors can embed a connection string with
-    # the tenant's database password — neither may ever reach TTS.
+    # 3. Fall back to speakable tool results from earlier turns
     for msg in reversed(messages_out):
         if getattr(msg, "type", None) == "tool" and getattr(msg, "name", None) in _SPEAKABLE_TOOLS:
             text = _normalize_content(getattr(msg, "content", ""))
             if text:
+                return text
+
+    # 4. Fall back to AI messages from earlier turns (ignoring fallback phrases)
+    for msg in reversed(messages_out):
+        if getattr(msg, "type", None) == "ai":
+            text = _normalize_content(getattr(msg, "content", ""))
+            if text and "didn't catch that" not in text.lower():
                 return text
 
     return "Got it! How else can I help you today?"
