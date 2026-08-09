@@ -4,6 +4,26 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
+LEGACY_TABLE_KEYS = {
+    "products_table", "products_columns",
+    "orders_table", "orders_columns",
+    "productions_table", "productions_columns",
+    "sets_table", "sets_columns",
+    "companies_table", "companies_columns",
+    "appointments_table", "appointments_columns",
+}
+
+
+def clean_legacy_table_map(table_map: Dict[str, Any]) -> Dict[str, Any]:
+    """If mapped_tables is present as a list, strip obsolete single-table legacy keys."""
+    if isinstance(table_map, dict) and isinstance(table_map.get("mapped_tables"), list):
+        out = dict(table_map)
+        for k in LEGACY_TABLE_KEYS:
+            out.pop(k, None)
+        return out
+    return table_map if isinstance(table_map, dict) else {}
+
+
 def parse_table_map_raw(config: Dict[str, Any]) -> Dict[str, Any]:
     import json
 
@@ -13,13 +33,13 @@ def parse_table_map_raw(config: Dict[str, Any]) -> Dict[str, Any]:
             tm = json.loads(tm) if tm.strip() else {}
         except json.JSONDecodeError:
             tm = {}
-    return tm if isinstance(tm, dict) else {}
+    return clean_legacy_table_map(tm) if isinstance(tm, dict) else {}
 
 
 def get_mapped_tables(table_map: Dict[str, Any], category: str) -> List[Dict[str, Any]]:
     """Return enabled mapped table configs, migrating legacy shapes if needed."""
     raw = table_map.get("mapped_tables")
-    if isinstance(raw, list) and raw:
+    if isinstance(raw, list):
         # A31: admin-authored JSON isn't guaranteed to be a list of dicts.
         return [
             t for t in raw

@@ -29,7 +29,7 @@ COLUMN_HINTS: Dict[str, Tuple[str, ...]] = {
 
 TABLE_HINTS: Dict[str, Tuple[str, ...]] = {
     "products_table": ("product", "products", "catalog", "items", "services", "sku", "inventory"),
-    "orders_table": ("order", "orders", "sales", "purchase", "purchases", "po", "pos", "purchaseorder", "purchase_orders", "transactions"),
+    "orders_table": ("order", "orders", "sales", "purchase", "purchases", "po", "purchaseorder", "purchase_orders", "transactions"),
     "productions_table": ("production", "productions", "project", "projects", "job", "jobs", "show", "shows"),
     "sets_table": ("set", "sets", "scenery", "scenic", "build", "builds", "construction"),
     "companies_table": ("company", "companies", "customer", "customers", "client", "clients", "account", "accounts", "lead", "leads"),

@@ -53,6 +53,77 @@ _ERROR_MARKERS = (
 )
 
 
+def _fit_rows(body: str, budget: int) -> str:
+    """
+    Shrink a section to `budget` chars while keeping EVERY row.
+
+    This used to be `body[:budget]` — a blunt tail cut. With seven verbose
+    products the last ones were sliced off mid-line, so the agent genuinely did
+    not know they existed and said so. Losing the tail of each description is
+    survivable; losing whole items is not, because the model cannot mention what
+    it cannot see.
+    """
+    body = body or ""
+    if len(body) <= budget:
+        return body
+
+    lines = body.splitlines()
+    if len(lines) <= 1:
+        return body[:budget] + "…"
+
+    # Reserve a little for the notice, then divide what is left evenly. Short
+    # lines keep their full length and donate the remainder to longer ones.
+    notice = "\n…(each entry shortened to fit)"
+    room = max(0, budget - len(notice))
+    per_line = max(40, room // max(1, len(lines)))
+
+    kept, used = [], 0
+    for line in lines:
+        allowance = per_line
+        if len(line) <= allowance:
+            kept.append(line)
+            used += len(line) + 1
+            continue
+        trimmed = line[:allowance].rstrip() + "…"
+        kept.append(trimmed)
+        used += len(trimmed) + 1
+
+    out = "\n".join(kept)
+    if len(out) > room:
+        out = out[:room].rstrip()
+    return out + notice
+
+
+def _fit_sections(sections: Dict[str, str], budget: int) -> Dict[str, str]:
+    """
+    Share the overall budget across sections instead of truncating the tail.
+
+    Their catalogue was 14013 chars against a 14000 cap, so the LAST section was
+    cut — and the sections that matter to a customer (7 products, 9 services)
+    were competing for room with 82 rows of CMS content blocks. Every section now
+    gets a fair share; sections under their share donate the surplus.
+    """
+    if not sections:
+        return sections
+    overhead = sum(len(label) + 4 for label in sections) + 2 * len(sections)
+    room = max(1000, budget - overhead)
+
+    fair = room // len(sections)
+    # Sections already under their share keep everything and free up the rest.
+    small = {k: v for k, v in sections.items() if len(v) <= fair}
+    large = {k: v for k, v in sections.items() if len(v) > fair}
+    if not large:
+        return sections
+
+    freed = sum(fair - len(v) for v in small.values())
+    per_large = fair + (freed // len(large))
+
+    out = dict(sections)
+    for key in large:
+        out[key] = _fit_rows(sections[key], per_large)
+    return out
+
+
 def _looks_like_error(sample: str) -> bool:
     low = (sample or "").strip().lower()
     if not low:
@@ -163,6 +234,27 @@ def get_section_roles(tenant_id: str) -> Dict[str, str]:
     return dict(entry.get("roles") or {}) if entry else {}
 
 
+def _infer_role_from_label(label: str) -> Optional[str]:
+    """
+    Guess a role from the section label when the mapping declares none.
+
+    Their tables are mapped with role="-" for everything except one, so role
+    synonyms were doing nothing: "what packages do you have" matched no label
+    and no role, scored zero everywhere, and fell through to the whole
+    catalogue — which is why a question about packages came back about products.
+    A label of "Services" plainly means the services role; use it.
+    """
+    words = _tokens(label)
+    try:
+        from backend.adapters.sql_pos import _ROLE_SYNONYMS
+    except Exception:      # pragma: no cover - defensive
+        return None
+    for role_key, syns in _ROLE_SYNONYMS.items():
+        if role_key in words or (words & syns):
+            return role_key
+    return None
+
+
 def _role_synonyms(role: Optional[str]) -> set:
     if not role:
         return set()
@@ -231,7 +323,15 @@ def select_catalog_section(tenant_id: str, user_text: str) -> Optional[str]:
 
     roles = get_section_roles(tenant_id)
 
-    best, best_score = None, 0
+    # Weighted, because the previous rule gave a label hit, a role hit and a
+    # stray category value in some row EQUAL weight — and then broke ties by
+    # dict insertion order. On a real catalogue with 8 sections, four of which
+    # are CMS blocks ("service info cards", "product content blocks", …), that
+    # is a coin toss: asking about services could land on a product section
+    # because one product row happened to carry a "Service" category.
+    LABEL_HIT, COVERAGE, ROLE_HIT, DATA_HIT = 10.0, 5.0, 4.0, 1.0
+
+    scored = []
     for label in sections:
         if label == "all":
             continue
@@ -241,18 +341,34 @@ def select_catalog_section(tenant_id: str, user_text: str) -> Optional[str]:
         for t in label_tokens:
             expanded.add(t[:-1] if t.endswith("s") else t + "s")
 
-        # Role synonyms, so everyday words reach the right section whatever the
-        # tenant called it. Without this a dental clinic asking "what services do
-        # you offer" matched no section — its table is labelled "Treatments" —
-        # and fell back to the whole catalogue, which then included the dentists.
-        expanded |= _role_synonyms(roles.get(label))
-        expanded |= section_data_terms(sections.get(label, ""))
+        label_hits = len(q & expanded)
+        score = LABEL_HIT * label_hits
+        if label_hits and label_tokens:
+            # Prefer the label the question actually NAMES. "services" matches
+            # all of itself; "service info cards" matches a third of itself, so
+            # a question about services should not land there.
+            score += COVERAGE * (label_hits / len(label_tokens))
 
-        score = len(q & expanded)
-        if score > best_score:
-            best, best_score = label, score
-    if best:
-        return best
+        # Role synonyms, so everyday words reach the right section whatever the
+        # tenant called it — a dental clinic's "Treatments" table answering
+        # "what services do you offer". Roles are often missing from the mapping,
+        # so fall back to inferring one from the label itself.
+        role = roles.get(label) or _infer_role_from_label(label)
+        score += ROLE_HIT * len(q & _role_synonyms(role))
+
+        # Values drawn from the rows. Deliberately the weakest signal: it exists
+        # so a production company's "films" reaches a table nobody labelled
+        # "films", NOT so a stray category can outvote an explicit label.
+        score += DATA_HIT * min(len(q & section_data_terms(sections.get(label, ""))), 3)
+
+        if score > 0:
+            # Tie-break on the shorter (more specific) label, then the name, so
+            # the result is deterministic rather than dependent on dict order.
+            scored.append((-score, len(label), label))
+
+    if scored:
+        scored.sort()
+        return scored[0][2]
 
     # No category word in the question — but "tell me about Sentrix" should still
     # narrow to the section that actually contains Sentrix, rather than handing
@@ -408,18 +524,17 @@ async def warmup_catalog(tenant_id: str, force: bool = False) -> Dict[str, Any]:
             await asyncio.gather(*(_fetch(label, query) for label, query in missing))
 
         for key, body in list(sections.items()):
-            if len(body) > _MAX_SECTION_CHARS:
-                sections[key] = body[:_MAX_SECTION_CHARS] + "\n…(truncated)"
+            sections[key] = _fit_rows(body, _MAX_SECTION_CHARS)
 
         if not sections:
             return {"ok": False, "error": "No catalog data returned from inventory sources"}
+
+        sections = _fit_sections(sections, _MAX_CHARS)
 
         parts = []
         for label, body in sections.items():
             parts.append(body if label == "all" else f"[{label}]\n{body}")
         text = "\n\n".join(parts).strip()
-        if len(text) > _MAX_CHARS:
-            text = text[:_MAX_CHARS] + "\n…(truncated)"
 
         roles = {}
         try:
