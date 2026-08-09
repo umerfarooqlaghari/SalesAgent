@@ -32,8 +32,8 @@ from backend.tenant.thread_scope import logical_thread_id
 logger = logging.getLogger(__name__)
 
 
-def _tenant_id(config: RunnableConfig) -> str:
-    return config.get("configurable", {}).get("tenant_id") or settings.DEFAULT_TENANT_ID
+def _tenant_id(config: Optional[RunnableConfig] = None) -> str:
+    return (config or {}).get("configurable", {}).get("tenant_id") or settings.DEFAULT_TENANT_ID
 
 
 async def _load_tenant_context(config: RunnableConfig):
@@ -280,6 +280,26 @@ async def handoff_to_human(
     return "Perfect, I've passed your details to our team. A representative will reach out to you within a few minutes. Is there anything else I can help you with?"
 
 
+def _normalize_email(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    text = raw.strip()
+    # Handle spoken dictation transcriptions: "at" -> "@", "dot" -> "."
+    text = re.sub(r"\s+(at|@)\s+", "@", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(at|@)\b", "@", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+(dot|\.)\s+", ".", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bdot\b", ".", text, flags=re.IGNORECASE)
+    text = text.replace(" ", "").lower()
+    return text
+
+
+def _normalize_phone(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    digits = re.sub(r"[^\d+]", "", raw)
+    return digits if len(digits) >= 6 else raw.strip()
+
+
 @tool
 async def book_appointment(
     name: str,
@@ -287,8 +307,8 @@ async def book_appointment(
     phone: str,
     date: str,
     time: str,
-    notes: str,
-    config: RunnableConfig
+    notes: Optional[str] = "",
+    config: RunnableConfig = None,
 ) -> str:
     """
     Books a meeting or consultation appointment.
@@ -299,13 +319,16 @@ async def book_appointment(
     thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
     
+    norm_email = _normalize_email(email)
+    norm_phone = _normalize_phone(phone)
+
     # Validate required fields
     missing = []
     if not name or name.strip() == "":
         missing.append("name")
-    if not email or "@" not in email:
+    if not norm_email or "@" not in norm_email:
         missing.append("email")
-    if not phone or phone.strip() == "":
+    if not norm_phone:
         missing.append("phone number")
     if not date or date.strip() == "":
         missing.append("preferred date")
@@ -325,14 +348,14 @@ async def book_appointment(
         tenant_id=tenant_id,
         thread_id=thread_id,
         name=name.strip(),
-        email=email.strip(),
-        phone=phone.strip(),
+        email=norm_email,
+        phone=norm_phone,
         date_str=date.strip(),
         time_str=time.strip(),
         notes=notes or ""
     )
     
-    return f"You're all set, {name}! Your appointment is confirmed for {date} at {time}. We'll send a confirmation to {email} shortly."
+    return f"You're all set, {name.strip()}! Your appointment is confirmed for {date.strip()} at {time.strip()}. We'll send a confirmation to {norm_email} shortly."
 
 
 @tool

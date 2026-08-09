@@ -583,6 +583,21 @@ async def get_recent_typed_chat_messages(
 ) -> List[str]:
     """Return recent user-typed chat messages for a thread (optionally after link time)."""
     conv = await get_conversation(tenant_id, thread_id)
+    if not conv and (thread_id or "").startswith("vapi_"):
+        call_id = thread_id.replace("vapi_", "")
+        linked = await get_linked_console_thread(call_id)
+        if linked:
+            conv = await get_conversation(tenant_id, linked)
+    elif conv and (thread_id or "").startswith("vapi_"):
+        call_id = thread_id.replace("vapi_", "")
+        linked = await get_linked_console_thread(call_id)
+        if linked:
+            linked_conv = await get_conversation(tenant_id, linked)
+            if linked_conv:
+                # Merge messages from both threads
+                msgs = list(conv.get("messages", [])) + list(linked_conv.get("messages", []))
+                conv = {"messages": msgs}
+
     if not conv:
         return []
 

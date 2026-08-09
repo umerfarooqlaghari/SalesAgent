@@ -657,11 +657,18 @@ class SqlPOSAdapter:
     async def list_products(self, query: Optional[str] = None) -> str:
         from backend.integrations.table_map_util import get_mapped_tables
 
-        mapped = get_mapped_tables(self.table_map, "inventory")
-        generic = {"product", "products", "service", "services", "all", "list", "everything", ""}
+        generic = {
+            "product", "products", "service", "services", "all", "list", "everything", "",
+            "more", "other", "additional", "next", "show more", "see more", "tell me more",
+            "more products", "more services", "other products", "other services",
+            "anything else", "what else", "all products", "all services", "catalogue", "catalog",
+        }
         q_clean = query.strip().lower() if query else ""
-        is_generic = not q_clean or q_clean in generic
+        q_words = {w.lower() for w in re.findall(r"\w+", q_clean)} if q_clean else set()
+        is_pagination = bool(q_words & {"more", "other", "additional", "else", "next", "another", "further"})
+        is_generic = not q_clean or q_clean in generic or is_pagination
 
+        mapped = get_mapped_tables(self.table_map, "inventory")
         if not mapped:
             table = self.table_map.get("products_table", "products")
             qt = self.sql._qualified(table)
