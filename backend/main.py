@@ -221,6 +221,83 @@ async def enforce_minutes_quota(tenant: TenantContext = Depends(get_tenant_or_ap
             )
     return tenant
 
+MAX_EMBED_PROMPT_CHARS = 4000
+
+# Per-key ceiling for browser-embedded publishable keys. Generous for a real
+# visitor, ruinous for a scraper.
+EMBED_QUERIES_PER_MINUTE = 20
+EMBED_QUERIES_PER_HOUR = 300
+
+
+def _request_origin(request: Request) -> str:
+    """The page that issued the request, if the browser told us."""
+    origin = request.headers.get("Origin") or ""
+    if origin:
+        return origin
+    referer = request.headers.get("Referer") or ""
+    if referer:
+        try:
+            from urllib.parse import urlsplit
+
+            parts = urlsplit(referer)
+            if parts.scheme and parts.netloc:
+                return f"{parts.scheme}://{parts.netloc}"
+        except Exception:
+            return ""
+    return ""
+
+
+def enforce_embed_guards(request: Request, tenant: TenantContext) -> None:
+    """
+    S16: rate-limit and origin-check a browser-embeddable key.
+
+    Origin checking is OPT-IN per tenant (settings.allowed_embed_origins). An
+    empty list means "any origin", which is what every existing tenant has, so
+    this cannot silently break a live widget — but a tenant that fills it in
+    gets a key that only works on their own site.
+
+    Rate limiting is NOT opt-in: the point is to bound the damage from a key
+    that is, by design, public.
+    """
+    from backend.auth.rate_limit import check_rate_limit
+    from backend.tenant.key_scope import get_key_scope
+
+    if get_key_scope() != "publishable":
+        return  # secret keys and dashboard sessions are already accountable
+
+    identity = tenant.tenant_id
+    if not check_rate_limit("embed-query-min", identity, limit=EMBED_QUERIES_PER_MINUTE,
+                            window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many requests. Please slow down.")
+    if not check_rate_limit("embed-query-hour", identity, limit=EMBED_QUERIES_PER_HOUR,
+                            window_seconds=3600):
+        raise HTTPException(status_code=429, detail="Hourly limit reached for this site key.")
+
+    allowed = []
+    try:
+        allowed = [
+            str(o).strip().rstrip("/").lower()
+            for o in ((tenant.settings or {}).get("allowed_embed_origins") or [])
+            if str(o).strip()
+        ]
+    except Exception:
+        allowed = []
+    if not allowed:
+        return
+
+    origin = _request_origin(request).rstrip("/").lower()
+    if origin and origin in allowed:
+        return
+    logger.warning(
+        "Rejected embed query for tenant %s from origin %r (allowed: %s)",
+        tenant.tenant_id, origin or "<none>", allowed,
+    )
+    raise HTTPException(
+        status_code=403,
+        detail="This site key is not authorised for this domain.",
+    )
+
+
 _THOUGHT_OPEN = "<thought>"
 _THOUGHT_CLOSE = "</thought>"
 
@@ -703,6 +780,7 @@ async def create_embed_session(
 @app.post("/api/query")
 @app.post("/query")
 async def execute_query_route(
+    request: Request,
     data: Dict[str, Any] = Body(...),
     tenant: TenantContext = Depends(enforce_minutes_quota),
 ):
@@ -710,9 +788,20 @@ async def execute_query_route(
     Direct text query endpoint for client applications sending { "question": "..." } or { "message": "..." }.
     Executes the Sales SDR agent and returns the response.
     """
+    # S16: this accepts pk_live_ publishable keys, which are embedded in the
+    # tenant's own public website HTML. The minutes quota alone does not cover
+    # it — a scraper with the key can drain the tenant's model budget at line
+    # rate, and each request is an uncapped prompt.
+    enforce_embed_guards(request, tenant)
+
     question = (data.get("question") or data.get("message") or data.get("prompt") or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="'question' or 'message' field is required in request body.")
+    if len(question) > MAX_EMBED_PROMPT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Question is too long (limit {MAX_EMBED_PROMPT_CHARS} characters).",
+        )
 
     thread_id = data.get("thread_id") or f"client_query_{tenant.tenant_id}"
 

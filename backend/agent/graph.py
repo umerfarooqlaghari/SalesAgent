@@ -107,6 +107,71 @@ def safe_format_prompt(template: str, **values) -> str:
     return _PLACEHOLDER_RE.sub(_sub, template)
 
 
+# Patterns that indicate the agent was in the middle of collecting details
+# for a booking, order, or handoff when Gemini returned empty.
+_COLLECTION_TOOL_NAMES = {
+    "book_appointment", "place_order", "handoff_to_human",
+    "reschedule_appointment", "cancel_appointment", "cancel_order",
+    "lookup_appointments", "get_typed_chat_details",
+}
+
+# Phrases the model (or tool) emits when it still needs more fields.
+_STILL_NEED_PHRASES = (
+    "i still need", "could you please provide", "could you share",
+    "what email", "what is your", "your email", "your phone",
+    "your name", "preferred date", "preferred time",
+    "i just need", "couple more details",
+)
+
+
+def _contextual_empty_fallback(messages: list, is_voice: bool) -> str:
+    """
+    Produce a context-aware fallback when Gemini returns empty.
+
+    Instead of the generic "I'm here to help! Could you repeat that?" which
+    resets the conversational flow and causes an infinite loop on voice (where
+    Vapi feeds it back into the next turn), this detects whether we were in a
+    detail-collection flow and nudges the caller for the next piece of info.
+    """
+    # Walk recent messages backwards looking for clues about the current flow.
+    recent_tool_names: list[str] = []
+    recent_assistant_text = ""
+    tool_returned_still_need = False
+
+    for msg in reversed(messages[-12:]):
+        msg_type = getattr(msg, "type", None)
+        if msg_type == "tool":
+            name = getattr(msg, "name", "") or ""
+            recent_tool_names.append(name)
+            content = str(getattr(msg, "content", "") or "").lower()
+            if any(p in content for p in _STILL_NEED_PHRASES):
+                tool_returned_still_need = True
+        elif msg_type == "ai" and not recent_assistant_text:
+            recent_assistant_text = str(getattr(msg, "content", "") or "").lower()
+
+    in_booking_flow = any(t in _COLLECTION_TOOL_NAMES for t in recent_tool_names)
+    assistant_was_collecting = any(
+        p in recent_assistant_text for p in _STILL_NEED_PHRASES
+    )
+
+    if tool_returned_still_need or in_booking_flow or assistant_was_collecting:
+        # The agent was mid-booking/order. Keep the flow alive.
+        if is_voice:
+            return (
+                "I didn't catch that — could you repeat the detail "
+                "you were sharing? I want to make sure I get it right."
+            )
+        return (
+            "Sorry, I missed that. Could you repeat the information "
+            "you were providing so I can complete your request?"
+        )
+
+    # Generic fallback for non-collection contexts.
+    if is_voice:
+        return "Sorry, I didn't catch that — could you say that again?"
+    return "I'm here to help! Could you repeat that?"
+
+
 def _tool_call_signatures(msg) -> set:
     sigs = set()
     for tc in (getattr(msg, "tool_calls", None) or []):
@@ -458,11 +523,17 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
             logger.error("LLM invoke fallback error in sdr_node: %s", e, exc_info=True)
 
     # Safety net: if Gemini returned an empty response (no text, no tool calls),
-    # produce a safe fallback so the graph doesn't crash with
+    # produce a context-aware fallback so the graph doesn't crash with
     # "model output must contain either output text or tool calls".
+    #
+    # The previous generic "I'm here to help!" broke booking flows: on voice
+    # the fallback was fed back into Vapi's next turn history, the model lost
+    # the booking context, returned empty again, and the caller heard "I'm here
+    # to help" in an infinite loop.
     if gathered is None:
         from langchain_core.messages import AIMessage
-        gathered = AIMessage(content="I'm here to help! Could you repeat that?")
+        fallback_text = _contextual_empty_fallback(messages, is_voice)
+        gathered = AIMessage(content=fallback_text)
     else:
         content = getattr(gathered, "content", None)
         tool_calls = getattr(gathered, "tool_calls", None)
@@ -470,7 +541,8 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         has_tools = bool(tool_calls)
         if not has_content and not has_tools:
             from langchain_core.messages import AIMessage
-            gathered = AIMessage(content="I'm here to help! Could you repeat that?")
+            fallback_text = _contextual_empty_fallback(messages, is_voice)
+            gathered = AIMessage(content=fallback_text)
 
     # R7: the built prompt is deliberately NOT returned into state. The chat graph
     # is checkpointed to Mongo, and the prompt carries the full catalog + knowledge
