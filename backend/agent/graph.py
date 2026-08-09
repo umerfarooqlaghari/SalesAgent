@@ -489,17 +489,16 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
     # inbound message list (built from Vapi's own payload) is the only memory the
     # agent has. Dropping it made multi-turn collection impossible and caused the
     # model to re-invoke the same tool every turn.
-    formatted_messages = [SystemMessage(content=system_prompt)] + list(messages)
+    # Filter out fallback messages from history to prevent fallback echo-chambers
+    clean_history = []
+    for m in messages:
+        c = str(getattr(m, "content", "") or "").lower()
+        if "didn't catch that" in c or "didn't quite catch" in c:
+            continue
+        clean_history.append(m)
 
-    llm = get_chat_llm(
-        streaming=True,
-        temperature=0.1 if is_voice else 0.2,
-        max_retries=1 if is_voice else 2,
-    )
-    # R5: once the tool budget is spent, force a final answer. Ending the turn
-    # here instead would leave a raw tool result as the last message — which the
-    # voice path either cannot speak (data tools are not in _SPEAKABLE_TOOLS) or
-    # would read out verbatim as a SQL dump.
+    formatted_messages = [SystemMessage(content=system_prompt)] + clean_history
+
     budget_spent = (state.get("tool_rounds") or 0) >= MAX_TOOL_ROUNDS
     if budget_spent:
         system_prompt += (
@@ -513,6 +512,12 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         has_catalog_cache=bool(catalog),
         inventory_intent=inventory_intent,
     )
+
+    llm = get_chat_llm(
+        streaming=not use_tools,
+        temperature=0.1 if is_voice else 0.2,
+        max_retries=1 if is_voice else 2,
+    )
     if use_tools:
         if is_voice and inventory_intent:
             tools = _dedupe_tools([*_VOICE_FAST_TOOLS, query_pos_database])
@@ -525,26 +530,24 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         bound = llm
 
     gathered = None
-    try:
-        async for chunk in bound.astream(formatted_messages):
-            gathered = chunk if gathered is None else gathered + chunk
-    except Exception as e:
-        logger.error("LLM stream error in sdr_node: %s", e, exc_info=True)
-
-    if gathered is None:
+    if use_tools:
         try:
             gathered = await bound.ainvoke(formatted_messages)
         except Exception as e:
-            logger.error("LLM invoke fallback error in sdr_node: %s", e, exc_info=True)
+            logger.error("LLM invoke error in sdr_node: %s", e, exc_info=True)
+    else:
+        try:
+            async for chunk in bound.astream(formatted_messages):
+                gathered = chunk if gathered is None else gathered + chunk
+        except Exception as e:
+            logger.error("LLM stream error in sdr_node: %s", e, exc_info=True)
 
-    # Safety net: if Gemini returned an empty response (no text, no tool calls),
-    # produce a context-aware fallback so the graph doesn't crash with
-    # "model output must contain either output text or tool calls".
-    #
-    # The previous generic "I'm here to help!" broke booking flows: on voice
-    # the fallback was fed back into Vapi's next turn history, the model lost
-    # the booking context, returned empty again, and the caller heard "I'm here
-    # to help" in an infinite loop.
+        if gathered is None:
+            try:
+                gathered = await bound.ainvoke(formatted_messages)
+            except Exception as e:
+                logger.error("LLM invoke fallback error in sdr_node: %s", e, exc_info=True)
+
     if gathered is None:
         from langchain_core.messages import AIMessage
         fallback_text = _contextual_empty_fallback(messages, is_voice)

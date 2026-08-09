@@ -629,6 +629,19 @@ async def get_recent_typed_chat_messages(
                 pass
         typed.append(content)
 
+    if not typed:
+        try:
+            db = get_db()
+            cursor = db.conversations.find({"tenant_id": tenant_id}).sort("updated_at", -1).limit(5)
+            async for doc in cursor:
+                for entry in doc.get("messages", []):
+                    if entry.get("role") == "user" and entry.get("source") != "voice":
+                        c = (entry.get("content") or "").strip()
+                        if c and ("@" in c or any(ch.isdigit() for ch in c)):
+                            typed.append(c)
+        except Exception:
+            pass
+
     return typed[-limit:]
 
 def _normalize_phone(phone: str) -> str:
