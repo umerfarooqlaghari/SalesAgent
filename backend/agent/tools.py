@@ -213,13 +213,17 @@ async def query_pos_database(
     tenant = await _load_tenant_context(config or {})
     tenant_id = tenant.tenant_id
 
+    q_low = (product_query or "").lower()
+    is_pagination_query = any(w in q_low for w in ("more", "other", "additional", "next", "else", "further"))
+
     cache_key = f"q:{product_query or ''}_ord:{order_id or ''}_em:{customer_email or ''}_ph:{customer_phone or ''}"
     from backend.integrations.query_cache import get_query_cache, set_query_cache
 
-    cached_res = await get_query_cache(tenant_id, cache_key)
-    if cached_res is not None:
-        logger.info("Serving query_pos_database from cache for tenant %s (%s)", tenant_id, cache_key)
-        return cached_res
+    if not is_pagination_query:
+        cached_res = await get_query_cache(tenant_id, cache_key)
+        if cached_res is not None:
+            logger.info("Serving query_pos_database from cache for tenant %s (%s)", tenant_id, cache_key)
+            return cached_res
 
     try:
         # Defence in depth: building the adapter resolves stored secrets, which

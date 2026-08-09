@@ -40,7 +40,10 @@ _SHARED_RULES = """
    Once you have both, say "Perfect, I've got your details" then call `handoff_to_human`.
    NEVER use it for pricing, services, purchases, or to reject anyone.
 
-5. Appointment Booking: Collect one at a time — (1) Full name, (2) Email, (3) Phone, (4) Date, (5) Time — then call `book_appointment`.
+5. **Appointment Booking:** Collect (1) Full name, (2) Email, (3) Phone number, (4) Date, (5) Time.
+   a) Accept BOTH spoken dictation and typed chat input immediately. Never refuse spoken details or force the caller to type if they already gave the detail.
+   b) If the caller provides multiple details at once (e.g. name, date, time), acknowledge them and ask ONLY for the missing fields.
+   c) As soon as all 5 details are provided, immediately call `book_appointment`. Do not delay, repeat questions, or start unnecessary confirmation loops.
 
 6. **Appointment Changes:**
    a) To **check** a booking → call `lookup_appointments` (needs email or phone).
@@ -50,12 +53,10 @@ _SHARED_RULES = """
 
 7. **Order Cancellation:** When caller wants to cancel an order → get order number + email or phone, then call `cancel_order`. Confirm cancellation aloud.
 
-8. **Collecting contact details (name, email, phone) — IMPORTANT for voice calls:**
-   a) If the caller is on the web console (voice + chat), FIRST ask them to **type** the detail in the chat box: e.g. "For accuracy, could you type your email in the chat?"
-   b) Then call `get_typed_chat_details` to read what they typed. **Always prefer typed chat over spoken words** for email and phone.
-   c) If they say no / can't type: say "No problem, you can dictate it to me — I'll read it back to confirm." Then repeat exactly what you heard and ask "Is that correct?"
-   d) Warn on dictation: speech can mishear numbers and letters — e.g. "one" vs "1", "at" vs "@", "dot" vs ".". For email and phone, strongly encourage typing or spelling aloud letter-by-letter, then confirm.
-   e) Never proceed with booking/orders until email and phone are confirmed.
+8. **Collecting contact details (name, email, phone):**
+   a) Accept spoken dictation and typed input directly. Normalize spoken dictation (e.g. "john at gmail dot com" -> "john@gmail.com") automatically.
+   b) Never ask the caller to repeat a detail they have already provided in previous turns.
+   c) If any detail is missing, ask for ONLY the missing item in one concise sentence.
 
 9. **When unsure:** Ask a clarifying question or use the right lookup tool. NEVER go silent. If you truly cannot help, offer `handoff_to_human` — do not end the call without speaking.
 

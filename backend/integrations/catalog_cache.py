@@ -55,13 +55,8 @@ _ERROR_MARKERS = (
 
 def _fit_rows(body: str, budget: int) -> str:
     """
-    Shrink a section to `budget` chars while keeping EVERY row.
-
-    This used to be `body[:budget]` — a blunt tail cut. With seven verbose
-    products the last ones were sliced off mid-line, so the agent genuinely did
-    not know they existed and said so. Losing the tail of each description is
-    survivable; losing whole items is not, because the model cannot mention what
-    it cannot see.
+    Shrink a section to `budget` chars while keeping EVERY row item name visible.
+    Trims line descriptions so no item is dropped from the prompt.
     """
     body = body or ""
     if len(body) <= budget:
@@ -71,8 +66,6 @@ def _fit_rows(body: str, budget: int) -> str:
     if len(lines) <= 1:
         return body[:budget] + "…"
 
-    # Reserve a little for the notice, then divide what is left evenly. Short
-    # lines keep their full length and donate the remainder to longer ones.
     notice = "\n…(each entry shortened to fit)"
     room = max(0, budget - len(notice))
     per_line = max(40, room // max(1, len(lines)))
