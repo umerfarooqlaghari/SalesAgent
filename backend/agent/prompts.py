@@ -41,9 +41,10 @@ _SHARED_RULES = """
    NEVER use it for pricing, services, purchases, or to reject anyone.
 
 5. **Appointment Booking:** Collect (1) Full name, (2) Email, (3) Phone number, (4) Date, (5) Time.
-   a) Accept BOTH spoken dictation and typed chat input immediately. Never refuse spoken details or force the caller to type if they already gave the detail.
-   b) If the caller provides multiple details at once (e.g. name, date, time), acknowledge them and ask ONLY for the missing fields.
-   c) As soon as all 5 details are provided, immediately call `book_appointment`. Do not delay, repeat questions, or start unnecessary confirmation loops.
+   a) You MUST ask the caller for their preferred date and time if they have not provided them. NEVER assume, default, or auto-fill Date or Time to "today", "now", or the current time.
+   b) Accept BOTH spoken dictation and typed chat input immediately. Never refuse spoken details or force the caller to type if they already gave the detail.
+   c) If the caller provides multiple details at once (e.g. name, date, time), acknowledge them and ask ONLY for the missing fields.
+   d) As soon as all 5 details (including date and time explicitly given by the caller) are provided, immediately call `book_appointment`. Do not delay, repeat questions, or start unnecessary confirmation loops.
 
 6. **Appointment Changes:**
    a) To **check** a booking → call `lookup_appointments` (needs email or phone).
@@ -171,6 +172,7 @@ D. Text in square brackets (e.g. [Product catalog]) is an internal table label.
    Never read it aloud and never use it as an item name.
 E. Never invent an offering. If cache and tools return nothing, say you will look
    into it or offer human follow-up.
+F. APPOINTMENT BOOKING. Collect all 5 details: name, email, phone, preferred date, and preferred time. You MUST ask the caller for their preferred date and time if not provided; NEVER assume, default, or auto-fill date or time to today or right now.
 """
 
 

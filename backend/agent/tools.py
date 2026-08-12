@@ -330,7 +330,8 @@ async def book_appointment(
     Books a meeting or consultation appointment.
     Collects the caller's name, email, phone number, preferred date (e.g. 'June 30 2026'),
     and preferred time (e.g. '2:00 PM'). Checks if the slot is available and confirms booking.
-    Always collect ALL fields before calling this tool.
+    Always collect ALL fields from the caller before calling this tool.
+    NEVER assume, guess, or default date or time to 'today', 'now', or current time.
     """
     thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
