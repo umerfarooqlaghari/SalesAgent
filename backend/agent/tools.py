@@ -17,6 +17,7 @@ from backend.database import (
     find_active_appointments,
     cancel_appointment_record,
     reschedule_appointment_record,
+    update_appointment_fields,
     find_active_orders,
     cancel_order_record,
     next_order_id,
@@ -250,38 +251,100 @@ async def query_pos_database(
         logger.error("query_pos_database failed for tenant %s: %s", tenant.tenant_id, e, exc_info=True)
         return f"Inventory query failed: {e}"
 
+from datetime import datetime, timezone
+
+def _normalize_appointment_date(raw_date: Optional[str]) -> str:
+    if not raw_date or not raw_date.strip():
+        return ""
+    text = raw_date.strip()
+    current_year = datetime.now(timezone.utc).year  # e.g., 2026
+
+    # Regex to find 4-digit year in date string
+    match = re.search(r"\b(20\d\d)\b", text)
+    if match:
+        year_val = int(match.group(1))
+        # If past year (e.g. 2024, 2025), replace with current_year (2026)
+        if year_val < current_year:
+            text = text[:match.start(1)] + str(current_year) + text[match.end(1):]
+    else:
+        # If no year was supplied in date string, append current_year
+        text = f"{text} {current_year}"
+
+    return text
+
+
 @tool
 async def handoff_to_human(
     reason: str,
     caller_name: str,
     caller_phone: str,
-    config: RunnableConfig
+    caller_email: str = "",
+    config: RunnableConfig = None,
 ) -> str:
     """
     Logs the caller's details and notifies a human representative to follow up.
-    REQUIRED: Collect caller_name and caller_phone BEFORE calling this tool.
+    REQUIRED: Collect caller_name, caller_phone, caller_email, AND the specific reason BEFORE calling this tool.
     Use ONLY when:
     1. The user explicitly asks to speak with or be contacted by a human.
     2. You genuinely don't know the answer and they want further help.
     Do NOT use this to reject or disqualify anyone.
     """
+    import asyncio as _asyncio
+    from backend.supervisors.email import send_supervisor_handoff_email
+
     thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
 
+    norm_email = _normalize_email(caller_email)
+    norm_phone = _normalize_phone(caller_phone)
+
+    # Validate required contact fields before firing handoff
+    missing = []
+    if not caller_name or caller_name.strip().lower() in ("", "unknown", "caller", "user", "guest", "n/a", "none"):
+        missing.append("full name")
+    if not norm_phone or norm_phone.strip().lower() in ("", "unknown", "n/a", "none"):
+        missing.append("phone number")
+    if not norm_email or "@" not in norm_email:
+        missing.append("email address")
+
+    if missing:
+        if len(missing) == 1:
+            return f"I can connect you with a supervisor! I just need your {missing[0]} so our team can reach out. Could you please provide that?"
+        items_str = ", ".join(missing[:-1]) + f" and {missing[-1]}"
+        return f"I can connect you with a supervisor! I just need your {items_str} so our team can reach out. Could you please provide those?"
+
+    # Validate that a specific reason was provided by caller
+    generic_reasons = ("", "user requested human follow-up", "talk to human", "speak to supervisor", "human follow-up", "human", "supervisor", "unknown", "n/a", "none")
+    if not reason or reason.strip().lower() in generic_reasons:
+        return f"I'd be glad to connect you with a supervisor, {caller_name.strip()}! Could you please share the topic or reason for your request so I can route it to the right department?"
+
     await save_lead(tenant_id, thread_id, {
-        "status": "Follow-up Requested",
-        "handoff_reason": reason,
-        "name": caller_name,
-        "phone": caller_phone,
+        "status": "Handoff Requested",
+        "handoff_reason": reason or "User requested human follow-up",
+        "name": caller_name.strip(),
+        "phone": norm_phone,
+        "email": norm_email,
     })
 
-    caller_info = f"Name: {caller_name} | Phone: {caller_phone}"
+    caller_info = f"Name: {caller_name.strip()} | Phone: {norm_phone} | Email: {norm_email}"
     logger.info(f"Human follow-up for thread {thread_id}: {caller_info} — {reason}")
 
-    # Fire WhatsApp notification to the operator
-    await send_whatsapp_alert(thread_id, reason, caller_info)
+    # Fire WhatsApp alert and supervisor email concurrently
+    await _asyncio.gather(
+        send_whatsapp_alert(thread_id, reason or "Human follow-up", caller_info),
+        send_supervisor_handoff_email(
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            caller_name=caller_name.strip(),
+            caller_phone=norm_phone,
+            caller_email=norm_email,
+            reason=reason or "User requested human follow-up",
+        ),
+        return_exceptions=True,  # don't let a notification failure crash the handoff
+    )
 
-    return "Perfect, I've passed your details to our team. A representative will reach out to you within a few minutes. Is there anything else I can help you with?"
+    return f"Perfect, {caller_name.strip()}! I've passed your details to our team. A supervisor will reach out to you shortly at {norm_email}. Is there anything else I can help you with in the meantime?"
+
 
 
 _WORD_DIGITS = {
@@ -316,6 +379,21 @@ def _normalize_phone(raw: Optional[str]) -> str:
     return digits if len(digits) >= 6 else raw.strip()
 
 
+_PLACEHOLDER_TIMES = {
+    "00:00", "00:00:00", "0:00", "12:00 am", "12:00am", "00:00am",
+    "now", "right now", "today", "current time", "present",
+    "tbd", "n/a", "none", "unknown", "pending", "unspecified",
+    "default", "any time", "anytime", "asap"
+}
+
+
+def _is_placeholder_time(time_str: Optional[str]) -> bool:
+    if not time_str or not time_str.strip():
+        return True
+    cleaned = time_str.strip().lower()
+    return cleaned in _PLACEHOLDER_TIMES
+
+
 @tool
 async def book_appointment(
     name: str,
@@ -328,10 +406,11 @@ async def book_appointment(
 ) -> str:
     """
     Books a meeting or consultation appointment.
-    Collects the caller's name, email, phone number, preferred date (e.g. 'June 30 2026'),
-    and preferred time (e.g. '2:00 PM'). Checks if the slot is available and confirms booking.
-    Always collect ALL fields from the caller before calling this tool.
-    NEVER assume, guess, or default date or time to 'today', 'now', or current time.
+    Collects the caller's name, email, phone number, preferred date, and preferred time as explicitly specified by the caller.
+    Checks if the slot is available and confirms booking.
+    Always collect ALL 5 fields explicitly from the caller before calling this tool.
+    NEVER assume, guess, or default date or time to 'today', 'now', current time, or sample dates.
+    CRITICAL: DO NOT invoke this tool if the caller has not explicitly stated BOTH preferred date AND preferred time in their messages.
     """
     thread_id = logical_thread_id(config)
     tenant_id = _tenant_id(config)
@@ -347,18 +426,22 @@ async def book_appointment(
         missing.append("email")
     if not norm_phone:
         missing.append("phone number")
-    if not date or date.strip() == "":
+    norm_date = _normalize_appointment_date(date)
+    if not norm_date:
         missing.append("preferred date")
-    if not time or time.strip() == "":
+    if not time or _is_placeholder_time(time):
         missing.append("preferred time")
     
     if missing:
-        return f"I still need the following details to complete your booking: {', '.join(missing)}. Could you please provide those?"
+        if len(missing) == 1:
+            return f"I still need your {missing[0]} to complete your booking. Could you please provide that?"
+        items_str = ", ".join(missing[:-1]) + f" and {missing[-1]}"
+        return f"I still need your {items_str} to complete your booking. Could you please provide those?"
     
     # Check availability
-    available = await check_slot_available(tenant_id, date.strip(), time.strip())
+    available = await check_slot_available(tenant_id, norm_date, time.strip())
     if not available:
-        return f"Unfortunately, {date} at {time} is already taken. Could you suggest another date or time that works for you?"
+        return f"Unfortunately, {norm_date} at {time.strip()} is already taken. Could you suggest another date or time that works for you?"
     
     # Confirm and create booking
     appt = await create_appointment(
@@ -367,12 +450,12 @@ async def book_appointment(
         name=name.strip(),
         email=norm_email,
         phone=norm_phone,
-        date_str=date.strip(),
+        date_str=norm_date,
         time_str=time.strip(),
         notes=notes or ""
     )
     
-    return f"You're all set, {name.strip()}! Your appointment is confirmed for {date.strip()} at {time.strip()}. We'll send a confirmation to {norm_email} shortly."
+    return f"You're all set, {name.strip()}! Your appointment is confirmed for {norm_date} at {time.strip()}. We'll send a confirmation to {norm_email} shortly."
 
 
 @tool
@@ -519,19 +602,29 @@ async def cancel_appointment(
     if (not email or "@" not in email) and (not phone or phone.strip() == ""):
         return "I can cancel that for you — what email or phone number did you use when you booked?"
 
+    # Find active appointments by caller identity first
     appts = await find_active_appointments(
         tenant_id,
         email=email.strip() if email else None,
         phone=phone.strip() if phone else None,
         thread_id=thread_id,
-        date_str=date.strip() if date else None,
-        time_str=time.strip() if time else None,
     )
 
     if not appts:
-        return "I couldn't find an active appointment matching those details. Would you like me to look up your bookings first?"
+        return "I couldn't find an active appointment under those details. Could you check your email or phone number?"
 
-    if len(appts) > 1 and (not date or not time):
+    if len(appts) > 1:
+        # Filter down by date/time if provided
+        if date and date.strip():
+            matched = [a for a in appts if date.strip().lower() in a.get("date", "").lower()]
+            if matched:
+                appts = matched
+        if len(appts) > 1 and time and not _is_placeholder_time(time):
+            matched = [a for a in appts if time.strip().lower() in a.get("time", "").lower()]
+            if matched:
+                appts = matched
+
+    if len(appts) > 1:
         summary = "; ".join(f"{a.get('date')} at {a.get('time')}" for a in appts)
         return (
             f"You have multiple upcoming appointments ({summary}). "
@@ -617,6 +710,100 @@ async def reschedule_appointment(
         f"All set! I've moved your appointment to {new_date} at {new_time}. "
         "You'll receive an updated confirmation shortly. Anything else I can help with?"
     )
+
+
+@tool
+async def update_appointment_details(
+    email: str,
+    phone: str,
+    new_email: Optional[str] = None,
+    new_phone: Optional[str] = None,
+    new_name: Optional[str] = None,
+    new_date: Optional[str] = None,
+    new_time: Optional[str] = None,
+    current_date: Optional[str] = None,
+    current_time: Optional[str] = None,
+    config: RunnableConfig = None,
+) -> str:
+    """
+    Update contact details (email, phone number, name) or date/time on an existing appointment.
+    Use when the caller asks to update, edit, or change their email, phone number, name, date, or time on a booking.
+    Requires existing email or phone for identity verification.
+    """
+    thread_id = logical_thread_id(config)
+    tenant_id = _tenant_id(config)
+
+    if (not email or "@" not in email) and (not phone or phone.strip() == ""):
+        return "I can update your appointment details — what is the email or phone number used for the booking?"
+
+    appts = await find_active_appointments(
+        tenant_id,
+        email=email.strip() if email else None,
+        phone=phone.strip() if phone else None,
+        thread_id=thread_id,
+    )
+
+    if not appts:
+        return "I couldn't find an active appointment under those contact details. Could you verify the email or phone number used?"
+
+    if len(appts) > 1:
+        if current_date and current_date.strip():
+            matched = [a for a in appts if current_date.strip().lower() in a.get("date", "").lower()]
+            if matched:
+                appts = matched
+        if len(appts) > 1 and current_time and not _is_placeholder_time(current_time):
+            matched = [a for a in appts if current_time.strip().lower() in a.get("time", "").lower()]
+            if matched:
+                appts = matched
+
+    if len(appts) > 1:
+        summary = "; ".join(f"{a.get('date')} at {a.get('time')}" for a in appts)
+        return (
+            f"You have multiple appointments ({summary}). "
+            "Which one would you like to update — please specify the current date and time."
+        )
+
+    target = appts[0]
+    updates = {}
+
+    if new_email and "@" in new_email:
+        updates["email"] = _normalize_email(new_email)
+    if new_phone and new_phone.strip():
+        updates["phone"] = _normalize_phone(new_phone)
+    if new_name and new_name.strip():
+        updates["name"] = new_name.strip()
+    if new_date and new_date.strip():
+        updates["date"] = new_date.strip()
+    if new_time and not _is_placeholder_time(new_time):
+        updates["time"] = new_time.strip()
+
+    if not updates:
+        return "Which detail would you like to update — your email, phone number, name, date, or time?"
+
+    # Check slot if changing date/time
+    check_date = updates.get("date", target.get("date"))
+    check_time = updates.get("time", target.get("time"))
+    if ("date" in updates or "time" in updates) and (check_date != target.get("date") or check_time != target.get("time")):
+        available = await check_slot_available(tenant_id, check_date, check_time)
+        if not available:
+            return f"Unfortunately {check_date} at {check_time} is already booked. Could you pick a different time?"
+
+    success = await update_appointment_fields(tenant_id, target["_id"], updates)
+    if not success:
+        return "I wasn't able to update your appointment details. Would you like me to try again?"
+
+    updated_labels = []
+    if "email" in updates:
+        updated_labels.append(f"email to {updates['email']}")
+    if "phone" in updates:
+        updated_labels.append(f"phone number to {updates['phone']}")
+    if "name" in updates:
+        updated_labels.append(f"name to {updates['name']}")
+    if "date" in updates or "time" in updates:
+        updated_labels.append(f"appointment to {check_date} at {check_time}")
+
+    summary_msg = ", ".join(updated_labels)
+    return f"Done! I've updated your {summary_msg}. Is there anything else I can help with?"
 
 
 @tool

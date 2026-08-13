@@ -107,71 +107,6 @@ def safe_format_prompt(template: str, **values) -> str:
     return _PLACEHOLDER_RE.sub(_sub, template)
 
 
-# Patterns that indicate the agent was in the middle of collecting details
-# for a booking, order, or handoff when Gemini returned empty.
-_COLLECTION_TOOL_NAMES = {
-    "book_appointment", "place_order", "handoff_to_human",
-    "reschedule_appointment", "cancel_appointment", "cancel_order",
-    "lookup_appointments", "get_typed_chat_details",
-}
-
-# Phrases the model (or tool) emits when it still needs more fields.
-_STILL_NEED_PHRASES = (
-    "i still need", "could you please provide", "could you share",
-    "what email", "what is your", "your email", "your phone",
-    "your name", "preferred date", "preferred time",
-    "i just need", "couple more details",
-)
-
-
-def _contextual_empty_fallback(messages: list, is_voice: bool) -> str:
-    """
-    Produce a context-aware fallback when Gemini returns empty.
-
-    Instead of the generic "I'm here to help! Could you repeat that?" which
-    resets the conversational flow and causes an infinite loop on voice (where
-    Vapi feeds it back into the next turn), this detects whether we were in a
-    detail-collection flow and nudges the caller for the next piece of info.
-    """
-    # Walk recent messages backwards looking for clues about the current flow.
-    recent_tool_names: list[str] = []
-    recent_assistant_text = ""
-    tool_returned_still_need = False
-
-    for msg in reversed(messages[-12:]):
-        msg_type = getattr(msg, "type", None)
-        if msg_type == "tool":
-            name = getattr(msg, "name", "") or ""
-            recent_tool_names.append(name)
-            content = str(getattr(msg, "content", "") or "").lower()
-            if any(p in content for p in _STILL_NEED_PHRASES):
-                tool_returned_still_need = True
-        elif msg_type == "ai" and not recent_assistant_text:
-            recent_assistant_text = str(getattr(msg, "content", "") or "").lower()
-
-    in_booking_flow = any(t in _COLLECTION_TOOL_NAMES for t in recent_tool_names)
-    assistant_was_collecting = any(
-        p in recent_assistant_text for p in _STILL_NEED_PHRASES
-    )
-
-    if tool_returned_still_need or in_booking_flow or assistant_was_collecting:
-        # The agent was mid-booking/order. Keep the flow alive.
-        if is_voice:
-            return (
-                "I didn't catch that — could you repeat the detail "
-                "you were sharing? I want to make sure I get it right."
-            )
-        return (
-            "Sorry, I missed that. Could you repeat the information "
-            "you were providing so I can complete your request?"
-        )
-
-    # Generic fallback for non-collection contexts.
-    if is_voice:
-        return "Sorry, I didn't catch that — could you say that again?"
-    return "I'm here to help! Could you repeat that?"
-
-
 def _tool_call_signatures(msg) -> set:
     sigs = set()
     for tc in (getattr(msg, "tool_calls", None) or []):
@@ -251,24 +186,9 @@ _VOICE_FAST_TOOLS = [
     cancel_order,
 ]
 
-
-def _dedupe_tools(tools_list: list) -> list:
-    seen = set()
-    out = []
-    for t in tools_list:
-        name = getattr(t, "name", id(t))
-        if name not in seen:
-            seen.add(name)
-            out.append(t)
-    return out
-
 _ACTION_KEYWORDS = (
     "book", "appointment", "schedule", "order", "buy", "purchase", "cancel",
-    "reschedule", "handoff", "human", "representative", "email", "phone", "number",
-    "name", "date", "time", "call", "register", "meeting", "consultation", "talk",
-    "contact", "reach", "my name", "my email", "my number", "zero", "one", "two",
-    "three", "four", "five", "six", "seven", "eight", "nine", "pm", "am", "tomorrow",
-    "today", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "reschedule", "handoff", "human", "representative", "email", "phone",
 )
 
 def _needs_tools(
@@ -280,11 +200,11 @@ def _needs_tools(
     text = (user_text or "").lower()
     if any(k in text for k in _ACTION_KEYWORDS):
         return True
-    # Always keep tools bound when inventory intent or SQL sources exist,
-    # so the LLM can execute query_pos_database if the prompt snippet
-    # doesn't contain the specific product, service, or FAQ requested.
+    # Tenant-mapped inventory: tools unless their SQL catalog is already warm
     if inventory_intent:
-        return True
+        return not has_catalog_cache
+    if has_fact_cache:
+        return False
     return True
 
 
@@ -450,6 +370,114 @@ async def _build_turn_context(
     return result
 
 
+def _has_output(message) -> bool:
+    """A usable model turn: some text, or at least one tool call."""
+    if message is None:
+        return False
+    content = getattr(message, "content", None)
+    if isinstance(content, list):
+        if content:
+            return True
+    elif content and str(content).strip():
+        return True
+    return bool(getattr(message, "tool_calls", None))
+
+
+def _log_empty_response(message, thread_id: str, tenant_id: str) -> None:
+    """
+    Say WHY the model produced nothing.
+
+    Nothing was logged here before, so "the agent went blank" had no evidence
+    behind it at all. finish_reason and safety ratings distinguish a safety
+    block from a token limit from a malformed history — three different fixes.
+    """
+    meta = {}
+    for attr in ("response_metadata", "additional_kwargs", "usage_metadata"):
+        value = getattr(message, attr, None)
+        if isinstance(value, dict) and value:
+            meta[attr] = {
+                k: value[k] for k in (
+                    "finish_reason", "safety_ratings", "prompt_feedback",
+                    "block_reason", "candidates", "output_tokens",
+                ) if k in value
+            } or value
+    logger.error(
+        "EMPTY_MODEL_RESPONSE tenant=%s thread=%s message=%r meta=%s",
+        tenant_id, thread_id, type(message).__name__, meta or "<none>",
+    )
+
+
+def _sanitize_history(formatted_messages: list):
+    """
+    Repair the two history shapes Gemini rejects by returning nothing:
+    a conversation that opens on an assistant turn, and consecutive same-role
+    turns. Returns None when there is nothing to repair, so the caller does not
+    pay for a pointless second call.
+
+    The leading SystemMessage is preserved as-is.
+    """
+    if not formatted_messages:
+        return None
+
+    head, rest = [], list(formatted_messages)
+    if rest and getattr(rest[0], "type", None) == "system":
+        head, rest = [rest[0]], rest[1:]
+
+    cleaned = []
+    for msg in rest:
+        content = getattr(msg, "content", None)
+        has_tools = bool(getattr(msg, "tool_calls", None))
+        if not has_tools and not (content and str(content).strip()):
+            continue  # empty turn: nothing for the model to condition on
+        if cleaned and getattr(cleaned[-1], "type", None) == getattr(msg, "type", None):
+            # Two turns from the same speaker in a row. Keep the newer one.
+            if getattr(msg, "type", None) == "human":
+                cleaned[-1] = msg
+                continue
+            cleaned[-1] = msg
+            continue
+        cleaned.append(msg)
+
+    # A conversation must open on the human side.
+    while cleaned and getattr(cleaned[0], "type", None) != "human":
+        cleaned.pop(0)
+
+    if not cleaned:
+        return None
+    repaired = head + cleaned
+    return repaired if len(repaired) != len(formatted_messages) else None
+
+
+def _recovery_prompt(messages: list) -> str:
+    """
+    A recovery line that does not destroy an in-progress booking.
+
+    The old fallback was "I'm here to help! Could you repeat that?" — an opener.
+    Mid-booking that reads as the agent having forgotten everything, which is
+    exactly what was reported. If the last thing WE asked for is recoverable
+    from the history, ask for that one thing again.
+    """
+    ASKS = (
+        ("email", "Could you repeat your email address for me?"),
+        ("phone", "Could you repeat your phone number?"),
+        ("number", "Could you repeat your phone number?"),
+        ("date", "What date works best for you?"),
+        ("time", "What time suits you?"),
+        ("name", "Could you tell me your name again?"),
+    )
+    for msg in reversed(list(messages or [])):
+        if getattr(msg, "type", None) != "ai":
+            continue
+        text = str(getattr(msg, "content", "") or "").lower()
+        if not text:
+            continue
+        for needle, question in ASKS:
+            if needle in text:
+                return question
+        break
+    return "Sorry — could you say that last part again?"
+
+
 async def sdr_node(state: AgentState) -> Dict[str, Any]:
     messages = state.get("messages", [])
     lead_profile = state.get("lead_profile")
@@ -489,16 +517,17 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
     # inbound message list (built from Vapi's own payload) is the only memory the
     # agent has. Dropping it made multi-turn collection impossible and caused the
     # model to re-invoke the same tool every turn.
-    # Filter out fallback messages from history to prevent fallback echo-chambers
-    clean_history = []
-    for m in messages:
-        c = str(getattr(m, "content", "") or "").lower()
-        if "didn't catch that" in c or "didn't quite catch" in c:
-            continue
-        clean_history.append(m)
+    formatted_messages = [SystemMessage(content=system_prompt)] + list(messages)
 
-    formatted_messages = [SystemMessage(content=system_prompt)] + clean_history
-
+    llm = get_chat_llm(
+        streaming=True,
+        temperature=0.1 if is_voice else 0.2,
+        max_retries=1 if is_voice else 2,
+    )
+    # R5: once the tool budget is spent, force a final answer. Ending the turn
+    # here instead would leave a raw tool result as the last message — which the
+    # voice path either cannot speak (data tools are not in _SPEAKABLE_TOOLS) or
+    # would read out verbatim as a SQL dump.
     budget_spent = (state.get("tool_rounds") or 0) >= MAX_TOOL_ROUNDS
     if budget_spent:
         system_prompt += (
@@ -512,15 +541,9 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         has_catalog_cache=bool(catalog),
         inventory_intent=inventory_intent,
     )
-
-    llm = get_chat_llm(
-        streaming=not use_tools,
-        temperature=0.1 if is_voice else 0.2,
-        max_retries=1 if is_voice else 2,
-    )
     if use_tools:
         if is_voice and inventory_intent:
-            tools = _dedupe_tools([*_VOICE_FAST_TOOLS, query_pos_database])
+            tools = list(dict.fromkeys([*_VOICE_FAST_TOOLS, query_pos_database]))
         elif is_voice and has_facts:
             tools = _VOICE_FAST_TOOLS
         else:
@@ -530,37 +553,47 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
         bound = llm
 
     gathered = None
-    if use_tools:
+    try:
+        async for chunk in bound.astream(formatted_messages):
+            gathered = chunk if gathered is None else gathered + chunk
+    except Exception as e:
+        logger.error("LLM stream error in sdr_node: %s", e, exc_info=True)
+
+    if gathered is None:
         try:
             gathered = await bound.ainvoke(formatted_messages)
         except Exception as e:
-            logger.error("LLM invoke error in sdr_node: %s", e, exc_info=True)
-    else:
-        try:
-            async for chunk in bound.astream(formatted_messages):
-                gathered = chunk if gathered is None else gathered + chunk
-        except Exception as e:
-            logger.error("LLM stream error in sdr_node: %s", e, exc_info=True)
+            logger.error("LLM invoke fallback error in sdr_node: %s", e, exc_info=True)
 
-        if gathered is None:
+    # An empty model response used to be swallowed into a canned line with
+    # nothing logged, which made it undiagnosable — and because voice memory is
+    # Vapi's replayed history, that canned line came back as context on the next
+    # turn and the agent said it again, and again.
+    #
+    # Gemini returns empty for a small number of concrete reasons, and the most
+    # common ones are repairable history problems: a conversation that opens on
+    # an assistant turn, or two same-role turns in a row. Try once more on a
+    # repaired history before giving up.
+    if not _has_output(gathered):
+        _log_empty_response(gathered, thread_id, tenant_id)
+        repaired = _sanitize_history(formatted_messages)
+        if repaired is not None:
+            logger.info(
+                "Empty model response — retrying on a repaired history (%d -> %d messages)",
+                len(formatted_messages), len(repaired),
+            )
             try:
-                gathered = await bound.ainvoke(formatted_messages)
+                gathered = await bound.ainvoke(repaired)
             except Exception as e:
-                logger.error("LLM invoke fallback error in sdr_node: %s", e, exc_info=True)
+                logger.error("Retry after empty response failed: %s", e, exc_info=True)
 
-    if gathered is None:
+    if not _has_output(gathered):
         from langchain_core.messages import AIMessage
-        fallback_text = _contextual_empty_fallback(messages, is_voice)
-        gathered = AIMessage(content=fallback_text)
-    else:
-        content = getattr(gathered, "content", None)
-        tool_calls = getattr(gathered, "tool_calls", None)
-        has_content = bool(content and str(content).strip()) if not isinstance(content, list) else bool(content)
-        has_tools = bool(tool_calls)
-        if not has_content and not has_tools:
-            from langchain_core.messages import AIMessage
-            fallback_text = _contextual_empty_fallback(messages, is_voice)
-            gathered = AIMessage(content=fallback_text)
+
+        # Deliberately NOT "I'm here to help" — a booking in progress must not be
+        # answered with an opener that throws away what was already collected.
+        # Re-ask for the outstanding detail instead so the flow can continue.
+        gathered = AIMessage(content=_recovery_prompt(messages))
 
     # R7: the built prompt is deliberately NOT returned into state. The chat graph
     # is checkpointed to Mongo, and the prompt carries the full catalog + knowledge

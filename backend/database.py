@@ -656,20 +656,15 @@ async def find_active_appointments(
     date_str: Optional[str] = None,
     time_str: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Find non-cancelled appointments matching caller identity within a tenant."""
+    """Find non-cancelled appointments matching caller identity or thread within a tenant."""
     db = get_db()
     filters: List[Dict[str, Any]] = [
         {"tenant_id": tenant_id},
         {"status": {"$ne": "cancelled"}},
     ]
 
-    if thread_id:
-        filters.append({"thread_id": thread_id})
-
     identity_clauses: List[Dict[str, Any]] = []
     if email and email.strip():
-        # A33: caller-supplied text must be escaped before it reaches a Mongo
-        # $regex, or "." matches every record and "(a+)+$" is a ReDoS.
         identity_clauses.append({"email": {"$regex": f"^{re.escape(email.strip())}$", "$options": "i"}})
     if phone and phone.strip():
         normalized = _normalize_phone(phone)
@@ -678,11 +673,13 @@ async def find_active_appointments(
 
     if identity_clauses:
         filters.append({"$or": identity_clauses})
+    elif thread_id:
+        filters.append({"thread_id": thread_id})
 
     if date_str and date_str.strip():
-        filters.append({"date": date_str.strip()})
+        filters.append({"date": {"$regex": re.escape(date_str.strip()), "$options": "i"}})
     if time_str and time_str.strip():
-        filters.append({"time": time_str.strip()})
+        filters.append({"time": {"$regex": re.escape(time_str.strip()), "$options": "i"}})
 
     query: Dict[str, Any] = {"$and": filters} if len(filters) > 1 else filters[0]
     cursor = db.appointments.find(query).sort([("date", 1), ("time", 1)])
@@ -716,6 +713,28 @@ async def reschedule_appointment_record(
     result = await db.appointments.update_one(
         {"_id": ObjectId(appt_id), "tenant_id": tenant_id, "status": {"$ne": "cancelled"}},
         {"$set": {"date": new_date.strip(), "time": new_time.strip()}},
+    )
+    return result.modified_count > 0
+
+async def update_appointment_fields(
+    tenant_id: str,
+    appt_id: str,
+    updates: Dict[str, Any],
+) -> bool:
+    """Update name, email, phone, date, time, or notes on an active appointment."""
+    from bson import ObjectId
+
+    db = get_db()
+    clean_updates = {
+        k: v.strip() if isinstance(v, str) else v
+        for k, v in updates.items()
+        if v is not None and (not isinstance(v, str) or v.strip() != "")
+    }
+    if not clean_updates:
+        return False
+    result = await db.appointments.update_one(
+        {"_id": ObjectId(appt_id), "tenant_id": tenant_id, "status": {"$ne": "cancelled"}},
+        {"$set": clean_updates},
     )
     return result.modified_count > 0
 

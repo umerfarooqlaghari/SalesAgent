@@ -50,6 +50,7 @@ from backend.superadmin.routes import router as superadmin_router
 from backend.tenant.registry import get_tenant_by_id
 
 from backend.billing.routes import router as billing_router
+from backend.supervisors.routes import router as supervisors_router
 from backend.tenant.thread_scope import graph_config
 
 active_connections: Dict[str, WebSocket] = {}
@@ -82,6 +83,7 @@ app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(superadmin_router)
 app.include_router(billing_router)
+app.include_router(supervisors_router)
 
 # S06: tenant websites embed our widget/voice endpoints directly with an API
 # key (no cookies) — those need an open CORS policy. Everything else (the

@@ -52,6 +52,12 @@ type IntegrationsState = {
 interface Props {
   backendUrl: string;
   getHeaders: () => Record<string, string>;
+  publishableKey?: string | null;
+  regeneratedKey?: string | null;
+  pkBusy?: boolean;
+  regeneratingKey?: boolean;
+  handleRegeneratePublishableKey?: () => void;
+  handleRegenerateApiKey?: () => void;
 }
 
 // F18: this took a non-optional CategorySchema, so both call sites reached for
@@ -253,7 +259,16 @@ function ConnectionFields({
   );
 }
 
-function AdminIntegrations({ backendUrl, getHeaders }: Props) {
+function AdminIntegrations({
+  backendUrl,
+  getHeaders,
+  publishableKey,
+  regeneratedKey,
+  pkBusy,
+  regeneratingKey,
+  handleRegeneratePublishableKey,
+  handleRegenerateApiKey,
+}: Props) {
   const [schemas, setSchemas] = useState<CategorySchema[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationsState | null>(null);
   const [loading, setLoading] = useState(true);
@@ -616,6 +631,109 @@ function AdminIntegrations({ backendUrl, getHeaders }: Props) {
             </button>
           </div>
         )}
+
+        {/* API Keys & Web Embedding */}
+        <section className={`${ui.card} overflow-hidden`}>
+          <div className={`${ui.cardHeader} bg-white`}>
+            <h3 className="text-base font-semibold text-gray-900">🔑 API Keys & Web Embedding</h3>
+            <p className="text-sm text-gray-500 mt-0.5">
+              Public and Secret API keys for website chat widgets, custom frontends, and server-to-server integrations.
+            </p>
+          </div>
+          <div className="p-5 space-y-5">
+            {/* Publishable Key */}
+            <div className="rounded-xl border border-sky-200 bg-sky-50/60 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <span className="text-xs font-bold uppercase tracking-wider text-sky-900">
+                  Publishable Key (Websites & Frontends)
+                </span>
+                <span className="rounded bg-sky-200 px-2 py-0.5 text-[10px] font-bold text-sky-800 uppercase">
+                  Frontend Safe
+                </span>
+              </div>
+              <p className="text-xs text-sky-700 mb-3">
+                Safe to include in public website HTML or frontend client code. Grants chat and widget access only.
+              </p>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 rounded-lg border border-sky-300 bg-white px-3 py-2 font-mono text-xs text-sky-950 font-semibold select-all break-all shadow-sm">
+                  {publishableKey || "pk_live_..."}
+                </code>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (publishableKey) {
+                      navigator.clipboard.writeText(publishableKey);
+                      setMessage("Publishable key copied to clipboard!", true);
+                    }
+                  }}
+                  className={ui.btnSecondary}
+                >
+                  Copy Key
+                </button>
+              </div>
+            </div>
+
+            {/* Key Action Buttons */}
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={handleRegeneratePublishableKey}
+                disabled={pkBusy}
+                className={ui.btnSecondary}
+              >
+                {pkBusy ? "Rotating PK…" : "Rotate Publishable Key (PK)"}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleRegenerateApiKey}
+                disabled={regeneratingKey}
+                className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-2 text-xs font-bold text-amber-800 hover:bg-amber-100 disabled:opacity-50 transition-all shadow-sm"
+              >
+                {regeneratingKey ? "Rotating SK…" : "Rotate Secret Key (SK)"}
+              </button>
+            </div>
+
+            {/* Secret Key Alert */}
+            {regeneratedKey && (
+              <div className="rounded-xl border border-emerald-300 bg-emerald-50 p-4 space-y-2">
+                <div className="flex items-center gap-2 text-emerald-900 font-bold text-xs uppercase">
+                  <span>⚠️ New Secret Key Generated</span>
+                  <span className="text-[10px] text-emerald-700 font-normal">Copy this immediately — it will not be shown again!</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 rounded-lg border border-emerald-300 bg-white px-3 py-2 font-mono text-xs text-emerald-950 font-bold select-all break-all shadow-sm">
+                    {regeneratedKey}
+                  </code>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(regeneratedKey);
+                      setMessage("Secret key copied to clipboard!", true);
+                    }}
+                    className={ui.btnPrimary}
+                  >
+                    Copy Secret Key
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Web Embed Snippet */}
+            <div className="rounded-xl border border-slate-200 bg-slate-900 p-4 text-slate-100 space-y-2">
+              <div className="flex items-center justify-between text-xs text-slate-400 font-semibold">
+                <span>Embed Web Widget</span>
+                <span className="text-[10px] text-indigo-400 font-mono">HTML Snippet</span>
+              </div>
+              <pre className="font-mono text-xs text-indigo-300 overflow-x-auto p-3 bg-slate-950 rounded-lg border border-slate-800">
+                {`<script src="${backendUrl || 'http://127.0.0.1:8765'}/static/widget.js" data-publishable-key="${publishableKey || 'YOUR_PUBLISHABLE_KEY'}" async></script>`}
+              </pre>
+              <p className="text-[11px] text-slate-400">
+                Paste this script tag before the closing <code className="text-slate-300">&lt;/body&gt;</code> tag on any HTML site or React project to enable the AI Sales Agent chat widget.
+              </p>
+            </div>
+          </div>
+        </section>
 
         <section className={`${ui.card} overflow-hidden`}>
           <div className={`${ui.cardHeader} bg-white`}>

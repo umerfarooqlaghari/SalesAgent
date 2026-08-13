@@ -58,6 +58,7 @@ async def ensure_all_indexes() -> None:
         _ensure_operational_indexes,
         _ensure_knowledge_indexes,
         _ensure_voice_indexes,
+        _ensure_supervisor_indexes,
     ):
         try:
             await step()
@@ -255,4 +256,29 @@ async def _ensure_voice_indexes() -> None:
         "call_id",
         unique=True,
         name="voice_billing_events_call_id",
+    )
+
+
+async def _ensure_supervisor_indexes() -> None:
+    """Supervisor registry — tenant-scoped lookup + unique email guard."""
+    db = get_db()
+    # List all supervisors for a tenant (handoff routing query)
+    await _ensure_index(
+        db.supervisors,
+        [("tenant_id", 1), ("active", 1), ("created_at", 1)],
+        name="supervisors_tenant_active_created",
+    )
+    # Prevent duplicate email registrations within a tenant
+    await _ensure_index(
+        db.supervisors,
+        [("tenant_id", 1), ("email", 1)],
+        unique=True,
+        name="supervisors_tenant_email_unique",
+    )
+    # Round-robin counter — one doc per tenant
+    await _ensure_index(
+        db.supervisor_rr,
+        "tenant_id",
+        unique=True,
+        name="supervisor_rr_tenant",
     )

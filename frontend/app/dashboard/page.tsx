@@ -30,6 +30,9 @@ const VAPI_CONFIGURED = Boolean(VAPI_PUBLIC_KEY && VAPI_ASSISTANT_ID);
 interface Lead {
   _id?: string;
   thread_id: string;
+  name?: string;
+  email?: string;
+  phone?: string;
   company?: string;
   job_title?: string;
   intent_score?: number;
@@ -75,9 +78,17 @@ export default function Dashboard() {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [activeLead, setActiveLead] = useState<Lead | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [activeTab, setActiveTab] = useState<"sandbox" | "supervisor" | "leads" | "appointments" | "orders" | "admin" | "billing">("sandbox");
+  const [activeTab, setActiveTab] = useState<"sandbox" | "supervisor" | "supervisors" | "leads" | "appointments" | "orders" | "admin" | "billing">("sandbox");
   const [appointments, setAppointments] = useState<any[]>([]);
   const [orders, setOrders] = useState<any[]>([]);
+
+  // Supervisor management state
+  const [supervisorList, setSupervisorList] = useState<any[]>([]);
+  const [supervisorForm, setSupervisorForm] = useState({ name: "", email: "", department: "", phone: "", active: true });
+  const [supervisorEditId, setSupervisorEditId] = useState<string | null>(null);
+  const [supervisorFormOpen, setSupervisorFormOpen] = useState(false);
+  const [supervisorSaving, setSupervisorSaving] = useState(false);
+  const [supervisorError, setSupervisorError] = useState("");
 
   // Real-time states
   const [connected, setConnected] = useState<boolean>(false);
@@ -1065,73 +1076,10 @@ export default function Dashboard() {
             </div>
           )}
           {tenantInfo && (
-            <p className="text-[10px] text-emerald-600 font-mono font-bold mb-3">
+            <p className="text-[10px] text-emerald-600 font-mono font-bold">
               ✓ {tenantInfo.org_name} ({tenantInfo.tenant_id})
             </p>
           )}
-          {publishableKey && (
-            <div className="mb-2 rounded-lg bg-sky-50 border border-sky-200 p-2">
-              <p className="text-[9px] text-sky-800 mb-1 font-bold uppercase">Publishable key (websites)</p>
-              <p className="font-mono text-[10px] text-sky-900 break-all select-all">{publishableKey}</p>
-              <p className="text-[9px] text-sky-600 mt-1">Safe for frontend. Embed / chat only.</p>
-            </div>
-          )}
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={handleRegeneratePublishableKey}
-              disabled={pkBusy}
-              className="flex-1 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-lg border border-sky-300 text-sky-700 bg-sky-50 hover:bg-sky-100/70 disabled:opacity-50"
-            >
-              {pkBusy ? "…" : "Rotate pk"}
-            </button>
-            <button
-              type="button"
-              onClick={handleRegenerateApiKey}
-              disabled={regeneratingKey}
-              className="flex-1 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-lg border border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100/70 disabled:opacity-50"
-            >
-              {regeneratingKey ? "…" : "Rotate sk"}
-            </button>
-          </div>
-          {regeneratedKey && (
-            <div className="mt-2 rounded-lg bg-emerald-50 border border-emerald-200 p-2">
-              <p className="text-[9px] text-emerald-800 mb-1 font-bold uppercase">New secret key — copy now</p>
-              <p className="font-mono text-[10px] text-indigo-600 break-all">{regeneratedKey}</p>
-            </div>
-          )}
-          <div className="flex items-center justify-between mt-3 mb-1.5">
-            <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
-              Backend Service URL
-            </label>
-            <span className="text-[9px] font-bold text-indigo-600 uppercase">Host</span>
-          </div>
-          <input
-            type="text"
-            value={backendUrlDraft}
-            onChange={(e) => setBackendUrlDraft(e.target.value)}
-            onBlur={commitBackendUrl}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                commitBackendUrl();
-              } else if (e.key === "Escape") {
-                setBackendUrlDraft(backendUrl);
-                setBackendUrlNote("");
-              }
-            }}
-            placeholder="e.g. https://salesagent-b6po.onrender.com"
-            className="w-full bg-white border border-slate-200 rounded-lg px-3 py-1.5 text-xs text-slate-800 placeholder-slate-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all font-mono"
-          />
-          <p className="mt-1 text-[9px] text-slate-400">
-            {backendUrlNote ? (
-              <span className="font-semibold text-rose-500">{backendUrlNote}</span>
-            ) : backendUrlDraft !== backendUrl ? (
-              <span className="font-semibold text-amber-600">Press Enter to apply</span>
-            ) : (
-              "Applied on Enter or when you click away."
-            )}
-          </p>
         </div>
 
         {/* Action Button */}
@@ -1250,7 +1198,19 @@ export default function Dashboard() {
                     setSelectedHandoffThread(threadId);
                     setSupervisorMobileView("queue");
                   },
-                  badge: leads.some((l) => l.status === "Handoff Requested"),
+                  badge: leads.some((l) => ["Handoff Requested", "Follow-up Requested"].includes(l.status || "")),
+                },
+                {
+                  id: "supervisors",
+                  mobile: "Team",
+                  desktop: "Supervisors",
+                  onClick: async () => {
+                    setActiveTab("supervisors");
+                    try {
+                      const res = await fetch(`${backendUrl}/api/supervisors`, { headers: getHeaders() });
+                      if (res.ok) setSupervisorList((await res.json()).supervisors || []);
+                    } catch { /* ignore */ }
+                  },
                 },
                 { id: "leads", mobile: "Leads", desktop: "Leads", onClick: () => { setActiveTab("leads"); fetchLeads(); } },
                 { id: "appointments", mobile: "Appts", desktop: "Appointments", onClick: async () => {
@@ -1600,16 +1560,16 @@ export default function Dashboard() {
             {/* Left Queue */}
             <div className={`flex w-full flex-col border-b border-slate-200 bg-white lg:w-80 lg:border-b-0 lg:border-r lg:border-slate-200 ${selectedHandoffThread && supervisorMobileView === "chat" ? "hidden lg:flex" : "flex"}`}>
               <div className="p-4 border-b border-slate-100 text-[11px] font-bold text-slate-500 uppercase tracking-wider">
-                Handoff Inboxes ({leads.filter((l) => ["Handoff Requested", "Human Claimed"].includes(l.status || "")).length})
+                Handoff Inboxes ({leads.filter((l) => ["Handoff Requested", "Follow-up Requested", "Human Claimed"].includes(l.status || "")).length})
               </div>
               <div className="flex-1 overflow-y-auto p-4 space-y-2">
-                {leads.filter((l) => ["Handoff Requested", "Human Claimed"].includes(l.status || "")).length === 0 ? (
+                {leads.filter((l) => ["Handoff Requested", "Follow-up Requested", "Human Claimed"].includes(l.status || "")).length === 0 ? (
                   <div className="text-center text-xs text-slate-400 py-8">
                     Queue clear. No active handoff requests!
                   </div>
                 ) : (
                   leads
-                    .filter((l) => ["Handoff Requested", "Human Claimed"].includes(l.status || ""))
+                    .filter((l) => ["Handoff Requested", "Follow-up Requested", "Human Claimed"].includes(l.status || ""))
                     .map((lead) => (
                       <button
                         key={lead.thread_id}
@@ -1753,6 +1713,169 @@ export default function Dashboard() {
           </div>
         )}
 
+        {/* Supervisors management view */}
+        {activeTab === "supervisors" && (
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8 space-y-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-bold text-slate-900">Supervisors</h2>
+                <p className="text-xs text-slate-500 mt-0.5">Human escalation targets — the agent emails the next available supervisor (round-robin) when a caller requests a human.</p>
+              </div>
+              <button
+                id="add-supervisor-btn"
+                type="button"
+                onClick={() => { setSupervisorEditId(null); setSupervisorForm({ name: "", email: "", department: "", phone: "", active: true }); setSupervisorError(""); setSupervisorFormOpen(true); }}
+                className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-bold text-white shadow hover:bg-indigo-700 transition-colors"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" /></svg>
+                Add Supervisor
+              </button>
+            </div>
+
+            {/* Inline add/edit form */}
+            {supervisorFormOpen && (
+              <div className="rounded-xl border border-indigo-200 bg-indigo-50 p-5 shadow-sm">
+                <h3 className="mb-4 text-sm font-bold text-indigo-900">{supervisorEditId ? "Edit Supervisor" : "New Supervisor"}</h3>
+                {supervisorError && <p className="mb-3 rounded-md bg-red-50 border border-red-200 px-3 py-2 text-xs text-red-700 font-medium">{supervisorError}</p>}
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div>
+                    <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1">Full Name *</label>
+                    <input id="supervisor-name" type="text" value={supervisorForm.name} onChange={e => setSupervisorForm(f => ({ ...f, name: e.target.value }))} placeholder="Jane Smith" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1">Email *</label>
+                    <input id="supervisor-email" type="email" value={supervisorForm.email} onChange={e => setSupervisorForm(f => ({ ...f, email: e.target.value }))} placeholder="jane@company.com" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1">Department</label>
+                    <input id="supervisor-department" type="text" value={supervisorForm.department} onChange={e => setSupervisorForm(f => ({ ...f, department: e.target.value }))} placeholder="Sales" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1">Phone (optional)</label>
+                    <input id="supervisor-phone" type="tel" value={supervisorForm.phone} onChange={e => setSupervisorForm(f => ({ ...f, phone: e.target.value }))} placeholder="+1 555 000 0000" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <label className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Active</label>
+                    <button
+                      id="supervisor-active-toggle"
+                      type="button"
+                      onClick={() => setSupervisorForm(f => ({ ...f, active: !f.active }))}
+                      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${supervisorForm.active ? "bg-indigo-600" : "bg-slate-300"}`}
+                    >
+                      <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform ${supervisorForm.active ? "translate-x-4" : "translate-x-0.5"}`} />
+                    </button>
+                    <span className="text-xs text-slate-500">{supervisorForm.active ? "Will receive handoff emails" : "Excluded from rotation"}</span>
+                  </div>
+                </div>
+                <div className="mt-4 flex gap-2">
+                  <button
+                    id="supervisor-save-btn"
+                    type="button"
+                    disabled={supervisorSaving}
+                    onClick={async () => {
+                      setSupervisorSaving(true);
+                      setSupervisorError("");
+                      try {
+                        const url = supervisorEditId
+                          ? `${backendUrl}/api/supervisors/${supervisorEditId}`
+                          : `${backendUrl}/api/supervisors`;
+                        const res = await fetch(url, {
+                          method: supervisorEditId ? "PUT" : "POST",
+                          headers: { ...getHeaders(), "Content-Type": "application/json" },
+                          body: JSON.stringify(supervisorForm),
+                        });
+                        const data = await res.json();
+                        if (!res.ok) { setSupervisorError(data.detail || "Save failed"); return; }
+                        const listRes = await fetch(`${backendUrl}/api/supervisors`, { headers: getHeaders() });
+                        if (listRes.ok) setSupervisorList((await listRes.json()).supervisors || []);
+                        setSupervisorFormOpen(false);
+                        setSupervisorEditId(null);
+                      } catch (e: any) {
+                        setSupervisorError(e.message || "Save failed");
+                      } finally {
+                        setSupervisorSaving(false);
+                      }
+                    }}
+                    className="rounded-lg bg-indigo-600 px-4 py-2 text-xs font-bold text-white shadow hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+                  >
+                    {supervisorSaving ? "Saving…" : supervisorEditId ? "Update" : "Create"}
+                  </button>
+                  <button type="button" onClick={() => { setSupervisorFormOpen(false); setSupervisorEditId(null); setSupervisorError(""); }} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50 transition-colors">Cancel</button>
+                </div>
+              </div>
+            )}
+
+            {/* Supervisors table */}
+            <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
+              <table className="w-full min-w-[640px] border-collapse text-left">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50 text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                    <th className="px-5 py-3">Name</th>
+                    <th className="px-5 py-3">Email</th>
+                    <th className="px-5 py-3">Department</th>
+                    <th className="px-5 py-3">Phone</th>
+                    <th className="px-5 py-3">Status</th>
+                    <th className="px-5 py-3">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-sm text-slate-700">
+                  {supervisorList.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="px-5 py-10 text-center text-xs text-slate-400">
+                        No supervisors yet. Click &ldquo;Add Supervisor&rdquo; above — the agent will email them when a caller requests a human.
+                      </td>
+                    </tr>
+                  ) : supervisorList.map((sv) => (
+                    <tr key={sv._id} className="hover:bg-slate-50 transition-colors">
+                      <td className="px-5 py-3 font-medium">{sv.name}</td>
+                      <td className="px-5 py-3 text-slate-500">{sv.email}</td>
+                      <td className="px-5 py-3 text-slate-500">{sv.department || <span className="text-slate-300">—</span>}</td>
+                      <td className="px-5 py-3 text-slate-500">{sv.phone || <span className="text-slate-300">—</span>}</td>
+                      <td className="px-5 py-3">
+                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-bold ${sv.active ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
+                          {sv.active ? "Active" : "Inactive"}
+                        </span>
+                      </td>
+                      <td className="px-5 py-3">
+                        <div className="flex items-center gap-2">
+                          <button
+                            id={`edit-supervisor-${sv._id}`}
+                            type="button"
+                            title="Edit"
+                            onClick={() => { setSupervisorEditId(sv._id); setSupervisorForm({ name: sv.name, email: sv.email, department: sv.department || "", phone: sv.phone || "", active: sv.active }); setSupervisorError(""); setSupervisorFormOpen(true); }}
+                            className="rounded p-1.5 text-indigo-600 hover:bg-indigo-50 transition-colors"
+                          >
+                            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                          </button>
+                          <button
+                            id={`delete-supervisor-${sv._id}`}
+                            type="button"
+                            title="Delete"
+                            onClick={async () => {
+                              if (!confirm(`Remove ${sv.name} from the supervisor list?`)) return;
+                              try {
+                                await fetch(`${backendUrl}/api/supervisors/${sv._id}`, { method: "DELETE", headers: getHeaders() });
+                                setSupervisorList(prev => prev.filter(s => s._id !== sv._id));
+                              } catch (e) { console.error(e); }
+                            }}
+                            className="rounded p-1.5 text-red-500 hover:bg-red-50 transition-colors"
+                          >
+                            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="rounded-lg border border-amber-100 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+              <strong>Round-robin routing:</strong> When a caller asks for a human, the agent collects their name, email, and phone, then emails the next active supervisor in rotation. Configure <strong>AWS SES</strong> credentials in your environment to enable live email delivery.
+            </div>
+          </div>
+        )}
+
         {/* CRM leads view */}
         {activeTab === "leads" && (
           <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:space-y-6 sm:p-6 lg:p-8">
@@ -1767,11 +1890,11 @@ export default function Dashboard() {
               <table className="w-full min-w-[640px] border-collapse text-left">
                 <thead>
                   <tr className="border-b border-slate-200 bg-slate-50 text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                    <th className="px-4 py-3 sm:px-6 sm:py-4">Company</th>
-                    <th className="px-4 py-3 sm:px-6 sm:py-4">Job Title</th>
-                    <th className="px-4 py-3 sm:px-6 sm:py-4">Intent Score</th>
-                    <th className="px-4 py-3 sm:px-6 sm:py-4">B2B Fit</th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4">Name / Contact</th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4">Email</th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4">Phone</th>
                     <th className="px-4 py-3 sm:px-6 sm:py-4">Status</th>
+                    <th className="px-4 py-3 sm:px-6 sm:py-4">Reason / Info</th>
                     <th className="px-4 py-3 sm:px-6 sm:py-4">Thread ID</th>
                   </tr>
                 </thead>
@@ -1779,31 +1902,17 @@ export default function Dashboard() {
                   {leads.length === 0 ? (
                     <tr>
                       <td colSpan={6} className="py-12 text-center text-xs font-semibold text-slate-400">
-                        No leads sync'd in database. Complete firmographic checks to qualify leads.
+                        No leads sync'd in database. Complete firmographic checks or request human follow-up.
                       </td>
                     </tr>
                   ) : (
                     leads.map((lead, idx) => (
                       <tr key={idx} className="transition-all hover:bg-slate-50/50">
-                        <td className="px-4 py-3 font-bold text-slate-800 sm:px-6 sm:py-4">{lead.company || "N/A"}</td>
-                        <td className="px-4 py-3 sm:px-6 sm:py-4">{lead.job_title || "N/A"}</td>
-                        <td className="px-4 py-3 sm:px-6 sm:py-4">
-                          <span className="font-mono font-bold text-slate-700">{lead.intent_score || 0}/10</span>
-                        </td>
-                        <td className="px-4 py-3 sm:px-6 sm:py-4">
-                          {lead.fit === true ? (
-                            <span className="text-emerald-600 font-bold text-xs flex items-center gap-1">
-                              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> Yes
-                            </span>
-                          ) : lead.fit === false ? (
-                            <span className="text-rose-600 font-bold text-xs flex items-center gap-1">
-                              <span className="h-1.5 w-1.5 rounded-full bg-rose-500" /> No
-                            </span>
-                          ) : (
-                            <span className="text-slate-500 font-semibold text-xs">Unknown</span>
-                          )}
-                        </td>
+                        <td className="px-4 py-3 font-bold text-slate-800 sm:px-6 sm:py-4">{lead.name || lead.company || "N/A"}</td>
+                        <td className="px-4 py-3 text-slate-600 sm:px-6 sm:py-4">{lead.email || "N/A"}</td>
+                        <td className="px-4 py-3 text-slate-600 sm:px-6 sm:py-4">{lead.phone || "N/A"}</td>
                         <td className="px-4 py-3 sm:px-6 sm:py-4">{renderStatusBadge(lead.status)}</td>
+                        <td className="px-4 py-3 text-slate-500 text-xs sm:px-6 sm:py-4">{lead.handoff_reason || (lead.job_title ? `${lead.job_title} (${lead.company || 'N/A'})` : "N/A")}</td>
                         <td className="max-w-[120px] truncate px-4 py-3 font-mono text-xs text-slate-500 sm:max-w-none sm:px-6 sm:py-4">{lead.thread_id}</td>
                       </tr>
                     ))
@@ -1981,7 +2090,16 @@ export default function Dashboard() {
         )}
 
         {activeTab === "admin" && (
-          <AdminIntegrations backendUrl={backendUrl} getHeaders={getHeaders} />
+          <AdminIntegrations
+            backendUrl={backendUrl}
+            getHeaders={getHeaders}
+            publishableKey={publishableKey}
+            regeneratedKey={regeneratedKey}
+            pkBusy={pkBusy}
+            regeneratingKey={regeneratingKey}
+            handleRegeneratePublishableKey={handleRegeneratePublishableKey}
+            handleRegenerateApiKey={handleRegenerateApiKey}
+          />
         )}
 
         {activeTab === "billing" && (
