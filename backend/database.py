@@ -694,11 +694,30 @@ async def cancel_appointment_record(tenant_id: str, appt_id: str) -> bool:
     from bson import ObjectId
 
     db = get_db()
+    try:
+        query = {"_id": ObjectId(appt_id), "tenant_id": tenant_id, "status": {"$ne": "cancelled"}}
+    except Exception:
+        query = {"id": appt_id, "tenant_id": tenant_id, "status": {"$ne": "cancelled"}}
+
     result = await db.appointments.update_one(
-        {"_id": ObjectId(appt_id), "tenant_id": tenant_id, "status": {"$ne": "cancelled"}},
+        query,
         {"$set": {"status": "cancelled"}},
     )
     return result.modified_count > 0
+
+async def delete_appointment_record(tenant_id: str, appt_id: str) -> bool:
+    """Permanently delete an appointment document from MongoDB."""
+    from bson import ObjectId
+
+    db = get_db()
+    try:
+        res = await db.appointments.delete_one({"_id": ObjectId(appt_id), "tenant_id": tenant_id})
+        if res.deleted_count > 0:
+            return True
+    except Exception:
+        pass
+    res = await db.appointments.delete_one({"id": appt_id, "tenant_id": tenant_id})
+    return res.deleted_count > 0
 
 async def reschedule_appointment_record(
     tenant_id: str,

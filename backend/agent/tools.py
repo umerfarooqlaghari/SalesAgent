@@ -25,6 +25,7 @@ from backend.database import (
     get_linked_console_thread,
     unlink_voice_call,
     get_recent_typed_chat_messages,
+    get_conversation,
 )
 from backend.adapters.factory import AdapterFactory
 from backend.config import settings
@@ -259,15 +260,14 @@ def _normalize_appointment_date(raw_date: Optional[str]) -> str:
     text = raw_date.strip()
     current_year = datetime.now(timezone.utc).year  # e.g., 2026
 
-    # Regex to find 4-digit year in date string
+    # Forcefully replace any past year (e.g. 2020..2025) with current year (2026)
     match = re.search(r"\b(20\d\d)\b", text)
     if match:
         year_val = int(match.group(1))
-        # If past year (e.g. 2024, 2025), replace with current_year (2026)
         if year_val < current_year:
-            text = text[:match.start(1)] + str(current_year) + text[match.end(1):]
+            text = re.sub(r"\b20[0-2][0-5]\b", str(current_year), text)
     else:
-        # If no year was supplied in date string, append current_year
+        # If no 4-digit year is present, append current year
         text = f"{text} {current_year}"
 
     return text
@@ -394,6 +394,51 @@ def _is_placeholder_time(time_str: Optional[str]) -> bool:
     return cleaned in _PLACEHOLDER_TIMES
 
 
+_DATE_KEYWORDS = {
+    "january", "jan", "february", "feb", "march", "mar", "april", "apr", "may",
+    "june", "jun", "july", "jul", "august", "aug", "september", "sept", "sep",
+    "october", "oct", "november", "nov", "december", "dec",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+    "tomorrow", "today", "tonight", "next week", "this week", "weekend",
+    "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th",
+    "11th", "12th", "13th", "14th", "15th", "16th", "17th", "18th", "19th", "20th",
+    "21st", "22nd", "23rd", "24th", "25th", "26th", "27th", "28th", "29th", "30th", "31st",
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+    "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth",
+    "eighteenth", "nineteenth", "twentieth", "thirtieth"
+}
+
+_TIME_KEYWORDS = {
+    "am", "pm", "a.m.", "p.m.", "o'clock", "oclock", "noon", "midnight",
+    "morning", "afternoon", "evening", "night",
+    "1pm", "2pm", "3pm", "4pm", "5pm", "6pm", "7pm", "8pm", "9pm", "10pm", "11pm", "12pm",
+    "1am", "2am", "3am", "4am", "5am", "6am", "7am", "8am", "9am", "10am", "11am", "12am",
+}
+
+
+async def _has_user_provided_date_and_time(tenant_id: str, thread_id: str) -> tuple[bool, bool]:
+    try:
+        conv = await get_conversation(tenant_id, thread_id)
+        if not conv or not conv.get("messages"):
+            # No history to verify against — fail closed (assume NOT provided)
+            # rather than waving the booking through unchecked.
+            return False, False
+        
+        user_texts = [m.get("content", "") for m in conv.get("messages", []) if m.get("role") == "user"]
+        full_text = " ".join(user_texts).lower()
+        if not full_text.strip():
+            return False, False
+            
+        has_date = any(re.search(rf"\b{kw}\b", full_text) for kw in _DATE_KEYWORDS) or bool(re.search(r"\b20\d\d\b", full_text)) or bool(re.search(r"\b\d{1,2}/\d{1,2}\b", full_text))
+        has_time = any(re.search(rf"\b{kw}\b", full_text) for kw in _TIME_KEYWORDS) or bool(re.search(r"\b\d{1,2}:\d{2}\b", full_text))
+        return has_date, has_time
+    except Exception:
+        # Same reasoning: an error checking history must not be treated as
+        # confirmation that the caller spoke a date/time.
+        return False, False
+
+
 @tool
 async def book_appointment(
     name: str,
@@ -418,6 +463,9 @@ async def book_appointment(
     norm_email = _normalize_email(email)
     norm_phone = _normalize_phone(phone)
 
+    # Verify caller actually provided date and time in history
+    user_has_date, user_has_time = await _has_user_provided_date_and_time(tenant_id, thread_id)
+
     # Validate required fields
     missing = []
     if not name or name.strip() == "":
@@ -427,9 +475,9 @@ async def book_appointment(
     if not norm_phone:
         missing.append("phone number")
     norm_date = _normalize_appointment_date(date)
-    if not norm_date:
+    if not norm_date or not user_has_date:
         missing.append("preferred date")
-    if not time or _is_placeholder_time(time):
+    if not time or _is_placeholder_time(time) or not user_has_time:
         missing.append("preferred time")
     
     if missing:

@@ -34,6 +34,8 @@ from backend.database import (
     rename_conversation,
     delete_conversation,
     list_appointments,
+    cancel_appointment_record,
+    delete_appointment_record,
     list_orders,
     link_voice_call,
     get_linked_console_thread,
@@ -846,6 +848,17 @@ async def get_appointments(tenant: TenantContext = Depends(require_secret_tenant
     """Returns all scheduled appointments from MongoDB."""
     appts = await list_appointments(tenant.tenant_id)
     return {"appointments": appts}
+
+@app.delete("/api/appointments/{appt_id}")
+async def delete_appointment_route(
+    appt_id: str,
+    tenant: TenantContext = Depends(require_secret_tenant),
+):
+    """Deletes or cancels an appointment record from MongoDB."""
+    success = await delete_appointment_record(tenant.tenant_id, appt_id)
+    if not success:
+        success = await cancel_appointment_record(tenant.tenant_id, appt_id)
+    return {"status": "success", "id": appt_id}
 
 @app.get("/api/orders")
 async def get_orders(tenant: TenantContext = Depends(require_secret_tenant)):

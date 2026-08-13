@@ -202,7 +202,7 @@ def _needs_tools(
         return True
     # Tenant-mapped inventory: tools unless their SQL catalog is already warm
     if inventory_intent:
-        return not has_catalog_cache
+        return True
     if has_fact_cache:
         return False
     return True

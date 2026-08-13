@@ -1925,7 +1925,7 @@ export default function Dashboard() {
 
         {/* ── Appointments Panel ── */}
         {activeTab === "appointments" && (
-          <div className="flex h-full flex-col gap-4 p-4 sm:gap-5 sm:p-6">
+          <div className="flex h-full min-h-0 flex-col gap-4 p-4 sm:gap-5 sm:p-6">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <h2 className="text-lg font-bold tracking-tight text-slate-900">📅 Scheduled Appointments</h2>
@@ -1948,7 +1948,7 @@ export default function Dashboard() {
                 ↻ Refresh
               </button>
             </div>
-            <div className="flex-1 overflow-auto rounded-xl border border-slate-200 bg-white shadow-sm">
+            <div className="flex-1 min-h-0 overflow-auto rounded-xl border border-slate-200 bg-white shadow-sm">
               <table className="w-full min-w-[860px] text-sm text-slate-600">
                 <thead>
                   <tr className="border-b border-slate-200 bg-slate-50 text-xs uppercase tracking-widest text-slate-500">
@@ -1959,12 +1959,13 @@ export default function Dashboard() {
                     <th className="px-3 py-3 text-left sm:px-5">Time</th>
                     <th className="px-3 py-3 text-left sm:px-5">Status</th>
                     <th className="px-3 py-3 text-left sm:px-5">Notes</th>
+                    <th className="px-3 py-3 text-left sm:px-5">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200">
                   {appointments.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="py-16 text-center text-xs font-semibold text-slate-400">
+                      <td colSpan={8} className="py-16 text-center text-xs font-semibold text-slate-400">
                         <div className="flex flex-col items-center gap-2 px-4">
                           <span className="text-3xl">📭</span>
                           <span>No appointments yet. Start a Vapi call and ask to book a meeting!</span>
@@ -1998,6 +1999,26 @@ export default function Dashboard() {
                           </span>
                         </td>
                         <td className="max-w-[120px] truncate px-3 py-3 text-xs text-slate-500 sm:max-w-[180px] sm:px-5 sm:py-4">{appt.notes || "—"}</td>
+                        <td className="px-3 py-3 sm:px-5 sm:py-4">
+                          <button
+                            onClick={async () => {
+                              if (!window.confirm("Delete this appointment? This cannot be undone.")) return;
+                              try {
+                                const res = await fetch(`${backendUrl}/api/appointments/${appt._id}`, {
+                                  method: "DELETE",
+                                  headers: getHeaders(),
+                                });
+                                if (res.ok) {
+                                  setAppointments((prev) => prev.filter((a) => a._id !== appt._id));
+                                }
+                              } catch { }
+                            }}
+                            className="rounded p-1.5 text-red-500 hover:bg-red-50 transition-colors"
+                            title="Delete Appointment"
+                          >
+                            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                          </button>
+                        </td>
                       </tr>
                     ))
                   )}
