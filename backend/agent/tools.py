@@ -439,6 +439,25 @@ async def _has_user_provided_date_and_time(tenant_id: str, thread_id: str) -> tu
         return False, False
 
 
+async def _has_user_provided_phone(tenant_id: str, thread_id: str, phone: str) -> bool:
+    try:
+        conv = await get_conversation(tenant_id, thread_id)
+        if not conv or not conv.get("messages"):
+            return False
+
+        normalized_phone = _normalize_phone(phone)
+        if not normalized_phone:
+            return False
+
+        return any(
+            normalized_phone in _normalize_phone(message.get("content", ""))
+            for message in conv["messages"]
+            if message.get("role") == "user"
+        )
+    except Exception:
+        return False
+
+
 @tool
 async def book_appointment(
     name: str,
@@ -465,6 +484,7 @@ async def book_appointment(
 
     # Verify caller actually provided date and time in history
     user_has_date, user_has_time = await _has_user_provided_date_and_time(tenant_id, thread_id)
+    user_has_phone = await _has_user_provided_phone(tenant_id, thread_id, norm_phone)
 
     # Validate required fields
     missing = []
@@ -472,7 +492,7 @@ async def book_appointment(
         missing.append("name")
     if not norm_email or "@" not in norm_email:
         missing.append("email")
-    if not norm_phone:
+    if not norm_phone or not user_has_phone:
         missing.append("phone number")
     norm_date = _normalize_appointment_date(date)
     if not norm_date or not user_has_date:
