@@ -543,7 +543,7 @@ async def sdr_node(state: AgentState) -> Dict[str, Any]:
     )
     if use_tools:
         if is_voice and inventory_intent:
-            tools = list(dict.fromkeys([*_VOICE_FAST_TOOLS, query_pos_database]))
+            tools = [*_VOICE_FAST_TOOLS, query_pos_database]
         elif is_voice and has_facts:
             tools = _VOICE_FAST_TOOLS
         else:
